@@ -1,0 +1,24 @@
+STAGE 2 - PROCESSING
+====================
+
+This installer sets up everything automatically:
+  - the Stage 2 app (Desktop shortcut created)
+  - the Anthropic API key (configured for you - nothing to paste)
+  - LibreOffice (downloaded + installed silently if missing, ~350 MB;
+    used to convert Word/Excel files to PDF)
+
+Windows will show ONE admin (UAC) prompt - click Yes.
+
+AFTER INSTALLING
+----------------
+Open "Stage2 Processing" from the Desktop and point it at the care-home
+folder that Stage 1 downloaded (in Documents\Lifted). It classifies and
+renames every document into a "<Care Home> Processed" folder.
+
+If LibreOffice could not be downloaded during install, the app still
+works (Office files convert as text-only) - install LibreOffice later
+from libreoffice.org and it is picked up automatically.
+
+WORKFLOW ORDER
+--------------
+  Stage 1 (Download & Merger)  ->  Stage 2 (Processing)  ->  Stage 3 (Uploading)
