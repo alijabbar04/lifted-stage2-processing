@@ -43,13 +43,36 @@ function Find-Gh {
     return $null
 }
 
+# Run a native exe and return its exit code, WITHOUT letting anything it writes
+# to stderr abort the script. Needed because $ErrorActionPreference = "Stop"
+# turns native-command stderr into a terminating error in Windows PowerShell
+# 5.1 - and `gh auth status` writes to stderr on the completely normal
+# "not signed in yet" path, which would otherwise kill the install with a
+# confusing NativeCommandError instead of starting the sign-in flow.
+# $Interactive leaves the streams alone so browser/device-code prompts work.
+function Invoke-Native {
+    param([string]$Exe, [string[]]$Arguments, [switch]$Quiet, [switch]$Interactive)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        if ($Interactive)  { & $Exe @Arguments }
+        elseif ($Quiet)    { & $Exe @Arguments 2>&1 | Out-Null }
+        else               { & $Exe @Arguments 2>&1 | ForEach-Object { Write-Host $_ } }
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 Write-Host "=== Stage 2 - Processing : install ===" -ForegroundColor Cyan
 
 # --- 1. GitHub CLI (needed because the repo is private) ---------------------
 $gh = Find-Gh
 if (-not $gh) {
     Write-Host "`n[1/5] GitHub CLI not found - installing it with winget..." -ForegroundColor Cyan
-    winget install --id GitHub.cli -e --accept-source-agreements --accept-package-agreements
+    Invoke-Native "winget" @("install","--id","GitHub.cli","-e",
+                             "--accept-source-agreements",
+                             "--accept-package-agreements") | Out-Null
     $gh = Find-Gh
     if (-not $gh) {
         Write-Host "GitHub CLI was installed but isn't visible yet." -ForegroundColor Yellow
@@ -61,12 +84,12 @@ if (-not $gh) {
 }
 
 # --- 2. GitHub sign-in ------------------------------------------------------
-& $gh auth status *> $null
-if ($LASTEXITCODE -ne 0) {
+if ((Invoke-Native $gh @("auth","status") -Quiet) -ne 0) {
     Write-Host "`n[2/5] Signing in to GitHub - a browser window will open." -ForegroundColor Cyan
     Write-Host "Use the GitHub account that was invited to this repository."
-    & $gh auth login --hostname github.com --web --git-protocol https
-    if ($LASTEXITCODE -ne 0) {
+    # -Interactive: the web/device-code flow needs the real console.
+    if ((Invoke-Native $gh @("auth","login","--hostname","github.com",
+                             "--web","--git-protocol","https") -Interactive) -ne 0) {
         Write-Host "GitHub sign-in did not complete - run install.ps1 again to retry." -ForegroundColor Red
         exit 1
     }
@@ -78,8 +101,8 @@ if ($LASTEXITCODE -ne 0) {
 $dl = Join-Path $env:TEMP "Stage2Install"
 New-Item -ItemType Directory -Force $dl | Out-Null
 Write-Host "`n[3/5] Downloading the app (~57 MB, one time)..." -ForegroundColor Cyan
-& $gh release download $Tag --repo $Repo --pattern $AppAsset --dir $dl --clobber
-if ($LASTEXITCODE -ne 0) {
+if ((Invoke-Native $gh @("release","download",$Tag,"--repo",$Repo,
+                         "--pattern",$AppAsset,"--dir",$dl,"--clobber")) -ne 0) {
     Write-Host "Download failed. Most likely your GitHub account has not been" -ForegroundColor Red
     Write-Host "invited to the repo yet - ask the maintainer, accept the emailed"
     Write-Host "invitation, then run install.ps1 again."
@@ -87,8 +110,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # The user guide is a separate, small asset. Not fatal if it is missing.
-& $gh release download $Tag --repo $Repo --pattern $GuideAsset --dir $dl --clobber *> $null
-$guideOk = ($LASTEXITCODE -eq 0)
+$guideOk = (Invoke-Native $gh @("release","download",$Tag,"--repo",$Repo,
+                                "--pattern",$GuideAsset,"--dir",$dl,
+                                "--clobber") -Quiet) -eq 0
 
 # --- 4. Install into the user profile (no admin needed) --------------------
 Write-Host "`n[4/5] Installing to $AppDir ..." -ForegroundColor Cyan
