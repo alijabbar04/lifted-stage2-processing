@@ -50,7 +50,7 @@ mirror is generated into [`vocabulary/`](vocabulary/).
 
 ## Quick start (users)
 
-1. Download **`Stage 2 - Processing.exe`** from the
+1. Download **`Stage2_Processing.exe`** from the
    [Releases](https://github.com/alijabbar04/lifted-stage2-processing/releases)
    page. Single file, ~56 MB, nothing to install.
 2. **Get an Anthropic API key from Ali Jabbar.** It is never stored in this

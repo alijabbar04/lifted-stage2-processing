@@ -13,7 +13,7 @@ You do not need Python, this repository, or any developer tools.
 ## 1. Download it
 
 Go to the repository's **Releases** page and download
-**`Stage 2 - Processing.exe`** from the latest release (about 56 MB).
+**`Stage2_Processing.exe`** from the latest release (about 56 MB).
 
 Put it somewhere sensible — your Desktop is fine. It is a single file; there is
 nothing to install.
@@ -32,7 +32,7 @@ bills that key's Anthropic account, so treat it like a company credit card.
 
 ## 3. First run
 
-Double-click **`Stage 2 - Processing.exe`**. Then:
+Double-click **`Stage2_Processing.exe`**. Then:
 
 1. Click the **cog (⚙) button** to open Settings.
 2. Paste the API key into the **API key** field and save.
