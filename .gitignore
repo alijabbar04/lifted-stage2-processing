@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts (PyInstaller work dir is redirected to pybuild/ by build.ps1
+# because build/ is a tracked source folder in this repo)
+dist/
+build/Stage2 Processing/
+build/stage2_credhelper/
+pybuild/
+*.exe
+*.msi
+*.spec.bak
+build/installer/Output/
+build/installer/payload/
+
+# SECRETS - never commit
+.installer_secrets
+apikey.dat
+api_key.local
+*.key
+.env
+
+# App runtime data / caches - real care-worker data, must never be committed
+*.log
+logs/
+.docreview_batch_state.json
+.docreview_manifest.json
+Filename Identification Record*.xlsx
+Doc Review AI filename change record*.xlsx
+Misnaming Record*.xlsx
+Filename_Audit_Report*.xlsx
+misnamed files record*.xlsx
+failed_files*.csv
+filename change record*.csv
+eval_results_*.csv
+rename_log*.csv
+api_usage*.jsonl
+
+# Document input / output folders - never commit worker documents
+input/
+output/
+documents/
+Misnamed Files/
+*.pdf
+!docs/USER_GUIDE.pdf
+
+# Editor / OS
+*.bak
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

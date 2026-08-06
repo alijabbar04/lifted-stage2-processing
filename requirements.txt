@@ -1,0 +1,29 @@
+# Stage 2 - Processing : runtime dependencies
+#
+# Install with:
+#   .\setup.ps1              (recommended - also checks your Python version)
+# or
+#   python -m pip install -r requirements.txt
+#
+# pymupdf  : renders PDF pages to images, extracts embedded text, rewrites page
+#            rotation when a scan is sideways, and splits multi-document bundles
+# pillow   : image handling - resizing/capping pages before they are sent to the
+#            API, and thumbnails/previews in the GUI
+# openpyxl : reads/writes the .xlsx controlled-vocabulary record, the override
+#            log, the misnaming record and the post-run audit report
+# keyring  : stores the Anthropic API key in the OS credential store (Windows
+#            Credential Manager / macOS Keychain / Linux Secret Service).
+#            Optional at runtime but STRONGLY recommended - without it the key
+#            falls back to the ANTHROPIC_API_KEY environment variable, then to
+#            a permission-restricted local file as a last resort.
+#
+# There is NO Anthropic SDK dependency: the app calls the Messages API and the
+# Message Batches API directly over urllib from the standard library.
+#
+# Versions below are the ones the shipped v1.0.0 exe was built and tested with
+# (Python 3.13.14, PyInstaller 6.21.0 - see build\build.ps1).
+
+pymupdf==1.27.2.3
+pillow==12.2.0
+openpyxl==3.1.5
+keyring>=24.0
