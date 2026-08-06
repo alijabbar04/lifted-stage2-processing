@@ -1,0 +1,11 @@
+# GENERATED FILE - DO NOT EDIT.
+# Regenerate with:  python vocabulary/export_vocabulary.py
+# Source of truth:  src/Stage2_Processing.pyw
+#
+# Names a previous version used (or that a model once invented)
+# and that are pruned from any workbook carrying them. Matching is
+# case-insensitive. See RETIRED_NAMES in src/Stage2_Processing.pyw.
+
+Non-UK Driving Licence
+Proof of Right to Work
+Use of Own Care Declaration
