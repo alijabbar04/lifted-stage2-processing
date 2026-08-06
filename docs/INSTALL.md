@@ -10,13 +10,63 @@ There are **two ways** to get Stage 2. Pick one.
 
 You do not need Python, this repository, or any developer tools.
 
-## 1. Download it
+## 1. Install it
 
-Go to the repository's **Releases** page and download
-**`Stage2_Processing.exe`** from the latest release (about 56 MB).
+**You need** a GitHub account that has been **invited to this repository** (it is
+private). Ask Ali Jabbar for an invite and accept the emailed invitation first.
 
-Put it somewhere sensible — your Desktop is fine. It is a single file; there is
-nothing to install.
+Open **PowerShell**: press the Windows key, type `powershell`, press Enter.
+
+**Step 1 — install the GitHub CLI.** This is how the download proves who you are,
+because the repository is private. One time only:
+
+```powershell
+winget install --id GitHub.cli -e
+```
+
+Now **close PowerShell and open a new window**, or the next step will not find
+the `gh` command. This trips everyone up once.
+
+**Step 2 — sign in to GitHub.** A browser window opens; sign in with the account
+that was invited. One time only:
+
+```powershell
+gh auth login --web
+```
+
+**Step 3 — download and run the installer.** Copy this whole line:
+
+```powershell
+gh release download v1.0.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
+```
+
+It downloads the app (about 57 MB), installs it, makes a Desktop and Start Menu
+shortcut, installs the user guide so the in-app **Guide** button works, and then
+lists what it installed so you can see it worked:
+
+| Installed | Where |
+|---|---|
+| App + shortcuts | `%LOCALAPPDATA%\Programs\Stage 2 - Processing\` |
+| User guide | `%LOCALAPPDATA%\Lifted\Guides\` |
+
+Nothing needs admin rights, and Python is not involved.
+
+> **"Download failed"?** Almost always means your GitHub account has not been
+> invited to the repository yet, or you have not accepted the invitation email.
+> Sort that out and run step 3 again.
+>
+> **"running scripts is disabled on this system"?** Allow local scripts for your
+> own account once, then re-run step 3:
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+> ```
+
+### Or download it by hand
+
+If you would rather not use PowerShell: go to the repository's **Releases** page
+and download **`Stage2_Processing.exe`** (about 57 MB). It is a single
+self-contained file and runs from anywhere — your Desktop is fine. You just will
+not get the shortcuts or the in-app guide.
 
 > Windows may warn that the file is "not commonly downloaded" because it is not
 > code-signed. Choose **Keep**, then if SmartScreen appears, **More info → Run
@@ -32,7 +82,8 @@ bills that key's Anthropic account, so treat it like a company credit card.
 
 ## 3. First run
 
-Double-click **`Stage2_Processing.exe`**. Then:
+Launch **Stage 2 - Processing** from the Desktop shortcut (or double-click
+`Stage2_Processing.exe` if you downloaded it by hand). Then:
 
 1. Click the **cog (⚙) button** to open Settings.
 2. Paste the API key into the **API key** field and save.

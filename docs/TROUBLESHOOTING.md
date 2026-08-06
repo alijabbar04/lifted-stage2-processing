@@ -200,10 +200,12 @@ work you have already paid for.
 The guide PDF is not on the machine. Stage 2 looks in `%LOCALAPPDATA%\Lifted\Guides`,
 beside the exe, and `Documents\Lifted\Guides`.
 
-Copy `docs/USER_GUIDE.pdf` from this repository into
-`%LOCALAPPDATA%\Lifted\Guides\` and rename it to start with `Stage 2` — for
-example `Stage 2 Guide - AI Processing.pdf` (matching is by filename prefix).
-The full installer places it there automatically.
+`install.ps1` places it for you, so the quickest fix is to re-run the install
+step from [INSTALL.md](INSTALL.md#1-install-it). To do it by hand, copy
+`docs/USER_GUIDE.pdf` into `%LOCALAPPDATA%\Lifted\Guides\` and rename it so it
+**starts with `Stage 2 `** — e.g. `Stage 2 Guide - AI Processing.pdf`. Matching is
+a literal filename-prefix check (`name.lower().startswith("stage 2")`), so
+`Stage2_Guide.pdf` will *not* be found — the space matters.
 
 ### Tools panel entries show "(NOT FOUND)"
 

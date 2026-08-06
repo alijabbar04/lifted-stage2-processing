@@ -48,22 +48,76 @@ mirror is generated into [`vocabulary/`](vocabulary/).
 
 ---
 
-## Quick start (users)
+## Install the app (start here)
 
-1. Download **`Stage2_Processing.exe`** from the
-   [Releases](https://github.com/alijabbar04/lifted-stage2-processing/releases)
-   page. Single file, ~56 MB, nothing to install.
-2. **Get an Anthropic API key from Ali Jabbar.** It is never stored in this
+This gives you the app with Desktop and Start Menu shortcuts, plus the user
+guide wired up to the in-app **Guide** button. No admin rights and no Python
+needed.
+
+**You need:** a Windows 10/11 PC and a GitHub account that has been **invited to
+this repository** (it's private — ask the maintainer for an invite and accept the
+email first).
+
+Open **PowerShell** (press the Windows key, type `powershell`, press Enter) and
+run these steps:
+
+**Step 1 — install the GitHub CLI** (one time; it's how the download
+authenticates against this private repo):
+
+```powershell
+winget install --id GitHub.cli -e
+```
+
+Then **close PowerShell and open a new window** so the `gh` command is found.
+
+**Step 2 — sign in to GitHub** (one time; a browser window opens — use the
+invited account):
+
+```powershell
+gh auth login --web
+```
+
+**Step 3 — download and run the installer:**
+
+```powershell
+gh release download v1.0.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
+```
+
+That downloads the app (~57 MB), installs it, creates the shortcuts, and
+verifies what landed:
+
+| Installed | Where |
+|---|---|
+| App + Desktop/Start Menu shortcuts | `%LOCALAPPDATA%\Programs\Stage 2 - Processing\` |
+| User guide (in-app **Guide** button) | `%LOCALAPPDATA%\Lifted\Guides\` |
+
+> Prefer to grab the file by hand? Download `Stage2_Processing.exe` from the
+> [Releases](https://github.com/alijabbar04/lifted-stage2-processing/releases)
+> page — it's a single self-contained exe and runs from anywhere. You just don't
+> get the shortcuts or the in-app guide.
+
+### First run
+
+1. **Get an Anthropic API key from Ali Jabbar.** It is never stored in this
    repository. Every document you process bills that key's account.
-3. Run the exe → **cog (⚙) → API key** → paste → save. It is stored in the
-   **Windows Credential Manager**, not in a file, and remembered from then on.
-4. Install [LibreOffice](https://www.libreoffice.org/download) (optional) so
-   Word/Excel/PowerPoint files convert properly rather than as text only.
-5. Point **Folder to process** at the `[Files]` folder Stage 1 produced —
+2. Launch **Stage 2 - Processing**, then **cog (⚙) → API key** → paste → save.
+   It goes into the **Windows Credential Manager**, not a file, and you only do
+   this once.
+3. Install LibreOffice if `install.ps1` said it was missing — without it,
+   Word/Excel/PowerPoint files convert as text only, which classifies badly:
+   ```powershell
+   winget install --id TheDocumentFoundation.LibreOffice -e
+   ```
+4. Point **Folder to process** at the `[Files]` folder Stage 1 produced —
    typically `Documents\Lifted\<Care Home>\<Care Home> [Files]`, the folder
    holding one sub-folder per worker.
-6. Pick **Live** (results as it goes) or **Overnight Batch** (half price, ready
+5. Pick **Live** (results as it goes) or **Overnight Batch** (half price, ready
    within ~1 hour, guaranteed within 24). Start it.
+
+> There is also a full installer that pre-configures the API key for you, so
+> there is nothing to paste. It is deliberately **not** published here because
+> the key is compiled into it — ask Ali for that one directly if you would rather
+> not handle a key.
 
 Full walkthrough with screenshots: **[docs/USER_GUIDE.pdf](docs/USER_GUIDE.pdf)**
 (also on the **Guide** button inside the app). Step-by-step install for a
@@ -156,6 +210,8 @@ calls the Messages API and the Message Batches API directly over `urllib`.
 | [`build/stage2.spec`](build/stage2.spec), [`build/build.ps1`](build/build.ps1) | PyInstaller build of the app |
 | [`build/installer/`](build/installer/) | Inno Setup installer tooling (see below) |
 | [`docs/`](docs/) | user guide PDF, install, troubleshooting, vocabulary guide |
+| [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
+| [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
 `src/Stage2_Processing.pyw` is the exact source that produced the shipped v1.0.0
 exe, so `build\build.ps1` reproduces it. The only edit is one code comment whose
