@@ -2240,6 +2240,61 @@ class DocRender:
     MAX_PAGES = 3          # hard ceiling on pages ever sent to the API
     DEFAULT_ZOOM = 1.5     # default render scale (overridden by settings)
 
+    # ---- content crop / up-res for small documents on a big blank page ----
+    # A photocopied ID card sits alone in the middle of an A4 sheet, so a
+    # full-page render spends nearly all its pixels on white paper and the
+    # card's own text (the 'DRIVING LICENCE' header, the MRZ, the category
+    # table) comes out unreadable - which is how 14 driving licences and 4
+    # BRPs were filed as 'Passport' in the 2026-08-11 Watra audit. When the
+    # page's actual content covers only a small part of the sheet, render that
+    # region instead, at a zoom that spends the same pixel budget on it.
+    CROP_MAX_FRAC = 0.34     # crop only when content covers less of the page
+    CROP_MIN_FRAC = 0.0015   # ...but is not just scanner speckle
+    CROP_PAD_FRAC = 0.04     # margin kept around the content, as page fraction
+    CROP_MAX_BOOST = 3.0     # ceiling on the extra zoom the crop may buy
+    _CROP_PROBE_PX = 200     # long side of the throwaway raster used to find it
+
+    @staticmethod
+    def _content_clip(page, ink_thresh: int = 205):
+        """The sub-rectangle of `page` that actually carries content, or None
+        when the content already fills the sheet (or the page is blank). Uses
+        a tiny throwaway raster, so the cost is negligible."""
+        if not HAS_PIL:
+            return None
+        try:
+            rect = page.rect
+            if rect.width <= 0 or rect.height <= 0:
+                return None
+            z = DocRender._CROP_PROBE_PX / max(rect.width, rect.height)
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+            from io import BytesIO
+            im = Image.open(BytesIO(pix.tobytes("png"))).convert("L")
+            w, h = im.size
+            px = im.point(lambda v: 1 if v < ink_thresh else 0,
+                          mode="L").tobytes()
+            # ignore isolated specks: a row/column counts only with >= 2 marks
+            rows = [sum(px[y * w:(y + 1) * w]) for y in range(h)]
+            cols = [sum(px[x::w]) for x in range(w)]
+            ys = [i for i, v in enumerate(rows) if v >= 2]
+            xs = [i for i, v in enumerate(cols) if v >= 2]
+            if not xs or not ys:
+                return None
+            frac = ((xs[-1] - xs[0] + 1) * (ys[-1] - ys[0] + 1)) / float(w * h)
+            if not (DocRender.CROP_MIN_FRAC <= frac <= DocRender.CROP_MAX_FRAC):
+                return None
+            padx = rect.width * DocRender.CROP_PAD_FRAC
+            pady = rect.height * DocRender.CROP_PAD_FRAC
+            clip = fitz.Rect(
+                max(rect.x0, rect.x0 + xs[0] / w * rect.width - padx),
+                max(rect.y0, rect.y0 + ys[0] / h * rect.height - pady),
+                min(rect.x1, rect.x0 + (xs[-1] + 1) / w * rect.width + padx),
+                min(rect.y1, rect.y0 + (ys[-1] + 1) / h * rect.height + pady))
+            if clip.width <= 0 or clip.height <= 0:
+                return None
+            return clip
+        except Exception:
+            return None
+
     @staticmethod
     def _max_px(zoom: float) -> int:
         # cap the longest image side proportional to zoom so payloads stay sane
@@ -2268,14 +2323,19 @@ class DocRender:
         pages plus the LAST page for longer documents, so a signature/result
         page at the end is seen), "first" (page 1 only), or a list of 0-based
         page indices. rotate: degrees CLOCKWISE to rotate every rendered page
-        (used by the rotation retry for sideways scans). Empty image list if
-        unrenderable (text may still come back for text-based PDFs/docx/txt)."""
+        (used by the rotation retry for sideways scans), or a
+        {page_index: degrees} dict to straighten individual pages (used by the
+        pre-classification deskew, where a scan mixes orientations). Empty
+        image list if unrenderable (text may still come back for text-based
+        PDFs/docx/txt)."""
         if zoom is None:
             zoom = DocRender.DEFAULT_ZOOM
         ext = path.suffix.lower()
         try:
             if ext in IMG_EXT:
                 # images are single-page; "first"/list still returns the image
+                if isinstance(rotate, dict):
+                    rotate = int(rotate.get(0, 0) or 0)
                 return DocRender._image(path, zoom, rotate)
             if ext in PDF_EXT and HAS_FITZ:
                 return DocRender._pdf(path, zoom, pages, rotate)
@@ -2392,15 +2452,29 @@ class DocRender:
                     idxs = [0, 1, total - 1]
             else:  # explicit list of indices
                 idxs = [i for i in pages if 0 <= i < total][:DocRender.MAX_PAGES]
-            mat = fitz.Matrix(zoom, zoom)
-            if rotate in (90, 180, 270):
+            base_mat = fitz.Matrix(zoom, zoom)
+            per_page = rotate if isinstance(rotate, dict) else {}
+            if not per_page and rotate in (90, 180, 270):
                 # prerotate() is counter-clockwise; rotate is clockwise
-                mat = mat.prerotate((360 - rotate) % 360)
+                base_mat = base_mat.prerotate((360 - rotate) % 360)
             cap = DocRender._max_px(zoom)
             for i in idxs:
                 page = doc[i]
                 text.append(page.get_text())
-                pix = page.get_pixmap(matrix=mat, alpha=False)
+                deg = int(per_page.get(i, 0) or 0)
+                if deg in (90, 180, 270):
+                    mat = fitz.Matrix(zoom, zoom).prerotate((360 - deg) % 360)
+                else:
+                    mat = base_mat
+                # a small document marooned on a big blank sheet is rendered
+                # from its content region, at a zoom that makes it readable
+                clip = DocRender._content_clip(page)
+                if clip is not None:
+                    boost = min(DocRender.CROP_MAX_BOOST,
+                                max(page.rect.width, page.rect.height)
+                                / max(clip.width, clip.height, 1e-6))
+                    mat = mat.prescale(boost, boost)
+                pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip)
                 png = pix.tobytes("png")
                 w, h = pix.width, pix.height
                 if HAS_PIL and max(pix.width, pix.height) > cap:
@@ -4875,7 +4949,8 @@ def _second_opinion(escalation_api, vocab, path, resolution, out,
         text = out.get("used_text", "")
         note = ROTATION_RETRY_NOTE
     else:
-        imgs, text = DocRender.render(path, zoom=resolution, pages="all")
+        imgs, text = DocRender.render(path, zoom=resolution, pages="all",
+                                      rotate=out.get("pre_rotations") or {})
     if not imgs and not text:
         return out
     retry = escalation_api.classify(vocab, imgs, text, note=note)
@@ -5068,13 +5143,26 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
 
     if total_pages is None:
         total_pages = DocRender.page_count(path)
+    # PRE-CLASSIFICATION DESKEW. The free local text-direction check knows,
+    # for any PDF carrying a text layer, exactly which pages are stored
+    # sideways or upside down. It used to run only AFTER the answer came back
+    # (Engine._maybe_fix_rotation), so the model was asked to read a rotated
+    # page and only the reactive rotation retry could save it. Straighten the
+    # RENDER first instead: it costs no API call, and a page the model can
+    # read upright is a page it classifies from the content rather than the
+    # shape. The stored file is still physically corrected later, by the
+    # existing rotation-fix step.
+    pre_rot = detect_pdf_page_text_rotations(path) or {}
+    if pre_rot:
+        p1_imgs = p1_text = None      # any caller-supplied page 1 is skewed
     if p1_imgs is None and p1_text is None:
-        p1_imgs, p1_text = DocRender.render(path, zoom=resolution, pages="first")
+        p1_imgs, p1_text = DocRender.render(path, zoom=resolution,
+                                            pages="first", rotate=pre_rot)
     ext = path.suffix.lower()
     out = {"result": {}, "used_imgs": p1_imgs, "used_text": p1_text,
            "total_pages": total_pages, "page1_only": False,
            "triaged": False, "triage_reason": "", "rotation_retried": False,
-           "escalated": False, "page_idxs": [0]}
+           "escalated": False, "page_idxs": [0], "pre_rotations": pre_rot}
     if adaptive_pages and ext in PDF_EXT and total_pages > 1:
         tri = api.triage(vocab, p1_imgs[0] if p1_imgs else "",
                          p1_text, total_pages)
