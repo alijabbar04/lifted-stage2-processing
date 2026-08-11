@@ -21,7 +21,7 @@
 # ============================================================================
 $ErrorActionPreference = "Stop"
 $Repo      = "alijabbar04/lifted-stage2-processing"
-$Tag       = "v1.0.0"
+$Tag       = "v1.1.0"
 $AppAsset  = "Stage2_Processing.exe"
 $GuideAsset = "Stage2_Guide_AI_Processing.pdf"
 
