@@ -42,6 +42,37 @@ Per pattern, on the previously-wrong documents:
 
 Residual failures are listed at the end of this entry.
 
+### Read the "before" column carefully: most of the fix is the rebuild
+
+The baseline was measured against the source as it stood, not against the exe
+that actually processed Watra Care — and it already scored 101/110. The shipped
+build was from 5 August and is behind this source. On today's code the
+**rotation retry fired on 40 of the 130 documents and rescued 38 of them**, so
+the great majority of the "rotated scan" bucket was already handled and simply
+never reached the operator.
+
+The practical consequence is that **rebuilding and redeploying the exe is the
+single largest part of this fix**; the vocabulary and pipeline work below closes
+the residual 9 and the 3 unflagged probes. It is also a standing lesson: an
+accuracy report written from a production run describes the *deployed build*,
+which may be months behind `main`. Check the build date before concluding the
+classifier is broken.
+
+### Historic regression set — could not be run
+
+The 33-document ground-truth set from the 2026-07-09 overhaul no longer exists
+on this machine. Its labels workbook survives at
+`OneDrive\Documents\misnamed files record.xlsx`, and every row still points at
+`OneDrive\Desktop\Misnamed Files\…`, but that documents folder is gone — a
+full sweep of `OneDrive\`, `Documents\`, `Downloads\` and `AppData\Local\Lifted`
+finds no copy, by folder name or by the individual filenames recorded in the
+workbook. Labels without documents cannot be scored.
+
+The watra-postaudit set's 17 controls cover the same ground for the types this
+release touches; the wider historic coverage is simply not available. If a copy
+of those 33 files turns up, run
+`python src\eval_classifier.py --tag historic-regression` against it.
+
 ### Vocabulary (`SEED_*`)
 
 Every change is a positive requirement plus an explicit exclusion plus a
@@ -170,8 +201,12 @@ left rather than fixed by loosening a guard.
   genuine "Vehicle Tax and MOT status" page — out of the controlled type into an
   `Other -` label, and stating the split inside rule 20 sent all six MOT rows to
   `Proof of Vehicle Tax`. Both directions were measured; this is the better one.
-  Real fix: a controlled `Proof of MOT` type, which is an `OVERWRITE_TYPES` and
-  Stage 3 decision, not a wording one.
+  A controlled `Proof of MOT` type was investigated as the clean fix and
+  **rejected: the platform has no MOT document type**, so the name would be
+  untypable at upload and would also lose the "Other" pin that the current
+  `Other - MOT history check` naming gets in the bulk path. Full evidence in
+  [docs/DEFERRED_WORK.md](docs/DEFERRED_WORK.md); this is now a permanent
+  documented residual, not a to-do.
 - **Row 108 — an employment-verification letter answered `Reference`.**
   `Reference` now requires the letter to assess the person, but a stricter
   version cost control row 104 (a genuine experience/character letter that *is*
@@ -184,6 +219,11 @@ left rather than fixed by loosening a guard.
   document type flipped from wrong to right. This particular scan is a small
   card under a heavy "CERTIFIED TRUE COPY" stamp. Placement-affecting, so it is
   worth a human look at upload time.
+
+All four are settled, not open: each has been through the harness in both
+directions and the next tightening costs more than it buys. They are tabulated
+in [docs/DEFERRED_WORK.md](docs/DEFERRED_WORK.md) so nobody re-opens them by
+accident.
 
 ### Cost
 
