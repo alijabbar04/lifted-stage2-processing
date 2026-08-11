@@ -1,4 +1,4 @@
-"""
+r"""
 eval_classifier.py - Stage 2 classification regression harness
 ================================================================
 Re-runs the EXACT production classification path (imported from
@@ -16,7 +16,14 @@ or drop it in one of the default locations that are probed in order:
   - <Desktop>\Lifted\Week 4\  then  <Desktop>\
   - documents : <root>\Misnamed Files\
   - labels    : <root>\misnamed files record.xlsx
-                (columns: File Path | AI name | Ideal name)
+                (columns: File Path | AI name | Ideal name [| kind])
+
+The optional 4th column `kind` splits the set for scoring:
+  misnamed  a document the classifier got WRONG and must now get right
+  control   a document it already gets RIGHT and must not start getting wrong
+            (over-firing a new exclusion is the classic regression)
+  probe     an extra diagnostic row, reported but excluded from the gate
+Sets without the column are scored as one block, exactly as before.
 
 IMPORTANT: the filenames in the ground-truth folder are the PREVIOUS RUN'S
 WRONG ANSWERS (Stage 2 renamed them). The filename is therefore NEVER given
@@ -117,6 +124,16 @@ IDEAL_TO_CANONICAL = {
     "other - recepit of uniform declaration":    "Receipt of Uniform and Deposit Declaration",
     "id":                                        "ID Badge",
     "uk driving license":                        "UK Driving Licence",
+    # 2026-08-11 Watra post-audit set: the verification report's true_type
+    # strings are already canonical, so they are listed here only where a
+    # variant spelling turns up in the labels.
+    "share code check result":                   "Share Code Check Result",
+    "employment application form":               "Employment Application Form",
+    "proof of car insurance":                    "Proof of Car Insurance",
+    "proof of vehicle tax":                      "Proof of Vehicle Tax",
+    "employee handbook receipt":                 "Employee Handbook Receipt",
+    "driving permit":                            "Driving Permit",
+    "international driving permit":               "Driving Permit",
 }
 
 # Content-decided overrides (document inspected; rough label contradicted it).
@@ -138,6 +155,27 @@ OTHER_LABEL_PATTERNS = {
     "Corrective Action Report":   r"(corrective|remedial|audit).*(action|report|finding)",
     "Media Use Agreement":        r"(media|photo|photography|image).*(agreement|permission|consent|policy)",
     "Mobile Phone Use Agreement": r"(mobile|phone).*(agreement|policy|declaration|acknowledg)",
+    # Watra post-audit recurring Other types (canonical strings fixed in the
+    # 2026-08-11 vocabulary pass) - the model words them slightly differently
+    # every time, so match the type rather than the exact phrase.
+    "Other - MOT history check":
+        r"\bmot\b",
+    "Other - Criminal Record Check Declaration":
+        r"criminal record|rehabilitation of offenders|unspent conviction|"
+        r"convictions? (self.)?declaration",
+    "Other - Training Repayment Agreement":
+        r"training.*(repay|cost).*(agreement|recovery)|repayment agreement",
+    "Other - Employment offer acceptance letter":
+        r"(offer|employment).*(accept)|accept.*(offer|employment)",
+    "Other - Consulate appointment booking confirmation":
+        r"(consulate|embassy|high commission).*(appoint|booking)|"
+        r"appointment.*(booking|confirmation)",
+    "Other - NHS GP Registration Confirmation Letter":
+        r"(gp|doctor|surgery|nhs|practice).*(registrat|confirm)",
+    "Other - employment verification confirmation letter":
+        r"employment.*(verif|confirm)|(verif|confirm).*employment",
+    "Other - bank letter about online banking":
+        r"bank.*(letter|online|internet)|online banking",
     "Other - Unknown":            r".*",   # any Other-group abstention is a safe landing
 }
 
@@ -164,8 +202,11 @@ def prediction_matches(pred_name: str, canonical: str, stage2) -> bool:
         pat = OTHER_LABEL_PATTERNS.get(canonical)
         if pat and re.search(pat, label, flags=re.I):
             return True
-        # an Other answer whose label simply names the canonical type
-        if norm(canonical) in norm(label):
+        # an Other answer whose label simply names the canonical type. The
+        # truth may itself be written as 'Other - <type>' (that IS the filed
+        # name for an Other-group type), so compare on the type alone.
+        want = re.sub(r"^\s*other\s*-\s*", "", canonical, flags=re.I)
+        if norm(want) in norm(label):
             return True
     return False
 
@@ -213,6 +254,7 @@ def main():
             continue
         fpath, ai_name, ideal = (str(r[0]).strip(), str(r[1] or "").strip(),
                                  str(r[2] or "").strip())
+        kind = (str(r[3]).strip().lower() if len(r) > 3 and r[3] else "misnamed")
         p = Path(fpath)
         if not p.exists():
             cand = GT_FOLDER / p.name
@@ -224,7 +266,7 @@ def main():
                   f"literally")
             canonical = ideal
         rows.append({"path": p, "ai_name": ai_name, "ideal": ideal,
-                     "canonical": canonical})
+                     "canonical": canonical, "kind": kind})
 
     missing = [r for r in rows if not r["path"].exists()]
     if missing:
@@ -260,9 +302,17 @@ def main():
     print(f"Second opinion: "
           f"{esc_api.model_id if esc_api else 'off'}")
 
+    by_kind = {}
+    for r in todo:
+        by_kind.setdefault(r["kind"], []).append(r)
+    print("Set: " + ", ".join(f"{k}={len(v)}"
+                              for k, v in sorted(by_kind.items())))
+
     out_rows = []
     n_match = 0
     n_repro = 0
+    kind_hits = {k: [0, 0] for k in by_kind}      # kind -> [correct, total]
+    misses = []
     for i, r in enumerate(todo, 1):
         p = r["path"]
         print(f"[{i}/{len(todo)}] {p.name} ...", end=" ", flush=True)
@@ -275,8 +325,10 @@ def main():
             result = core["result"]
         except Exception as e:
             print(f"ERROR {e}")
+            kind_hits[r["kind"]][1] += 1
+            misses.append((r["kind"], p.name, r["canonical"], f"ERROR: {e}"))
             out_rows.append([str(p), r["ai_name"], f"ERROR: {e}", "",
-                             r["canonical"], "no", ""])
+                             r["canonical"], "no", "", r["kind"]])
             continue
 
         # interpret the result exactly as production does (auto-Other path)
@@ -294,6 +346,10 @@ def main():
 
         ok = prediction_matches(name, r["canonical"], stage2)
         n_match += 1 if ok else 0
+        kind_hits[r["kind"]][0] += 1 if ok else 0
+        kind_hits[r["kind"]][1] += 1
+        if not ok:
+            misses.append((r["kind"], p.name, r["canonical"], name))
         repro = norm(stage2.base_controlled_name(name)) == norm(r["ai_name"])
         n_repro += 1 if repro else 0
         tags = ""
@@ -306,7 +362,7 @@ def main():
               f"{' [reproduces old error]' if repro else ''}{tags}")
         out_rows.append([str(p), r["ai_name"], name, conf, r["canonical"],
                          "yes" if ok else "no",
-                         "yes" if repro else "no"])
+                         "yes" if repro else "no", r["kind"]])
 
     # ---- write CSV ----
     desk = stage2.desktop_path()
@@ -315,12 +371,15 @@ def main():
         w = csv.writer(f)
         w.writerow(["file", "previous_AI_name", "new_prediction",
                     "confidence", "normalised_ideal", "match",
-                    "reproduces_previous_error"])
+                    "reproduces_previous_error", "kind"])
         w.writerows(out_rows)
         w.writerow([])
         w.writerow([f"SUMMARY: {n_match} correct / {len(out_rows)} total "
                     f"({100.0*n_match/max(1,len(out_rows)):.0f}%); "
                     f"{n_repro} reproduce the previous wrong answer"])
+        for k, (hit, tot) in sorted(kind_hits.items()):
+            w.writerow([f"  {k}: {hit}/{tot} "
+                        f"({100.0*hit/max(1,tot):.0f}%)"])
     cost = stage2.tokens_cost_gbp(model_id, api.in_tokens, api.out_tokens)
     if esc_api is not None:
         cost += stage2.tokens_cost_gbp(esc_api.model_id, esc_api.in_tokens,
@@ -328,6 +387,12 @@ def main():
     print(f"\nSUMMARY: {n_match}/{len(out_rows)} correct "
           f"({100.0*n_match/max(1,len(out_rows)):.0f}%), "
           f"{n_repro} reproduce the old wrong answer.")
+    for k, (hit, tot) in sorted(kind_hits.items()):
+        print(f"  {k:<9} {hit}/{tot} ({100.0*hit/max(1,tot):.0f}%)")
+    if misses:
+        print("\nMISSES (kind | file | wanted | got):")
+        for k, fname, want, got in misses:
+            print(f"  {k:<9} {fname[:52]:<52} {want!r} -> {got!r}")
     print(f"Actual API usage: {api.in_tokens:,} in / {api.out_tokens:,} out "
           f"tokens"
           + (f" (+{esc_api.in_tokens:,}/{esc_api.out_tokens:,} second-opinion)"
