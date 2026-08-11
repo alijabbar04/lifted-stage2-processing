@@ -3118,12 +3118,18 @@ class ClaudeAPI:
     # ---- 1) classify a document into the controlled vocabulary ----
     def classify_payload(self, vocab_block: str, imgs: list,
                          extracted_text: str, max_tokens: int = 500,
-                         note: str = ""):
+                         note: str = "", page_idxs=None, total_pages=None):
         """Build the (system, content_blocks, max_tokens) for a classification
         request. Shared by live classify() and Overnight Batch submission so BOTH
         modes send a byte-for-byte identical request (same system prompt, same
         image blocks, same max_tokens). This is the single definition of the
         classification prompt.
+        `page_idxs`/`total_pages` label each image with the REAL page it came
+        from ('Page 3 of 12'). Long documents are sampled (first two pages plus
+        the last), so without labels the model cannot tell 'the third image'
+        from 'page 3' - and rule 18(b), first complete document wins, is
+        decided on exactly that. Omit them and the images go unlabelled, as
+        before.
         (max_tokens must comfortably exceed the JSON reply: 320 used to truncate
         replies mid-'features', which parsed as {} and mis-filed the document.)"""
         system = (
@@ -3218,7 +3224,15 @@ class ClaudeAPI:
         blocks = []
         # rotation retries send MORE than MAX_PAGES images (one page rendered
         # in several orientations), so the cap is applied by the caller
-        for b in imgs[:max(DocRender.MAX_PAGES, len(imgs))]:
+        shown = imgs[:max(DocRender.MAX_PAGES, len(imgs))]
+        # only label when the labels are trustworthy: the rotation retry sends
+        # the SAME page four times, and its note explains that itself
+        label = (not note and page_idxs is not None
+                 and len(page_idxs) == len(shown) and total_pages)
+        for k, b in enumerate(shown):
+            if label:
+                blocks.append({"type": "text", "text":
+                               f"Page {page_idxs[k] + 1} of {total_pages}:"})
             blocks.append(self._img_block(b))
         ctx = f"CONTROLLED VOCABULARY:\n{vocab_block}\n\n"
         if extracted_text:
@@ -3230,13 +3244,14 @@ class ClaudeAPI:
         return system, blocks, max_tokens
 
     def classify(self, vocab_block: str, imgs: list, extracted_text: str,
-                 note: str = "") -> dict:
+                 note: str = "", page_idxs=None, total_pages=None) -> dict:
         """LIVE classify: build the shared request and POST it synchronously.
         The fixed system prompt is prompt-cached (cache_system=True). `note` is
         an optional per-document instruction appended to the (uncached) user
         message - used by the rotation retry."""
-        system, blocks, mt = self.classify_payload(vocab_block, imgs,
-                                                   extracted_text, note=note)
+        system, blocks, mt = self.classify_payload(
+            vocab_block, imgs, extracted_text, note=note,
+            page_idxs=page_idxs, total_pages=total_pages)
         raw = self._post(system, blocks, max_tokens=mt, cache_system=True)
         return self._json_from(raw)
 
@@ -5178,10 +5193,12 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
             return _finish(out)
         out["triage_reason"] = str(tri.get("reason", ""))
         used_imgs, used_text = DocRender.render(path, zoom=resolution,
-                                                pages="all")
+                                                pages="all", rotate=pre_rot)
         out["used_imgs"], out["used_text"] = used_imgs, used_text
         out["page_idxs"] = _all_idxs()
-        out["result"] = api.classify(vocab, used_imgs, used_text)
+        out["result"] = api.classify(vocab, used_imgs, used_text,
+                                     page_idxs=out["page_idxs"],
+                                     total_pages=total_pages)
         if emit_cost:
             emit_cost()
         return _finish(out)
@@ -5189,10 +5206,12 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
     # (for single-page docs page 1 IS the whole doc)
     if ext in PDF_EXT and total_pages > 1 and not adaptive_pages:
         used_imgs, used_text = DocRender.render(path, zoom=resolution,
-                                                pages="all")
+                                                pages="all", rotate=pre_rot)
         out["used_imgs"], out["used_text"] = used_imgs, used_text
         out["page_idxs"] = _all_idxs()
-    out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"])
+    out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"],
+                                 page_idxs=out["page_idxs"],
+                                 total_pages=total_pages)
     if emit_cost:
         emit_cost()
     return _finish(out)
@@ -6713,7 +6732,9 @@ class Engine:
                     self.failed_log.record(self.care_home, w.name, f,
                                            "skipped: unrenderable", "")
                     continue
-                system, blocks, mt = self.api.classify_payload(vocab, imgs, text)
+                system, blocks, mt = self.api.classify_payload(
+                    vocab, imgs, text, page_idxs=_audit_pages_for(f),
+                    total_pages=DocRender.page_count(f))
                 # custom_id: stable, unique, derived from the content hash
                 # (sha-256 hex truncated + a per-hash counter for exact copies).
                 n = hash_counts.get(fhash, 0)
