@@ -1654,6 +1654,23 @@ class KnowledgeBase:
                       if k.lower() in seeded and k != seeded[k.lower()]]:
                 del d[k]
                 changed = True
+        # ...and drop a seeded name that ALSO sits in the wrong tab. A type the
+        # user accepted from the unknown-document prompt lands in Important;
+        # if the same name is later seeded into Other (or vice versa) the
+        # workbook ends up holding it twice with two different descriptions,
+        # and group_of() silently answers with whichever tab it checks first -
+        # so the type's tier, and therefore its Stage 3 upload route, depends
+        # on tab order rather than on the source. Found on 2026-08-11: 'MOT
+        # test certificate' was in Important AND Other at once.
+        tabs = {"Crucial": self.crucial, "Important": self.important,
+                "Other": self.other}
+        for name, seed in (list((k, "Crucial") for k, _ in SEED_CRUCIAL)
+                           + list((k, "Important") for k, _ in SEED_IMPORTANT)
+                           + list((k, "Other") for k, _ in SEED_OTHER)):
+            for tab, d in tabs.items():
+                if tab != seed and name in d:
+                    del d[name]
+                    changed = True
         if changed:
             try:
                 self._write()
