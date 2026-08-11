@@ -209,7 +209,8 @@ calls the Messages API and the Message Batches API directly over `urllib`.
 | [`vocabulary/`](vocabulary/) | **generated** flat mirror of the vocabulary + rules, and the extractor |
 | [`build/stage2.spec`](build/stage2.spec), [`build/build.ps1`](build/build.ps1) | PyInstaller build of the app |
 | [`build/installer/`](build/installer/) | Inno Setup installer tooling (see below) |
-| [`docs/`](docs/) | user guide PDF, install, troubleshooting, vocabulary guide |
+| [`docs/`](docs/) | user guide PDF, install, troubleshooting, vocabulary guide, deferred work |
+| [`CHANGELOG.md`](CHANGELOG.md) | what changed in each version, with the harness numbers |
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
@@ -220,11 +221,13 @@ functional change.
 
 ### A few things worth knowing before you edit
 
-- **The vocabulary lives in two places at runtime.** The `SEED_*` constants only
-  create `%APPDATA%\DocReviewAIStation\Filename Identification Record.xlsx` on
-  first run; after that the workbook is what the app reads. Editing a seed does
-  not change behaviour on a machine that already has a workbook — see
-  [VOCABULARY_GUIDE.md](docs/VOCABULARY_GUIDE.md#the-two-place-problem-seeds-vs-workbook).
+- **The vocabulary lives in two places at runtime**, but the source wins. The
+  `SEED_*` constants create `%APPDATA%\DocReviewAIStation\Filename
+  Identification Record.xlsx`, and every later load **re-seeds** it: an edited
+  seed description overwrites the workbook's copy on the next run, so a fix
+  reaches machines that have run before without anyone touching Excel. Only a
+  rename/removal needs a second edit (`RETIRED_NAMES`). See
+  [VOCABULARY_GUIDE.md](docs/VOCABULARY_GUIDE.md#seeds-vs-workbook-how-an-edit-reaches-a-machine-that-already-ran).
 - **`OVERWRITE_TYPES` is mirrored in Stage 3.** Change one side only and uploads
   break silently.
 - **Model IDs are pinned deliberately** (`claude-haiku-4-5`,

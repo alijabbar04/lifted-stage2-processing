@@ -1298,6 +1298,10 @@ def is_overwrite_type(stem: str) -> bool:
 #   Linux   : $XDG_DATA_HOME/DocReviewAIStation  (falls back to ~/.local/share/...)
 # ====================================================================
 APP_NAME = "DocReviewAIStation"
+# Shown in the window title so a support question ("which build is this?") can
+# be answered from a screenshot. Bump it with any classification change - see
+# CHANGELOG.md.
+APP_VERSION = "1.1.0"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -9446,7 +9450,7 @@ class App(tk.Tk):
         FX_RATE[0] = self.cfg.get("fx", 0.79)
         self.kb = KnowledgeBase()
 
-        self.title("Stage 2 — Processing  (Doc Review AI)")
+        self.title(f"Stage 2 — Processing  v{APP_VERSION}  (Doc Review AI)")
         self.configure(bg=BG)
         ui = 1.0
         if _api_usage is not None:

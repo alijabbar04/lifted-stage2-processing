@@ -43,36 +43,37 @@ A flat, reviewable mirror of all of it is generated into
 [`../vocabulary/`](../vocabulary/) — see that folder's README. The mirror is
 **generated**; editing it does nothing.
 
-### The two-place problem: seeds vs workbook
-
-This is the single most important thing to understand before you edit anything.
+### Seeds vs workbook: how an edit reaches a machine that already ran
 
 ```
-SEED_* constants  --(first run ONLY)-->  %APPDATA%\DocReviewAIStation\Filename Identification Record.xlsx
-                                          ^ every run after that reads THIS
+SEED_* constants  --(every run)-->  %APPDATA%\DocReviewAIStation\Filename Identification Record.xlsx
+                                     ^ loaded, RE-SEEDED, and rewritten on each load
 ```
 
-The seeds are what a **fresh install** gets. After first run the workbook on
-disk is the source of truth: each run loads it, prunes anything in
-`RETIRED_NAMES`, and appends new types you accept from the unknown-document
-prompt.
+`KnowledgeBase._read()` runs on every launch and, for **every seeded
+(canonical) name**, overwrites the workbook's description with the one in the
+source. So a description you change in `SEED_*` lands automatically on the next
+run, on your machine and on colleagues' — no Excel editing, no row deleting.
+Types a *user* added from the unknown-document prompt are not seeded, so they
+keep their own text.
 
-**Consequence:** editing a seed description does *not* change behaviour on a
-machine that already has a workbook. To make a fix land you must do both:
+The same load also prunes anything in `RETIRED_NAMES` and drops a workbook row
+that duplicates a seeded name in different casing.
 
-1. edit the constant in the source (so fresh installs and the repo are correct), **and**
-2. update the existing workbook (so *your* machine and colleagues' machines pick it up).
+**What still needs a second edit:**
 
-Step 2 has three options, easiest first:
+- **Renaming or removing a type** — the old spelling must go into
+  `RETIRED_NAMES`, or existing workbooks keep serving the dead name.
+- **Changing `OVERWRITE_TYPES`** — Stage 3 mirrors that set; edit both sides.
 
-- **Delete the affected row** from the workbook's tab and let the next run
-  re-seed it from the source. Safe for a description-only change.
-- **Edit the description cell** directly in Excel (`Filename` | `Description /
-  Identification Features`). Open it from the app: **🧰 Tools → vocabulary
-  workbook**.
-- **Add the old name to `RETIRED_NAMES`** if you are renaming or removing a
-  type. That prunes it from every workbook automatically on next run — this is
-  the only option that fixes colleagues' machines without them touching Excel.
+**Prove it landed** rather than assuming. Load a `KnowledgeBase` and read the
+workbook back off disk (this is what the 2026-08-11 pass did — see the
+propagation check in that changelog entry):
+
+```python
+kb = KnowledgeBase()                      # exactly what a run does
+assert "your new wording" in kb.vocabulary_block()
+```
 
 ---
 
@@ -212,7 +213,14 @@ confirmation before sending anything.
   (`SECOND_OPINION_MAX_CONF`). If a fix is "right but unconfident", sharpen the
   description rather than lowering a threshold.
 - **Renaming a type is two edits.** Add the old spelling to `RETIRED_NAMES` as
-  well, or existing workbooks keep serving the dead name.
+  well, or existing workbooks keep serving the dead name. (Changing only a
+  *description* needs no second edit — see the re-seeding note above.)
+- **A regression set needs controls, and controls need checking.** The
+  2026-08-11 pass first picked its "still correct" controls automatically from
+  an audit's `Correct` rows; **6 of 12 turned out to be audit misses of the very
+  patterns being fixed**, so the fixed classifier answering them correctly
+  would have been scored as a regression. Look at the pages before you trust a
+  control.
 - **`OVERWRITE_TYPES` is mirrored in Stage 3.** Editing one side only breaks
   uploads — this exact desync caused the `DBS Check` upload failures in
   2026-07-13.
