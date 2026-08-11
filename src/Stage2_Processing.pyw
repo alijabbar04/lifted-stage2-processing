@@ -388,7 +388,21 @@ SEED_CRUCIAL = [
                                    "Studies' (CAS) - a CAS is the STUDENT-visa "
                                    "equivalent issued by a university, never a "
                                    "CoS (file it 'Other - Confirmation of "
-                                   "Acceptance for Studies (CAS)')."),
+                                   "Acceptance for Studies (CAS)'). THE WORD "
+                                   "'CERTIFICATE' IN A TITLE NEVER MAKES A "
+                                   "DOCUMENT A CoS - require the CoS number AND "
+                                   "the sponsor AND the job/salary fields to be "
+                                   "visible. In particular a document headed "
+                                   "'Certificate of Motor Insurance' or otherwise "
+                                   "from an INSURER (policyholder, vehicle "
+                                   "registration mark, policy number, cover dates) "
+                                   "is 'Proof of Car Insurance'; a bank statement "
+                                   "(bank logo, account/sort code, transaction "
+                                   "table) is 'Bank Statement'; a gov.uk 'Vehicle "
+                                   "Tax and MOT status' page is 'Proof of Vehicle "
+                                   "Tax'. None of these become a CoS by sitting in "
+                                   "a sponsorship folder or carrying a "
+                                   "'CERTIFIED TRUE COPY' stamp."),
     ("DBS Check Notes", "Free-text notes, a memo, a chase-up email, or a "
                         "hand-typed/handwritten record specifically ABOUT A DBS "
                         "CHECK. To be this type the TEXT ITSELF must mention DBS - "
@@ -451,7 +465,14 @@ SEED_CRUCIAL = [
                             "'Employment Contract'. NOT a separate in-pack page "
                             "such as a Deductions from Pay Agreement, pay "
                             "agreement, policy, job description, or lone "
-                            "signature page."),
+                            "signature page. It is also NOT any document that "
+                            "simply arrived filed under a contract name: a gov.uk "
+                            "'Check MOT history' printout is 'Other - MOT history "
+                            "check', a 'Vehicle Tax and MOT status' page is "
+                            "'Proof of Vehicle Tax', and a university letter "
+                            "confirming a student's enrolment/term dates is 'Term "
+                            "Time Evidence'. Require contract wording - parties, "
+                            "job title, hours, notice, terms - on the page."),
     ("Employment Contract Amendment", "A FORMAL VARIATION/AMENDMENT to "
                         "existing contract terms - titled e.g. 'Amendment to "
                         "Contract', 'Variation of Terms', 'Change to Terms and "
@@ -529,7 +550,16 @@ SEED_IMPORTANT = [
                                 "result, it is 'DBS Check Notes', not this."),
     ("Arc Card", "ARC logo, applicant registration card, photo, asylum seeker details"),
     ("Availability", "Weekly schedule, days/times available, availability form"),
-    ("Bank Statement", "Bank logo, account number, transactions, balances"),
+    ("Bank Statement", "A bank's own account STATEMENT - bank logo/letterhead "
+                       "(e.g. Halifax, Lloyds, Monzo), the account holder's name, "
+                       "account number and sort code, a statement period, and a "
+                       "table of transactions with running balances. Use this "
+                       "controlled type rather than an 'Other - bank account "
+                       "statement' label, and rather than 'Proof of Address' even "
+                       "though a statement also shows an address. It is NOT a "
+                       "bank LETTER about the account (opening confirmation, "
+                       "online-banking notice) - that has no transaction table "
+                       "and is an Other document."),
     ("Birth Certificate", "Birth registration details, registrar, date/place of birth"),
     ("CV", "A curriculum vitae / résumé - the worker's own summary of their "
            "employment history, job timeline, qualifications, education, skills "
@@ -550,7 +580,18 @@ SEED_IMPORTANT = [
                                 "licence printout with a CHECK CODE and category "
                                 "tables is the Summary, NOT 'UK Driving Licence' (the "
                                 "physical photocard)."),
-    ("Driving Permit", "Driving permit/licence issued by authority"),
+    ("Driving Permit", "An INTERNATIONAL DRIVING PERMIT (IDP) - the booklet or "
+                       "card headed 'INTERNATIONAL DRIVING PERMIT' (often also in "
+                       "French, 'Permis de conduire international'), issued under "
+                       "the United Nations / Geneva or Vienna road traffic "
+                       "conventions by a national motoring authority or automobile "
+                       "association as an official TRANSLATION of the holder's "
+                       "national licence, listing the vehicle categories the "
+                       "holder may drive and the countries it is valid in. Also "
+                       "any other official permit to drive that is not a licence "
+                       "card. It is NOT a national driving licence: the overseas "
+                       "licence itself is 'Non UK Driving Licence' and the DVLA "
+                       "photocard is 'UK Driving Licence'."),
     ("Driving Practical Test Certificate", "DVSA practical test pass certificate"),
     ("Driving Theory Test Certificate", "DVSA theory test pass certificate"),
     ("ECS Notice", "A Home Office EMPLOYER CHECKING SERVICE (ECS) notice/letter "
@@ -600,7 +641,16 @@ SEED_IMPORTANT = [
                            "subject, reasons for leaving, gap explanations). "
                            "It is NOT a 'CV' (a CV is the worker's own typed "
                            "summary document) and NOT the full multi-section "
-                           "'Employment Application Form'."),
+                           "'Employment Application Form'. CHECK EVERY PAGE "
+                           "BEFORE CHOOSING THIS TYPE: if ANY page of the file "
+                           "carries a 'Position applied for' / post-applied-for "
+                           "header, a personal-details section, application "
+                           "questions, or the signed declarations that close an "
+                           "application pack, the file is the whole 'Employment "
+                           "Application Form' - a history grid inside it is one "
+                           "SECTION of that pack, not the document. Use "
+                           "'Employment History' only when the history grid is "
+                           "genuinely all there is."),
     ("Financial Evidence", "Savings, funds, financial support evidence"),
     ("Health Declaration", "A MEDICAL/HEALTH self-declaration form - health questions "
                            "about the worker's own medical history, conditions, "
@@ -626,7 +676,16 @@ SEED_IMPORTANT = [
                  "employer branding/logo (e.g. a Bluebird Care card) and often a "
                  "region or office. It is a picture of a physical badge, NOT a form "
                  "or declaration. It is NOT a 'Use of Own Car Declaration' or any "
-                 "other form - it has no questions or signatures, it is an ID card."),
+                 "other form - it has no questions or signatures, it is an ID card. "
+                 "It is also NOT a gov.uk / Home Office 'View a right to work' / "
+                 "'View a job applicant's right to work' / 'Prove your right to "
+                 "work' page - a FULL PAGE carrying the worker's photo together "
+                 "with 'They have permission to work in the UK until <date>' and a "
+                 "'Details of check' box (Company name, Date of check, Reference "
+                 "number) is 'Share Code Check Result', even when the page is "
+                 "scanned ROTATED and even when the incoming filename says 'ID "
+                 "Badge'. The badge is a small plastic CARD photographed on a desk "
+                 "or lanyard; the right-to-work result is a printed web page."),
     ("Intranet Access Declaration", "An IT / intranet / system-access "
                                     "acknowledgement form (e.g. a 'NEST Access "
                                     "(Intranet) Declaration') - it asks whether the "
@@ -665,8 +724,8 @@ SEED_IMPORTANT = [
                                   "this is the answer - it is NOT a 'Passport'."),
     ("No Reference Risk Assessment", "Risk assessment due to missing references"),
     ("Non UK Driving Licence", "A FOREIGN (non-UK) driving licence card - issued "
-                               "by any overseas authority (e.g. 'Provisional Driver "
-                               "Licence, New South Wales, Australia', an EU licence, "
+                               "by any overseas authority (e.g. a New South Wales "
+                               "(Australia) driver licence, an EU licence, "
                                "a Sri Lankan/Indian/Nigerian licence), in any "
                                "language. A photo card with the holder's photo, "
                                "licence number, licence class/vehicle categories, "
@@ -677,7 +736,11 @@ SEED_IMPORTANT = [
                                "('UK Driving Licence'), NOT the DVLA online "
                                "'Driving Licence Summary', NOT a passport, and NOT "
                                "'ID' - use this specific type for any foreign "
-                               "driving licence."),
+                               "driving licence. Two documents are excluded: a "
+                               "card carrying a UK flag panel ('UK'/'GB'/Union "
+                               "Jack) or 'DVLA' is 'UK Driving Licence'; a "
+                               "document headed 'INTERNATIONAL DRIVING PERMIT' "
+                               "is 'Driving Permit'."),
     ("PPE Declaration", "PPE acknowledgement/declaration form"),
     ("Passport", "The photo/identity page of a PASSPORT booklet: a large face photo, "
                  "passport number (format like a single letter + 8 digits or 9 digits), "
@@ -695,10 +758,21 @@ SEED_IMPORTANT = [
                  "a police-check letterhead, or a credit-card-sized permit is NEVER "
                  "'Passport' even if a passport number or an MRZ appears on it. Only "
                  "the passport BOOKLET identity page (headed 'PASSPORT', with the "
-                 "'P<' MRZ) is 'Passport'. FINAL CHECK before answering 'Passport': "
-                 "read the FIRST character of the machine-readable zone - 'P<' means "
-                 "passport bio page; 'V' means a visa and the page is 'Visa "
-                 "Vignette'."),
+                 "'P<' MRZ) is 'Passport'. A small CREDIT-CARD-SIZED PHOTOCARD "
+                 "with NO two-line 'P<' MRZ is NEVER 'Passport', however "
+                 "identity-document it looks and however heavily a red 'CERTIFIED "
+                 "TRUE COPY' stamp obscures it: a card headed 'DRIVING LICENCE' "
+                 "(including 'PROVISIONAL DRIVING LICENCE') with a driver number "
+                 "and an entitlement category table is a driving licence - 'UK "
+                 "Driving Licence' whenever it shows 'DVLA' or a UK/GB flag "
+                 "panel, whatever country the holder's place of birth names; and "
+                 "a card headed 'RESIDENCE PERMIT' with a card number and 'NO "
+                 "PUBLIC FUNDS' is 'BRP'. FINAL CHECK before "
+                 "answering 'Passport': read the FIRST character of the "
+                 "machine-readable zone - 'P<' means passport bio page; 'V' means "
+                 "a visa and the page is 'Visa Vignette'; 'IR' means a residence "
+                 "permit and the page is 'BRP'; and NO MRZ at all on a small card "
+                 "means it is a licence or permit, not a passport."),
     ("Payslip", "Employer name, pay period, deductions, net pay"),
     ("Probation Review", "A probation assessment / review, OR end-of-probation "
                          "feedback notes - printed OR handwritten, from the "
@@ -717,7 +791,19 @@ SEED_IMPORTANT = [
                          "Check Notes' - probation feedback has nothing to do "
                          "with a DBS check unless the text explicitly discusses "
                          "a DBS/Disclosure/Barring check."),
-    ("Proof of Address", "Utility bill, council tax, bank statement showing address"),
+    ("Proof of Address", "A COUNCIL TAX BILL or a UTILITY BILL is 'Proof of "
+                         "Address' - always this controlled type, NEVER an "
+                         "'Other - council tax bill' / 'Other - energy bill' "
+                         "label. More generally: a bill or official letter "
+                         "evidencing WHERE THE WORKER LIVES - a council tax "
+                         "bill/demand notice from a local authority, a utility "
+                         "bill (gas, electricity, water, broadband - e.g. "
+                         "British Gas, EDF, Octopus, Thames Water), or a "
+                         "similar addressed statement, showing the worker's "
+                         "name and full postal address. If the "
+                         "document is a BANK STATEMENT (bank logo, account and "
+                         "sort code, a transaction table) file it as 'Bank "
+                         "Statement' - that specific type wins over this one."),
     ("Proof of Car Insurance", "ANY document FROM AN INSURER evidencing a motor "
                                "insurance policy: a certificate of motor "
                                "insurance, policy schedule, COVER SUMMARY, "
@@ -786,7 +872,10 @@ SEED_IMPORTANT = [
                                    "certificate: NEVER 'Passport', NEVER 'Visa "
                                    "Vignette', and never any right-to-work document."),
     ("Proof of Vaccination", "Vaccination record/card/certificate"),
-    ("Proof of Vehicle Tax", "Vehicle tax confirmation, DVLA tax status"),
+    ("Proof of Vehicle Tax", "Vehicle tax confirmation, DVLA tax status - the "
+                             "page must state the vehicle's TAX position "
+                             "('Vehicle status: Taxed', a tax due date). A page "
+                             "that shows no tax status is not this type."),
     ("Proof of Visa Application", "Application submission receipt, payment confirmation"),
     ("Reference", "A COMPLETED employment/character reference ABOUT the "
                   "worker - the reference CONTENT must actually be present: "
@@ -800,7 +889,22 @@ SEED_IMPORTANT = [
                   "reference ('Reference Request Email'); NOT a blank, "
                   "unfilled reference form (Other - blank reference form "
                   "template); and NOT 'Reference Consent' (the worker's "
-                  "permission form)."),
+                  "permission form). A LETTER ON A FORMER EMPLOYER'S "
+                  "LETTERHEAD - an 'experience certificate', 'service "
+                  "certificate' or 'to whom it may concern' letter - IS a "
+                  "'Reference', not a 'Training Certificate' and not an Other "
+                  "label, BUT ONLY IF IT ASSESSES THE PERSON: it must give an "
+                  "opinion on their conduct, character, performance or "
+                  "suitability, or recommend them ('we found her hard-working "
+                  "and reliable', 'I have no hesitation in recommending "
+                  "her'). A letter that merely CONFIRMS THE FACTS of "
+                  "employment - job title, dates, salary, 'this is to confirm "
+                  "that X was employed here from ... to ...' - with no view "
+                  "on the person is NOT a reference; file it 'Other - "
+                  "employment verification letter'. A title reading "
+                  "'Reference Request' does not make a FILLED-IN form a "
+                  "request: judge by whether the referee's answers are on "
+                  "the page."),
     ("Reference Consent", "A short form in which the WORKER GIVES PERMISSION for the "
                           "employer/agency to obtain a reference from a previous "
                           "employer or college - e.g. wording like 'I <name> give "
@@ -830,11 +934,32 @@ SEED_IMPORTANT = [
                                    "procedures. It tests safeguarding knowledge. It is "
                                    "NOT a 'Health Declaration' (which is about the "
                                    "worker's own medical health) and NOT a policy "
-                                   "document - it is a completed questionnaire/form."),
+                                   "document - it is a completed questionnaire/form. "
+                                   "MATCH ONLY A FORM THAT ACTUALLY ASKS "
+                                   "SAFEGUARDING-KNOWLEDGE QUESTIONS: this type is "
+                                   "not a bin for any signed Watra/employer "
+                                   "'PERSONAL INFORMATION' or 'Declaration' sheet. "
+                                   "It is NOT a criminal-record self-declaration "
+                                   "(a 'Criminal Record Check Declaration' citing "
+                                   "the Rehabilitation of Offenders Act and asking "
+                                   "the worker to declare convictions/cautions - "
+                                   "that is 'Other - Criminal Record Check "
+                                   "Declaration'), NOT a 'Staff Handbook "
+                                   "Declaration' / handbook receipt ('Employee "
+                                   "Handbook Receipt'), and NOT a Home Office "
+                                   "right-to-work result page ('Share Code Check "
+                                   "Result')."),
     ("Spot Check", "Spot check form, observations, compliance review"),
     ("Supervision", "Supervision meeting notes, actions, signatures"),
     ("Tenancy Agreement Signature Evidence", "Signed tenancy agreement/signature page"),
-    ("Term Time Evidence", "Student status/term dates evidence"),
+    ("Term Time Evidence", "Evidence of a worker's STUDENT STATUS and term "
+                           "dates - typically a letter or portal printout from a "
+                           "university or college (e.g. Coventry University, "
+                           "Birmingham City University) confirming the student is "
+                           "enrolled on a named course, with the course dates / "
+                           "term and vacation dates that govern how many hours "
+                           "they may work. It is a letter ABOUT studying, never "
+                           "an 'Employment Contract'."),
     ("Training Certificate", "ANY course/training completion certificate from "
                            "any provider - e-learning, workshop, first aid, "
                            "mandatory training, moving & handling, medication - "
@@ -844,13 +969,34 @@ SEED_IMPORTANT = [
                            "Skills for Care'). Certificates are often scanned "
                            "rotated or photographed as screenshots - still this "
                            "type. Never file a completion certificate under an "
-                           "Other label."),
+                           "Other label. IT MUST BE A COMPLETION CERTIFICATE - "
+                           "a document that CERTIFIES/AWARDS that a named person "
+                           "completed a named course, with the provider, the "
+                           "course and a completion date. It is NOT a 'TRAINING "
+                           "REPAYMENT AGREEMENT' (a signed contract in which the "
+                           "worker agrees to repay training costs if they leave, "
+                           "with repayment percentages, employee AND employer "
+                           "signatures - that is 'Other - Training Repayment "
+                           "Agreement'), and NOT an employer 'experience "
+                           "certificate' / character letter about a person's job "
+                           "and conduct (that is 'Reference'). A signed agreement "
+                           "about training is a contract, not a certificate."),
     ("UK Driving Licence", "The PHYSICAL UK photocard DRIVING LICENCE (DVLA-issued, "
                            "pink/green plastic CARD). BOTH sides are 'UK Driving "
                            "Licence':\n"
                            "  - FRONT: the holder's PHOTO, name, date and place of "
                            "birth, a driver number, issue and expiry dates, "
-                           "signature.\n"
+                           "signature, and a UK flag panel (a Union Jack, or a "
+                           "blue panel with the letters 'UK' or 'GB').\n"
+                           "  READ FIELD 4c - THE ISSUING AUTHORITY. On the "
+                           "numbered photocard, 4c names the issuer: '4c. DVLA' "
+                           "means this type, full stop. Field 3 is the holder's "
+                           "DATE AND PLACE OF BIRTH - a line like "
+                           "'3. 04.12.1998 PAKISTAN' says where the person was "
+                           "BORN, not who issued the card, and never makes the "
+                           "licence foreign. A card headed 'PROVISIONAL DRIVING "
+                           "LICENCE' with a Union Jack and 4c. DVLA is a UK "
+                           "provisional licence and IS this type.\n"
                            "  - BACK (no photo): the entitlement CATEGORY TABLE - "
                            "columns headed 'Cat.', 'From', 'To', 'Codes' with "
                            "category letters (B, B1, BE...) and small vehicle "
@@ -1018,6 +1164,54 @@ SEED_OTHER = [
                     "written reply about the worker appears on ANY later "
                     "page of the scan, the whole file is a 'Reference', not "
                     "this type."),
+    # ---- 2026-08-11 Watra post-audit: four Other documents that recur often
+    # enough to deserve a stable definition and a stable filed name. They stay
+    # in the Other tier deliberately (bulk upload, no Stage 3 slot) - the point
+    # is that every copy lands on the SAME 'Other - <name>' string instead of a
+    # different free-form label each run.
+    ("MOT test certificate", "The DVSA MOT TEST CERTIFICATE (VT20) for a "
+                    "vehicle - 'Driver & Vehicle Standards Agency' / 'MOT Test "
+                    "Certificate' heading, a test number, the tested vehicle, "
+                    "an expiry date and the testing station. It is the "
+                    "certificate ISSUED AT A TEST. It is NOT the gov.uk "
+                    "'Check MOT history' web printout ('Other - MOT history "
+                    "check') and NOT vehicle tax ('Proof of Vehicle Tax'). "
+                    "[Seeded 2026-08-11: the app had minted this name into "
+                    "BOTH the Important and Other tabs of the workbook with "
+                    "two different descriptions.]"),
+    ("MOT history check", "The gov.uk check-mot.service.gov.uk 'Check MOT "
+                    "history' printout - the registration mark and make/model "
+                    "as a large heading, 'MOT valid until <date>', colour, "
+                    "fuel type, date first registered, and the vehicle's past "
+                    "MOT tests with mileage and advisories. There is no "
+                    "controlled type for it, so this Other name is the right "
+                    "answer - never 'Employment Contract', and never 'Proof of "
+                    "Vehicle Tax' unless the page also states a tax status."),
+    ("Criminal Record Check Declaration", "A worker's SELF-DECLARATION about "
+                    "criminal convictions - typically headed 'PERSONAL "
+                    "INFORMATION' / 'Criminal Record Check Declaration', citing "
+                    "the Rehabilitation of Offenders Act and exempt roles, "
+                    "asking the worker to declare ALL convictions, cautions, "
+                    "charges and pending cases (often answered 'None'), signed "
+                    "and dated. It is the worker's own declaration, NOT a DBS "
+                    "certificate or check record (the DBS types), and NOT a "
+                    "'Safeguarding Questionnaire' - it asks about the worker's "
+                    "record, not about safeguarding knowledge."),
+    ("Training Repayment Agreement", "A signed AGREEMENT to repay training "
+                    "costs - headed e.g. 'TRAINING REPAYMENT AGREEMENT', naming "
+                    "the employer and the worker, the course funded and its "
+                    "cost, and a repayment scale if the worker leaves within a "
+                    "stated period, with BOTH parties' signatures. It is a "
+                    "contractual document about money. It is NOT a 'Training "
+                    "Certificate' (which certifies a course was COMPLETED) "
+                    "despite the word 'training' in its title."),
+    ("Employment offer acceptance letter", "The WORKER'S acceptance of a job "
+                    "offer - a short letter or signed tear-off slip confirming "
+                    "they accept the offered post, usually repeating the job "
+                    "title and start date and signed by the worker. It is the "
+                    "reply TO an offer: the employer's offer itself is 'Hire "
+                    "Request Offer Letter', and the contract is 'Employment "
+                    "Contract'."),
 ]
 
 # Category names that have been RETIRED / RENAMED. If an existing workbook from
@@ -1104,6 +1298,10 @@ def is_overwrite_type(stem: str) -> bool:
 #   Linux   : $XDG_DATA_HOME/DocReviewAIStation  (falls back to ~/.local/share/...)
 # ====================================================================
 APP_NAME = "DocReviewAIStation"
+# Shown in the window title so a support question ("which build is this?") can
+# be answered from a screenshot. Bump it with any classification change - see
+# CHANGELOG.md.
+APP_VERSION = "1.1.0"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -1460,6 +1658,23 @@ class KnowledgeBase:
                       if k.lower() in seeded and k != seeded[k.lower()]]:
                 del d[k]
                 changed = True
+        # ...and drop a seeded name that ALSO sits in the wrong tab. A type the
+        # user accepted from the unknown-document prompt lands in Important;
+        # if the same name is later seeded into Other (or vice versa) the
+        # workbook ends up holding it twice with two different descriptions,
+        # and group_of() silently answers with whichever tab it checks first -
+        # so the type's tier, and therefore its Stage 3 upload route, depends
+        # on tab order rather than on the source. Found on 2026-08-11: 'MOT
+        # test certificate' was in Important AND Other at once.
+        tabs = {"Crucial": self.crucial, "Important": self.important,
+                "Other": self.other}
+        for name, seed in (list((k, "Crucial") for k, _ in SEED_CRUCIAL)
+                           + list((k, "Important") for k, _ in SEED_IMPORTANT)
+                           + list((k, "Other") for k, _ in SEED_OTHER)):
+            for tab, d in tabs.items():
+                if tab != seed and name in d:
+                    del d[name]
+                    changed = True
         if changed:
             try:
                 self._write()
@@ -2046,6 +2261,61 @@ class DocRender:
     MAX_PAGES = 3          # hard ceiling on pages ever sent to the API
     DEFAULT_ZOOM = 1.5     # default render scale (overridden by settings)
 
+    # ---- content crop / up-res for small documents on a big blank page ----
+    # A photocopied ID card sits alone in the middle of an A4 sheet, so a
+    # full-page render spends nearly all its pixels on white paper and the
+    # card's own text (the 'DRIVING LICENCE' header, the MRZ, the category
+    # table) comes out unreadable - which is how 14 driving licences and 4
+    # BRPs were filed as 'Passport' in the 2026-08-11 Watra audit. When the
+    # page's actual content covers only a small part of the sheet, render that
+    # region instead, at a zoom that spends the same pixel budget on it.
+    CROP_MAX_FRAC = 0.34     # crop only when content covers less of the page
+    CROP_MIN_FRAC = 0.0015   # ...but is not just scanner speckle
+    CROP_PAD_FRAC = 0.04     # margin kept around the content, as page fraction
+    CROP_MAX_BOOST = 3.0     # ceiling on the extra zoom the crop may buy
+    _CROP_PROBE_PX = 200     # long side of the throwaway raster used to find it
+
+    @staticmethod
+    def _content_clip(page, ink_thresh: int = 205):
+        """The sub-rectangle of `page` that actually carries content, or None
+        when the content already fills the sheet (or the page is blank). Uses
+        a tiny throwaway raster, so the cost is negligible."""
+        if not HAS_PIL:
+            return None
+        try:
+            rect = page.rect
+            if rect.width <= 0 or rect.height <= 0:
+                return None
+            z = DocRender._CROP_PROBE_PX / max(rect.width, rect.height)
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+            from io import BytesIO
+            im = Image.open(BytesIO(pix.tobytes("png"))).convert("L")
+            w, h = im.size
+            px = im.point(lambda v: 1 if v < ink_thresh else 0,
+                          mode="L").tobytes()
+            # ignore isolated specks: a row/column counts only with >= 2 marks
+            rows = [sum(px[y * w:(y + 1) * w]) for y in range(h)]
+            cols = [sum(px[x::w]) for x in range(w)]
+            ys = [i for i, v in enumerate(rows) if v >= 2]
+            xs = [i for i, v in enumerate(cols) if v >= 2]
+            if not xs or not ys:
+                return None
+            frac = ((xs[-1] - xs[0] + 1) * (ys[-1] - ys[0] + 1)) / float(w * h)
+            if not (DocRender.CROP_MIN_FRAC <= frac <= DocRender.CROP_MAX_FRAC):
+                return None
+            padx = rect.width * DocRender.CROP_PAD_FRAC
+            pady = rect.height * DocRender.CROP_PAD_FRAC
+            clip = fitz.Rect(
+                max(rect.x0, rect.x0 + xs[0] / w * rect.width - padx),
+                max(rect.y0, rect.y0 + ys[0] / h * rect.height - pady),
+                min(rect.x1, rect.x0 + (xs[-1] + 1) / w * rect.width + padx),
+                min(rect.y1, rect.y0 + (ys[-1] + 1) / h * rect.height + pady))
+            if clip.width <= 0 or clip.height <= 0:
+                return None
+            return clip
+        except Exception:
+            return None
+
     @staticmethod
     def _max_px(zoom: float) -> int:
         # cap the longest image side proportional to zoom so payloads stay sane
@@ -2074,14 +2344,19 @@ class DocRender:
         pages plus the LAST page for longer documents, so a signature/result
         page at the end is seen), "first" (page 1 only), or a list of 0-based
         page indices. rotate: degrees CLOCKWISE to rotate every rendered page
-        (used by the rotation retry for sideways scans). Empty image list if
-        unrenderable (text may still come back for text-based PDFs/docx/txt)."""
+        (used by the rotation retry for sideways scans), or a
+        {page_index: degrees} dict to straighten individual pages (used by the
+        pre-classification deskew, where a scan mixes orientations). Empty
+        image list if unrenderable (text may still come back for text-based
+        PDFs/docx/txt)."""
         if zoom is None:
             zoom = DocRender.DEFAULT_ZOOM
         ext = path.suffix.lower()
         try:
             if ext in IMG_EXT:
                 # images are single-page; "first"/list still returns the image
+                if isinstance(rotate, dict):
+                    rotate = int(rotate.get(0, 0) or 0)
                 return DocRender._image(path, zoom, rotate)
             if ext in PDF_EXT and HAS_FITZ:
                 return DocRender._pdf(path, zoom, pages, rotate)
@@ -2198,15 +2473,29 @@ class DocRender:
                     idxs = [0, 1, total - 1]
             else:  # explicit list of indices
                 idxs = [i for i in pages if 0 <= i < total][:DocRender.MAX_PAGES]
-            mat = fitz.Matrix(zoom, zoom)
-            if rotate in (90, 180, 270):
+            base_mat = fitz.Matrix(zoom, zoom)
+            per_page = rotate if isinstance(rotate, dict) else {}
+            if not per_page and rotate in (90, 180, 270):
                 # prerotate() is counter-clockwise; rotate is clockwise
-                mat = mat.prerotate((360 - rotate) % 360)
+                base_mat = base_mat.prerotate((360 - rotate) % 360)
             cap = DocRender._max_px(zoom)
             for i in idxs:
                 page = doc[i]
                 text.append(page.get_text())
-                pix = page.get_pixmap(matrix=mat, alpha=False)
+                deg = int(per_page.get(i, 0) or 0)
+                if deg in (90, 180, 270):
+                    mat = fitz.Matrix(zoom, zoom).prerotate((360 - deg) % 360)
+                else:
+                    mat = base_mat
+                # a small document marooned on a big blank sheet is rendered
+                # from its content region, at a zoom that makes it readable
+                clip = DocRender._content_clip(page)
+                if clip is not None:
+                    boost = min(DocRender.CROP_MAX_BOOST,
+                                max(page.rect.width, page.rect.height)
+                                / max(clip.width, clip.height, 1e-6))
+                    mat = mat.prescale(boost, boost)
+                pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip)
                 png = pix.tobytes("png")
                 w, h = pix.width, pix.height
                 if HAS_PIL and max(pix.width, pix.height) > cap:
@@ -2417,10 +2706,22 @@ DISAMBIGUATION_RULES = (
     "page (Details of check box: company, date of check, reference number).\n"
     "   - 'UK Driving Licence': the PHYSICAL DVLA PHOTOCARD driving licence "
     "(a plastic CARD with the holder's photo, driver number, and entitlement "
-    "category codes printed on it, 'DRIVING LICENCE'/'DVLA').\n"
+    "category codes printed on it, 'DRIVING LICENCE'/'DVLA'). Decide UK vs "
+    "non-UK from the ISSUER, field 4c - '4c. DVLA' (with a Union Jack or "
+    "'UK'/'GB' panel) is the UK licence. Field 3's place of birth is about the "
+    "PERSON: 'PAKISTAN'/'BANGLADESH'/'NIGERIA' there does NOT make the card "
+    "foreign, and 'PROVISIONAL DRIVING LICENCE' is still the UK licence.\n"
     "   - 'Non UK Driving Licence': a FOREIGN photocard/paper driving licence "
     "issued by another country (not the DVLA) - the overseas equivalent, often "
-    "in another language. Not a UK licence, not a passport, not an ID card.\n"
+    "in another language. Not a UK licence, not a passport, not an ID card. A "
+    "UK flag panel ('UK'/'GB'/Union Jack) or a DVLA mark means the card is the "
+    "UK one, whatever the holder's nationality or place of birth.\n"
+    "   - 'Driving Permit': an INTERNATIONAL DRIVING PERMIT - headed "
+    "'INTERNATIONAL DRIVING PERMIT' (often multilingual), issued under the "
+    "UN/Geneva conventions as an official translation of a national licence, "
+    "listing categories and the countries it is valid in. An IDP is 'Driving "
+    "Permit', NEVER 'Non UK Driving Licence' - they are different types with "
+    "different upload routes, so read the heading before choosing.\n"
     "   - 'Driving Licence Summary': the DVLA ONLINE 'Licence summary' / "
     "share-code printout (a gov.uk page headed 'Driver & Vehicle Licensing "
     "Agency' / 'Licence summary' with 'Driving status', a CHECK CODE, "
@@ -2468,7 +2769,13 @@ DISAMBIGUATION_RULES = (
     "the specific 'CV' type already covers it, so match it to 'CV'. LIKEWISE "
     "a course/training completion certificate of any kind (workshop, e-"
     "learning, first aid, mandatory training, a screenshot or photo of one) "
-    "is ALWAYS 'Training Certificate' - never an Other label.\n"
+    "is ALWAYS 'Training Certificate' - never an Other label. That second "
+    "half applies ONLY to documents that CERTIFY COMPLETION of a course: a "
+    "'Training Repayment Agreement' (a signed contract to repay training "
+    "costs) is 'Other - Training Repayment Agreement', and a former "
+    "employer's 'experience certificate'/character letter about a person's "
+    "job and conduct is 'Reference'. The word 'training', or a "
+    "certificate-like border, is not enough.\n"
     "15. THE CERTIFICATE OF SPONSORSHIP FAMILY - only the assigned CoS "
     "details record itself is 'Certificate of Sponsorship'. It must show the "
     "CoS's OWN fields: certificate/CoS number, sponsor (licence) details, the "
@@ -2499,21 +2806,55 @@ DISAMBIGUATION_RULES = (
     "its rough shape: return match=false, a LOW confidence, report the "
     "rotation, and describe what little you can see.\n"
     "18. MIXED BUNDLES: one scanned file sometimes contains several distinct "
-    "documents. Classify the FILE by its SUBSTANTIVE document, applying two "
+    "documents. THE IMAGES ARE THE FILE'S PAGES IN ORDER - image 1 is page 1. "
+    "Classify the FILE by its SUBSTANTIVE document, applying two "
     "principles in order: (a) a COVERING email/cover sheet never outranks "
     "the document it transmits - a reference-request email whose later pages "
     "contain the completed/written reference is a 'Reference' (only a chain "
     "with NO reference content is 'Reference Request Email'); (b) otherwise "
-    "the FIRST page's document wins - an unrelated attachment or appendix "
+    "THE FIRST COMPLETE DOCUMENT WINS - an unrelated attachment or appendix "
     "does not override what the file starts with (e.g. a health-declaration "
     "form with an unrelated table appended is still the health "
-    "declaration).\n"
+    "declaration). Apply (b) strictly on stacked ID scans and mixed packs: a "
+    "passport bio page on page 1 followed by a BRP on page 3 is 'Passport', "
+    "not 'BRP'; a criminal-record declaration on page 1 followed by an "
+    "emergency-contact form is 'Other - Criminal Record Check Declaration', "
+    "not 'Emergency Contact Details'. Do NOT classify from the most "
+    "interesting or most compliance-critical page - classify from the FIRST "
+    "one, and put the rest in 'bundle_starts'. If every document in the file "
+    "is the SAME type (two right-to-work checks, two insurance "
+    "certificates), that shared type is the answer.\n"
     "19. A FILLED-IN FORM IS NEVER A 'TEMPLATE'. When a form's fields are "
     "completed (names, answers, dates, a signature), classify it as the "
     "document its CONTENT makes it - a filled reference check form is a "
     "'Reference', a filled health questionnaire is a 'Health Declaration'. "
     "Only a genuinely BLANK specimen with empty fields may be described as "
     "a template (an Other document).\n"
+    "20. FOUR DOCUMENTS THAT ARE OFTEN GIVEN AN 'Other - ...' LABEL WHEN A "
+    "CONTROLLED NAME ALREADY COVERS THEM. A council-tax or utility bill is "
+    "'Proof of Address', NOT 'Other - council tax bill'. A bank account "
+    "statement is 'Bank Statement', NOT 'Other - bank statement'. A signed "
+    "staff-handbook receipt is 'Employee Handbook Receipt'. A curriculum "
+    "vitae is 'CV'. THIS RULE IS A SHORT LIST, NOT A GENERAL PREFERENCE: it "
+    "never overrides rule III. Where no controlled name genuinely fits, "
+    "match=false with a specific other_label is still the RIGHT answer, and "
+    "stretching the nearest controlled name over the document is still the "
+    "worst one.\n"
+    "21. UK vs NON-UK DRIVING LICENCE - DECIDE BY THE ISSUER, NOT BY THE "
+    "HOLDER. On a photocard licence the numbered fields mean: 3 = the "
+    "holder's date and PLACE OF BIRTH, 4c = the ISSUING AUTHORITY. Only 4c "
+    "decides the type. '4c. DVLA', a Union Jack, or a blue 'UK'/'GB' panel "
+    "means 'UK Driving Licence' - and a line such as '3. 04.12.1998 PAKISTAN' "
+    "or a foreign-sounding name changes NOTHING, because it describes the "
+    "person, not the card. Care-sector files are full of UK licences held by "
+    "workers born abroad; filing them as 'Non UK Driving Licence' is a "
+    "recurring and costly error (the two types take different Stage 3 upload "
+    "routes). 'PROVISIONAL DRIVING LICENCE' with a UK panel is a UK "
+    "provisional licence, still 'UK Driving Licence'. Use 'Non UK Driving "
+    "Licence' ONLY when the issuing authority itself is overseas (a foreign "
+    "country's name or transport authority printed as the issuer). And if the "
+    "document is headed 'INTERNATIONAL DRIVING PERMIT', it is neither: it is "
+    "'Driving Permit'.\n"
 )
 
 
@@ -2798,12 +3139,18 @@ class ClaudeAPI:
     # ---- 1) classify a document into the controlled vocabulary ----
     def classify_payload(self, vocab_block: str, imgs: list,
                          extracted_text: str, max_tokens: int = 500,
-                         note: str = ""):
+                         note: str = "", page_idxs=None, total_pages=None):
         """Build the (system, content_blocks, max_tokens) for a classification
         request. Shared by live classify() and Overnight Batch submission so BOTH
         modes send a byte-for-byte identical request (same system prompt, same
         image blocks, same max_tokens). This is the single definition of the
         classification prompt.
+        `page_idxs`/`total_pages` label each image with the REAL page it came
+        from ('Page 3 of 12'). Long documents are sampled (first two pages plus
+        the last), so without labels the model cannot tell 'the third image'
+        from 'page 3' - and rule 18(b), first complete document wins, is
+        decided on exactly that. Omit them and the images go unlabelled, as
+        before.
         (max_tokens must comfortably exceed the JSON reply: 320 used to truncate
         replies mid-'features', which parsed as {} and mis-filed the document.)"""
         system = (
@@ -2898,7 +3245,15 @@ class ClaudeAPI:
         blocks = []
         # rotation retries send MORE than MAX_PAGES images (one page rendered
         # in several orientations), so the cap is applied by the caller
-        for b in imgs[:max(DocRender.MAX_PAGES, len(imgs))]:
+        shown = imgs[:max(DocRender.MAX_PAGES, len(imgs))]
+        # only label when the labels are trustworthy: the rotation retry sends
+        # the SAME page four times, and its note explains that itself
+        label = (not note and page_idxs is not None
+                 and len(page_idxs) == len(shown) and total_pages)
+        for k, b in enumerate(shown):
+            if label:
+                blocks.append({"type": "text", "text":
+                               f"Page {page_idxs[k] + 1} of {total_pages}:"})
             blocks.append(self._img_block(b))
         ctx = f"CONTROLLED VOCABULARY:\n{vocab_block}\n\n"
         if extracted_text:
@@ -2910,13 +3265,14 @@ class ClaudeAPI:
         return system, blocks, max_tokens
 
     def classify(self, vocab_block: str, imgs: list, extracted_text: str,
-                 note: str = "") -> dict:
+                 note: str = "", page_idxs=None, total_pages=None) -> dict:
         """LIVE classify: build the shared request and POST it synchronously.
         The fixed system prompt is prompt-cached (cache_system=True). `note` is
         an optional per-document instruction appended to the (uncached) user
         message - used by the rotation retry."""
-        system, blocks, mt = self.classify_payload(vocab_block, imgs,
-                                                   extracted_text, note=note)
+        system, blocks, mt = self.classify_payload(
+            vocab_block, imgs, extracted_text, note=note,
+            page_idxs=page_idxs, total_pages=total_pages)
         raw = self._post(system, blocks, max_tokens=mt, cache_system=True)
         return self._json_from(raw)
 
@@ -4629,7 +4985,8 @@ def _second_opinion(escalation_api, vocab, path, resolution, out,
         text = out.get("used_text", "")
         note = ROTATION_RETRY_NOTE
     else:
-        imgs, text = DocRender.render(path, zoom=resolution, pages="all")
+        imgs, text = DocRender.render(path, zoom=resolution, pages="all",
+                                      rotate=out.get("pre_rotations") or {})
     if not imgs and not text:
         return out
     retry = escalation_api.classify(vocab, imgs, text, note=note)
@@ -4822,13 +5179,26 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
 
     if total_pages is None:
         total_pages = DocRender.page_count(path)
+    # PRE-CLASSIFICATION DESKEW. The free local text-direction check knows,
+    # for any PDF carrying a text layer, exactly which pages are stored
+    # sideways or upside down. It used to run only AFTER the answer came back
+    # (Engine._maybe_fix_rotation), so the model was asked to read a rotated
+    # page and only the reactive rotation retry could save it. Straighten the
+    # RENDER first instead: it costs no API call, and a page the model can
+    # read upright is a page it classifies from the content rather than the
+    # shape. The stored file is still physically corrected later, by the
+    # existing rotation-fix step.
+    pre_rot = detect_pdf_page_text_rotations(path) or {}
+    if pre_rot:
+        p1_imgs = p1_text = None      # any caller-supplied page 1 is skewed
     if p1_imgs is None and p1_text is None:
-        p1_imgs, p1_text = DocRender.render(path, zoom=resolution, pages="first")
+        p1_imgs, p1_text = DocRender.render(path, zoom=resolution,
+                                            pages="first", rotate=pre_rot)
     ext = path.suffix.lower()
     out = {"result": {}, "used_imgs": p1_imgs, "used_text": p1_text,
            "total_pages": total_pages, "page1_only": False,
            "triaged": False, "triage_reason": "", "rotation_retried": False,
-           "escalated": False, "page_idxs": [0]}
+           "escalated": False, "page_idxs": [0], "pre_rotations": pre_rot}
     if adaptive_pages and ext in PDF_EXT and total_pages > 1:
         tri = api.triage(vocab, p1_imgs[0] if p1_imgs else "",
                          p1_text, total_pages)
@@ -4844,10 +5214,12 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
             return _finish(out)
         out["triage_reason"] = str(tri.get("reason", ""))
         used_imgs, used_text = DocRender.render(path, zoom=resolution,
-                                                pages="all")
+                                                pages="all", rotate=pre_rot)
         out["used_imgs"], out["used_text"] = used_imgs, used_text
         out["page_idxs"] = _all_idxs()
-        out["result"] = api.classify(vocab, used_imgs, used_text)
+        out["result"] = api.classify(vocab, used_imgs, used_text,
+                                     page_idxs=out["page_idxs"],
+                                     total_pages=total_pages)
         if emit_cost:
             emit_cost()
         return _finish(out)
@@ -4855,10 +5227,12 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
     # (for single-page docs page 1 IS the whole doc)
     if ext in PDF_EXT and total_pages > 1 and not adaptive_pages:
         used_imgs, used_text = DocRender.render(path, zoom=resolution,
-                                                pages="all")
+                                                pages="all", rotate=pre_rot)
         out["used_imgs"], out["used_text"] = used_imgs, used_text
         out["page_idxs"] = _all_idxs()
-    out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"])
+    out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"],
+                                 page_idxs=out["page_idxs"],
+                                 total_pages=total_pages)
     if emit_cost:
         emit_cost()
     return _finish(out)
@@ -6379,7 +6753,9 @@ class Engine:
                     self.failed_log.record(self.care_home, w.name, f,
                                            "skipped: unrenderable", "")
                     continue
-                system, blocks, mt = self.api.classify_payload(vocab, imgs, text)
+                system, blocks, mt = self.api.classify_payload(
+                    vocab, imgs, text, page_idxs=_audit_pages_for(f),
+                    total_pages=DocRender.page_count(f))
                 # custom_id: stable, unique, derived from the content hash
                 # (sha-256 hex truncated + a per-hash counter for exact copies).
                 n = hash_counts.get(fhash, 0)
@@ -9074,7 +9450,7 @@ class App(tk.Tk):
         FX_RATE[0] = self.cfg.get("fx", 0.79)
         self.kb = KnowledgeBase()
 
-        self.title("Stage 2 — Processing  (Doc Review AI)")
+        self.title(f"Stage 2 — Processing  v{APP_VERSION}  (Doc Review AI)")
         self.configure(bg=BG)
         ui = 1.0
         if _api_usage is not None:
