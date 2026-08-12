@@ -527,7 +527,7 @@ def main():
             din, dout, gbp = _spent()
             out_rows.append([str(p), r["ai_name"], f"ERROR: {e}", "",
                              r["canonical"], "no", "", r["kind"],
-                             0, 0, "", din, dout, round(gbp, 5), 0])
+                             0, 0, "", "", din, dout, round(gbp, 5), 0])
             continue
 
         # interpret the result exactly as production does (auto-Other path)
@@ -581,6 +581,11 @@ def main():
                          "yes" if repro else "no", r["kind"],
                          len(core.get("used_imgs") or []),
                          len(core.get("ghost_pages") or []),
+                         # `rotation_path` only exists from v1.2.0; record the
+                         # boolean too or a BASELINE run (which sets only
+                         # rotation_retried) looks like it never rotated
+                         # anything and the rotation gate cannot be scored
+                         "yes" if core.get("rotation_retried") else "",
                          core.get("rotation_path", ""),
                          din, dout, round(gbp, 5), nseg])
 
@@ -592,7 +597,8 @@ def main():
         w.writerow(["file", "previous_AI_name", "new_prediction",
                     "confidence", "normalised_ideal", "match",
                     "reproduces_previous_error", "kind",
-                    "images_sent", "ghost_pages", "rotation_path",
+                    "images_sent", "ghost_pages", "rotation_retried",
+                    "rotation_path",
                     "in_tokens", "out_tokens", "gbp", "would_split_into"])
         w.writerows(out_rows)
         w.writerow([])
