@@ -5063,8 +5063,17 @@ def _rotation_retry(api, vocab, path, resolution, out, emit_cost=None):
                 fixes[i] = d
     if not fixes:
         fixes = {i: rot for i in idxs}
+    # the first render was already straightened by the free text-layer check,
+    # so the model's report is a turn ON TOP of that - compose the two or the
+    # confirmation would undo the deskew it never saw
+    pre = out.get("pre_rotations") or {}
+    render_rot = {}
+    for i in idxs:
+        deg = (int(pre.get(i, 0) or 0) + fixes.get(i, 0)) % 360
+        if deg in (90, 180, 270):
+            render_rot[i] = deg
     imgs, text = DocRender.render(path, zoom=resolution, pages=idxs,
-                                  rotate=fixes, max_pages=MAX_SEG_PAGES)
+                                  rotate=render_rot, max_pages=MAX_SEG_PAGES)
     if len(imgs) != len(idxs):
         return _rotation_retry_four(api, vocab, path, resolution, out,
                                     emit_cost)
@@ -6594,6 +6603,16 @@ class Engine:
                 if d in (90, 180, 270):
                     rot[i] = d
         rot.update(detect_pdf_page_text_rotations(f) or {})
+        # A ghost page was never shown to the model, so it has no correction of
+        # its own - but it is the back of the page before it and is stored the
+        # same way up. Give it that page's turn, or a split child ends up half
+        # upright and half sideways.
+        carry = 0
+        for i in range(total):
+            if i in rot:
+                carry = rot[i]
+            elif i in ghosts and carry:
+                rot[i] = carry
 
         # ---- write the parts, then archive the original (never deleted) --
         parts = []
