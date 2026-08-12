@@ -1,5 +1,170 @@
 # Changelog
 
+## v1.2.0 — UNRELEASED — in-call bundle segmentation + orientation rework
+
+> **Not released, not tagged, not merged.** Two of the four gates could not be
+> run: the Anthropic API credit balance was exhausted 59 documents into the
+> baseline. The bundle gate DID complete and it **fails** (78% correct against
+> an 80% bar, and one mis-split against a zero-mis-split bar). What is written
+> below is what was actually measured, including the failures. See
+> "What is still needed" at the end.
+
+### What changed
+
+Stage 2 classifies a *file*, so a scan holding four documents got one name and
+the other three left the compliance record. v1.2.0 asks the classification call
+— which already has the pages in front of it — to also return a per-page
+`documents` map, then splits locally with PyMuPDF.
+
+**Same-call segmentation shipped, not the escalation ladder.** The choice was
+made on measurement, before any API spend. Over the 130-file ground truth,
+sending every non-ghost page of a short file and dropping near-blank pages
+*reduces* images sent from 296 to 281 (−5.1%), with the median per file
+unchanged at 2. An escalation ladder would have cost a second call on every
+suspected bundle to buy a saving that ghost-page exclusion already pays for.
+
+**Ghost pages.** 141 of the 544 GT pages (26%) are near-blank versos, most
+carrying a mirror-image bleed-through of their own front. They are no longer
+sent to the model. They are never dropped from disk, and never start a segment.
+
+The ink threshold is 0.05% of pixels below grey 160, and it is deliberately
+low. Measured on real pages:
+
+| Page | Ink | What it is |
+|---|---:|---|
+| row 62 p2 | 0.08% | bleed-through ghost — *not* excluded at this threshold |
+| row 62 p3 | 0.19% | a real, full Certificate of Sponsorship |
+| typical content | 0.7–6% | ordinary pages |
+
+Only ~2.4× separates the faintest real page from the densest ghost, so some
+ghosts are let through on purpose: sending a blank page wastes a fraction of a
+penny, dropping a real one loses a document.
+
+**Split gates.** A split needs all of: the model saw the file in full; ≥2
+segments; ≥2 *distinct* types; every segment ≥75 confidence and a real
+vocabulary type; no segment starting on a blank page; segments tiling the file
+exactly. Two copies of one type are one type and are never split. Anything else
+leaves the file whole and flags it.
+
+**Orientation.** The four-orientation retry (four images to settle one page,
+fired on 40 of 130 documents in v1.1.0) is replaced by straightening the render
+locally from the rotation the model just reported and re-asking **once**. The
+old retry remains as the fallback when that confirmation is unconvinced.
+Rotation is now baked into split children, so split documents open upright.
+
+**A safety bug fixed on the way.** The `.splitbak` copy that was supposed to
+guarantee "a split never deletes a document" was being destroyed:
+`flatten_worker()` moves everything under a worker back into processing, and
+`cleanup_leftover_files()` deletes `.splitbak` outright (on by default).
+Originals now go to `APP_DIR/Original Bundles/<care home>/<worker>/`.
+
+### Gate 2 — bundles: **FAIL** (the one gate that completed)
+
+Ground truth: the 18 `multi_doc_bundle` rows of the Watra verification, expected
+maps derived from the notes written after a human read the evidence pages.
+
+| Outcome | n | |
+|---|---:|---|
+| CORRECT | 14 | 78% — the bar is 80% |
+| MISSED (left whole; acceptable) | 3 | rows 34, 64, 106 |
+| **MIS-SPLIT (a wrong boundary)** | **1** | **row 43 — the bar is zero** |
+
+Broken down by what each file should do:
+
+| Expectation | n | Result |
+|---|---:|---|
+| must NOT be split (8 same-type bundles, 3 too long to see in full) | 11 | **11/11 correct** — no file that should be left alone was split |
+| must be split | 7 | 3 correct (rows 60, 62, 114), 1 mis-split (43), 3 missed (34, 64, 106) |
+
+**Row 43 is a real defect, not a ground-truth artefact.** The model returned
+`[[1,2] UK Driving Licence, [3–12] Bank Statement]` for a 12-page ID bundle.
+Pages 5–8 are a DWP National Insurance letter ("Page 1 of 4") and page 11 is a
+Watra Care staff ID badge — both confirmed by rendering the pages. There is no
+bank statement in the file. It merged three documents and invented a type for
+them. Row 43 is the longest file segmentation attempted (8 non-ghost pages);
+every correct split had ≤4.
+
+**One ground-truth entry was corrected** after the run, and it is called out
+rather than quietly changed: row 60 was originally scored MIS-SPLIT for
+returning `[council tax][statement+statement]` instead of three segments. That
+contradicted this design's own rule — two copies of one type are one upload
+slot, which is exactly why the eight same-type bundles are scored as correctly
+*not* split. The corrected entry requires the council-tax boundary and lets the
+two statements share a segment.
+
+### Gates 1, 3, 4 — NOT RUN (API credits exhausted)
+
+| Gate | State |
+|---|---|
+| 1. Regression (identical names, zero spurious splits) | **not run** — baseline stopped at 59/130 |
+| 3. Rotation (≥38/40 floor, cheaper per rotated doc) | **not run** |
+| 4. Cost (median single-doc ≤ today's) | **partial** |
+
+What was measured before credits ran out:
+
+| | Baseline v1.1.0 (59 docs) | v1.2.0 bundle set (18 docs) |
+|---|---:|---:|
+| median £/doc | £0.02829 | £0.02647 |
+| mean £/doc | £0.02523 | £0.02401 |
+| median images/doc | 2 | 2 |
+
+These two sets are not the same documents, so this is **not** a valid
+before/after comparison — it is only evidence that nothing has blown up. The
+real cost gate needs both runs over the same 130 files. Spend so far: **£1.50
+baseline + £0.43 bundles = £1.93**.
+
+Zero spurious splits were flagged on the 59 baseline documents that completed,
+but the baseline runs v1.1.0 code, which cannot split at all — so that number
+proves nothing until the v1.2.0 regression run happens.
+
+Note for whoever re-runs this: the built-in pre-flight estimator is still low
+on rotated scans (it estimated £0.07 for the 18 bundle files; they cost £0.43,
+6×). That was known in v1.1.0 and is not fixed here.
+
+### What is still needed before this can ship
+
+1. **Top up the Anthropic API credits.** Everything below is blocked on it.
+2. Re-run the baseline to completion and run the v1.2.0 regression:
+   `python src\eval_classifier.py --tag v120-baseline` (against the v1.1.0
+   source) and `--tag v120`. Gate 1 needs identical names and zero splits on
+   the naming set; gate 4 compares the per-document £ columns.
+3. **Diagnose the three MISSED rows (34, 64, 106).** They are the difference
+   between 78% and passing. Row 106 is the known residual and its sibling row
+   114 — the same form pack for a different worker — split correctly, so 106 is
+   borderline rather than structurally impossible.
+   `scratchpad\diagnose.py` dumps the raw `documents` map for exactly these
+   files and was written for this; it never got to run.
+4. **Decide row 43.** The candidate fix is lowering `MAX_SEG_PAGES` from 12 to
+   7 non-ghost pages, which excludes row 43 from segmentation entirely (it
+   becomes a flagged MISSED, which is acceptable) while keeping every file that
+   split correctly. It is deliberately **not** applied here: it is a one-data-
+   point change and could not be re-measured.
+5. Only then: merge, tag, rebuild, release.
+
+**Version strings are already bumped on this branch** — `APP_VERSION = "1.2.0"`,
+`install.ps1 $Tag = "v1.2.0"`, installer `MyAppVersion 1.2`. The v1.2.0 GitHub
+release does not exist yet, so `install.ps1` on this branch would fail to
+download. That is safe while the branch is unmerged and is the reason it must
+not be merged before the release is cut.
+
+### The Ansa example — not tested
+
+The 8-page Ansa Shahid file (Share Code + Passport + Visa Vignette + BRP, three
+ghost versos, every page 90° out) is **not on this machine**. The bundle GT
+folder and its expected map are ready for it at
+`%LOCALAPPDATA%\Lifted\EvalGT\bundles\` — drop the file in and
+`scratchpad\make_bundle_gt.py` will pick it up by filename.
+
+### Residual row 106
+
+Still open, but no longer for the old reason. The v1.1.0 note said it "needs the
+file split, not a rule", and the machinery to split it now exists and is proven:
+an end-to-end test splits that exact file into
+`Other - Criminal Record Check Declaration.pdf` + `Emergency Contact Details.pdf`
+with the blank page 3 travelling with the second child and the original archived.
+What is not yet reliable is the model returning the two-document map for it on
+demand — it did for row 114, not for 106. See item 3 above.
+
 ## v1.1.0 — 2026-08-11 — Watra Care post-audit accuracy pass
 
 A post-run accuracy audit of the Watra Care Limited batch flagged 113 documents
