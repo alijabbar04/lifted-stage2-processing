@@ -132,7 +132,7 @@ on rotated scans (it estimated £0.07 for the 18 bundle files; they cost £0.43,
    between 78% and passing. Row 106 is the known residual and its sibling row
    114 — the same form pack for a different worker — split correctly, so 106 is
    borderline rather than structurally impossible.
-   `scratchpad\diagnose.py` dumps the raw `documents` map for exactly these
+   `src\diagnose_bundles.py` dumps the raw `documents` map for exactly these
    files and was written for this; it never got to run.
 4. **Decide row 43.** The candidate fix is lowering `MAX_SEG_PAGES` from 12 to
    7 non-ghost pages, which excludes row 43 from segmentation entirely (it
@@ -152,8 +152,8 @@ not be merged before the release is cut.
 The 8-page Ansa Shahid file (Share Code + Passport + Visa Vignette + BRP, three
 ghost versos, every page 90° out) is **not on this machine**. The bundle GT
 folder and its expected map are ready for it at
-`%LOCALAPPDATA%\Lifted\EvalGT\bundles\` — drop the file in and
-`scratchpad\make_bundle_gt.py` will pick it up by filename.
+`%LOCALAPPDATA%\Lifted\EvalGT\bundles\` — drop the file in as the only
+non-`row_` PDF there and re-run `python src\build_bundle_gt.py`.
 
 ### Residual row 106
 
