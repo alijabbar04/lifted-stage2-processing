@@ -1301,7 +1301,7 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -2338,7 +2338,8 @@ class DocRender:
         return 1
 
     @staticmethod
-    def render(path: Path, zoom: float = None, pages="all", rotate: int = 0):
+    def render(path: Path, zoom: float = None, pages="all", rotate: int = 0,
+               max_pages: int = None):
         """Return (list_of_b64_png, extracted_text).
         pages: "all" (a representative sample of up to MAX_PAGES - first two
         pages plus the LAST page for longer documents, so a signature/result
@@ -2359,7 +2360,7 @@ class DocRender:
                     rotate = int(rotate.get(0, 0) or 0)
                 return DocRender._image(path, zoom, rotate)
             if ext in PDF_EXT and HAS_FITZ:
-                return DocRender._pdf(path, zoom, pages, rotate)
+                return DocRender._pdf(path, zoom, pages, rotate, max_pages)
             if ext == ".txt":
                 return [], path.read_text(encoding="utf-8", errors="ignore")[:8000]
             if ext in (".docx", ".doc"):
@@ -2456,7 +2457,8 @@ class DocRender:
             return None, w, h
 
     @staticmethod
-    def _pdf(path: Path, zoom: float, pages, rotate: int = 0):
+    def _pdf(path: Path, zoom: float, pages, rotate: int = 0,
+             max_pages: int = None):
         imgs, text = [], []
         doc = fitz.open(path)
         try:
@@ -2472,7 +2474,12 @@ class DocRender:
                     # seen (same page count as before, so same cost)
                     idxs = [0, 1, total - 1]
             else:  # explicit list of indices
-                idxs = [i for i in pages if 0 <= i < total][:DocRender.MAX_PAGES]
+                # MAX_PAGES is a cost guard on the ordinary classification
+                # sample. Segmentation deliberately raises it (max_pages) so it
+                # can see a whole short file; the bundle scan does the same by
+                # chunking. Everything else keeps the old three-page ceiling.
+                lim = DocRender.MAX_PAGES if max_pages is None else max_pages
+                idxs = [i for i in pages if 0 <= i < total][:lim]
             base_mat = fitz.Matrix(zoom, zoom)
             per_page = rotate if isinstance(rotate, dict) else {}
             if not per_page and rotate in (90, 180, 270):
@@ -3139,7 +3146,8 @@ class ClaudeAPI:
     # ---- 1) classify a document into the controlled vocabulary ----
     def classify_payload(self, vocab_block: str, imgs: list,
                          extracted_text: str, max_tokens: int = 500,
-                         note: str = "", page_idxs=None, total_pages=None):
+                         note: str = "", page_idxs=None, total_pages=None,
+                         segment: bool = False):
         """Build the (system, content_blocks, max_tokens) for a classification
         request. Shared by live classify() and Overnight Batch submission so BOTH
         modes send a byte-for-byte identical request (same system prompt, same
@@ -3151,8 +3159,17 @@ class ClaudeAPI:
         from 'page 3' - and rule 18(b), first complete document wins, is
         decided on exactly that. Omit them and the images go unlabelled, as
         before.
+        `segment=True` (set only when the caller is showing EVERY non-ghost
+        page, see segmentation_pages) additionally asks for the per-page
+        `documents` map that lets a genuine multi-document file be split
+        locally. It is purely ADDITIVE: the top-level match/name/confidence
+        answer keeps exactly its old meaning - the whole file's single name
+        under rule 18(b) - so a file that is not split is named today's way.
         (max_tokens must comfortably exceed the JSON reply: 320 used to truncate
         replies mid-'features', which parsed as {} and mis-filed the document.)"""
+        if segment:
+            # the documents map costs output tokens roughly linear in pages
+            max_tokens = max(max_tokens, 500 + 60 * max(1, len(imgs)))
         system = (
             "You are a meticulous UK care-sector compliance document classifier. "
             "You are given the controlled vocabulary of allowed document names "
@@ -3242,6 +3259,46 @@ class ClaudeAPI:
             'separate document, [] for a single document>]}\n'
             "Set match=true only when confidence is high (>=80)."
         )
+        if segment:
+            # APPENDED, never woven in: a non-segmenting call keeps the exact
+            # system prompt it has always had, so its prompt cache entry and
+            # its answers are unchanged.
+            system += (
+                "\n\nPER-PAGE DOCUMENT MAP (additional task)\n"
+                "You are being shown EVERY readable page of this file, each "
+                "labelled with its REAL page number. As well as the single "
+                "answer above (which must stay the answer for the FIRST "
+                "complete document, exactly as instructed), return a "
+                "'documents' array that maps EVERY page number from 1 to "
+                f"{total_pages or len(imgs)} to the document it belongs to.\n"
+                "- Near-blank pages are NOT shown to you. A page number you "
+                "were not shown is the blank back of the page before it: put "
+                "it in the SAME document as the page before it.\n"
+                "- List the documents in page order. The first must start at "
+                "page 1. Page ranges must not overlap and must leave no gaps.\n"
+                "- A NEW document means a different ARTEFACT (a passport page "
+                "after a right-to-work check, a payslip after a contract) or "
+                "the same artefact for a DIFFERENT PERSON. Continuation pages "
+                "- page 2 of a contract, the BACK of the same card, a "
+                "signature page, an appendix - are the SAME document.\n"
+                "- TWO COPIES OF THE SAME KIND OF DOCUMENT (two right-to-work "
+                "checks, two insurance certificates, two bank statements) are "
+                "two documents of the SAME type: report them as separate "
+                "entries with the SAME 'type'. Never invent a different type "
+                "to make them look distinct.\n"
+                "- 'type' must be copied EXACTLY from the controlled "
+                "vocabulary, or be a short specific description for an "
+                "Other-group document. 'confidence' is per document, judged "
+                "only on the pages of THAT document.\n"
+                "- WHEN UNSURE, return ONE document covering every page. A "
+                "wrong boundary destroys a compliance record; leaving a bundle "
+                "whole merely leaves it as it is today.\n"
+                "Add to the JSON object:\n"
+                '"documents": [{"pages": [<real page numbers>], '
+                '"type": "<exact vocabulary name or short Other description>", '
+                '"document_date": "DD-MM-YYYY" or null, '
+                '"confidence": 0-100}]'
+            )
         blocks = []
         # rotation retries send MORE than MAX_PAGES images (one page rendered
         # in several orientations), so the cap is applied by the caller
@@ -3265,14 +3322,16 @@ class ClaudeAPI:
         return system, blocks, max_tokens
 
     def classify(self, vocab_block: str, imgs: list, extracted_text: str,
-                 note: str = "", page_idxs=None, total_pages=None) -> dict:
+                 note: str = "", page_idxs=None, total_pages=None,
+                 segment: bool = False) -> dict:
         """LIVE classify: build the shared request and POST it synchronously.
         The fixed system prompt is prompt-cached (cache_system=True). `note` is
         an optional per-document instruction appended to the (uncached) user
-        message - used by the rotation retry."""
+        message - used by the rotation retry. `segment` additionally requests
+        the per-page documents map (see classify_payload)."""
         system, blocks, mt = self.classify_payload(
             vocab_block, imgs, extracted_text, note=note,
-            page_idxs=page_idxs, total_pages=total_pages)
+            page_idxs=page_idxs, total_pages=total_pages, segment=segment)
         raw = self._post(system, blocks, max_tokens=mt, cache_system=True)
         return self._json_from(raw)
 
@@ -4933,16 +4992,24 @@ def _rot_of(result) -> int:
     return rot if rot in (90, 180, 270) else 0
 
 
-def _rotation_retry(api, vocab, path, resolution, out, emit_cost=None):
-    """If the classification reply says the page image is rotated (sideways
-    phone photos and scans are endemic in these files, and the model misreads
-    or refuses them), retry ONCE with page 1 rendered in all four orientations
-    in a single call. The retry is strictly better-informed, so its result
-    replaces the first one. No-op when the reply reports rotation 0."""
-    res = out.get("result") or {}
-    rot = _rot_of(res)
-    if not rot:
-        return out
+ROTATION_CONFIRM_NOTE = (
+    "NOTE: your previous view of this document reported it as scanned "
+    "rotated. Every page above has now been TURNED UPRIGHT accordingly and "
+    "re-rendered - read it as it now appears and classify it. In the "
+    "'rotation'/'rotations' fields report only any turn STILL needed for what "
+    "you can see now (0 when a page is now upright).")
+
+# Confidence the corrected-orientation view must reach for its answer to be
+# trusted. Below it the document falls through to the old four-orientation
+# retry, which is dearer but makes no assumption about which way is up.
+ROTATION_CONFIRM_MIN_CONF = 60
+
+
+def _rotation_retry_four(api, vocab, path, resolution, out, emit_cost=None):
+    """LAST RESORT: re-ask with page 1 rendered in all four orientations in a
+    single call, letting the model pick the upright copy. Four images for one
+    page, so it is the dearest way to settle orientation - used only when the
+    cheap corrected-render confirmation below could not."""
     rot_imgs = DocRender.render_page1_rotations(path, zoom=resolution)
     if len(rot_imgs) < 2:
         return out
@@ -4958,6 +5025,85 @@ def _rotation_retry(api, vocab, path, resolution, out, emit_cost=None):
         retry.pop("rotations", None)
         out["result"] = retry
         out["rotation_retried"] = True
+        out["rotation_path"] = "four-orientation"
+    return out
+
+
+def _rotation_retry(api, vocab, path, resolution, out, emit_cost=None):
+    """Settle a document the classifier reported as scanned rotated.
+
+    The reply already says WHICH WAY each page is turned (per-page
+    'rotations', or the whole-file 'rotation'). So instead of re-sending page 1
+    four times and asking the model to pick the upright copy - four images for
+    one page - straighten the render LOCALLY using what it just told us and
+    re-ask ONCE, at the same page count as the original call. That is roughly a
+    quarter of the old retry's images when it fires.
+
+    The confirmation sees pages already turned by `fixes`, so its own rotation
+    report is only the RESIDUAL turn still needed; the two are composed before
+    anything is physically rotated. If the confirmation comes back unconvinced
+    (below ROTATION_CONFIRM_MIN_CONF), the old four-orientation retry still
+    runs - a rotated document that cannot be read is worse than a dear one."""
+    res = out.get("result") or {}
+    rot = _rot_of(res)
+    if not rot:
+        return out
+    idxs = list(out.get("page_idxs") or [0])
+    # per-page corrections when the reply lines up with the pages shown,
+    # otherwise the single whole-file rotation applied to every page
+    fixes = {}
+    rots = res.get("rotations")
+    if isinstance(rots, list) and len(rots) == len(idxs):
+        for i, d in zip(idxs, rots):
+            try:
+                d = int(float(d or 0))
+            except Exception:
+                continue
+            if d in (90, 180, 270):
+                fixes[i] = d
+    if not fixes:
+        fixes = {i: rot for i in idxs}
+    imgs, text = DocRender.render(path, zoom=resolution, pages=idxs,
+                                  rotate=fixes, max_pages=MAX_SEG_PAGES)
+    if len(imgs) != len(idxs):
+        return _rotation_retry_four(api, vocab, path, resolution, out,
+                                    emit_cost)
+    confirm = api.classify(vocab, imgs, text, note=ROTATION_CONFIRM_NOTE,
+                           page_idxs=idxs,
+                           total_pages=out.get("total_pages"),
+                           segment=bool(out.get("segment_view")))
+    if emit_cost:
+        emit_cost()
+    if not confirm or _conf_int(confirm) < ROTATION_CONFIRM_MIN_CONF:
+        return _rotation_retry_four(api, vocab, path, resolution, out,
+                                    emit_cost)
+    # compose what we turned with any residual the confirmation still reports,
+    # so the stored file ends up upright in ONE physical rotation
+    residual = {}
+    crots = confirm.get("rotations")
+    if isinstance(crots, list) and len(crots) == len(idxs):
+        for i, d in zip(idxs, crots):
+            try:
+                d = int(float(d or 0))
+            except Exception:
+                continue
+            if d in (90, 180, 270):
+                residual[i] = d
+    else:
+        cr = _rot_of(confirm)
+        if cr:
+            residual = {i: cr for i in idxs}
+    final = {}
+    for i in idxs:
+        deg = (fixes.get(i, 0) + residual.get(i, 0)) % 360
+        if deg in (90, 180, 270):
+            final[i] = deg
+    confirm["rotations"] = [final.get(i, 0) for i in idxs]
+    confirm["rotation"] = final.get(idxs[0], 0) if idxs else 0
+    out["result"] = confirm
+    out["used_imgs"], out["used_text"] = imgs, text
+    out["rotation_retried"] = True
+    out["rotation_path"] = "corrected-render"
     return out
 
 
@@ -5010,136 +5156,223 @@ def rescue_result(api, vocab, path, resolution, result, *, emit_cost=None,
     Both steps are no-ops on confident, upright results, so this costs nothing
     for the vast majority of documents.
     Returns the same dict shape as classify_document_core."""
+    total = DocRender.page_count(path)
+    seg_idxs, seg_ghosts, seg_full = segmentation_pages(path, total)
     out = {"result": result or {}, "used_imgs": [], "used_text": "",
-           "rotation_retried": False, "escalated": False}
+           "rotation_retried": False, "escalated": False,
+           "total_pages": total, "page_idxs": seg_idxs,
+           "ghost_pages": sorted(seg_ghosts), "segment_view": seg_full,
+           "possible_bundle": bool(total > 1 and not seg_full)}
     out = _rotation_retry(api, vocab, path, resolution, out, emit_cost)
     return _second_opinion(escalation_api, vocab, path, resolution, out,
                            emit_cost)
 
 
-BUNDLE_SCAN_SYSTEM = (
-    "You are checking whether ONE scanned compliance file wrongly contains "
-    "SEVERAL distinct documents concatenated together (occasionally including "
-    "documents belonging to a DIFFERENT PERSON than the rest of the file).\n\n"
-    "You are shown the file's pages IN ORDER, each labelled with its real page "
-    "number. For EVERY page decide: does this page BEGIN a new, separate "
-    "document, or does it continue the document the previous page belongs to?\n\n"
-    "STRICT RULES - read carefully:\n"
-    "- A new document = a different ARTEFACT (a passport page after a DBS "
-    "certificate, a contract after an ID card) or the same kind of artefact "
-    "for a DIFFERENT PERSON (a second passport with a different name).\n"
-    "- NOT new: continuation pages of the same document - page 2+ of a "
-    "contract/letter/certificate/policy, the BACK of the same card, a "
-    "signature page at the end of the same form, an appendix of the same "
-    "report. Repetitive multi-page forms are ONE document.\n"
-    "- Judge by content: headings, letterheads, person names, document "
-    "numbers, page footers ('page 2 of 3' means continuation).\n"
-    "- WHEN UNCERTAIN, ANSWER false (continuation). Splitting a real "
-    "multi-page document in half is worse than leaving a bundle intact.\n"
-    "- Page 1 always begins the first document; never report it.\n\n"
-    "Respond ONLY with JSON, no prose:\n"
-    '{"multiple_documents": true|false, '
-    '"starts": [<real page numbers (as labelled) that BEGIN a new separate '
-    'document - never page 1; [] when the file is one document>], '
-    '"note": "<one short sentence>"}'
-)
+# ====================================================================
+# GHOST (near-blank) PAGES
+# --------------------------------------------------------------------
+# Care-home scanners produce a huge number of near-empty versos: the blank
+# back of a single-sided sheet, often carrying a faint mirror-image
+# bleed-through of its own front. 26% of the pages in the 2026-08-11 Watra
+# ground truth are such pages. They are worthless to the classifier, so they
+# are dropped from the images sent to the API - which is what pays for the
+# extra pages segmentation needs - but they are NEVER dropped from disk: a
+# ghost page is attached to the preceding segment when a file is split.
+#
+# CALIBRATION (measured over all 544 GT pages, threshold = fraction of pixels
+# darker than GHOST_INK_LEVEL on a small probe raster):
+#   0.00%  - 139 pages, truly blank versos (the dominant cluster)
+#   0.08%  - row 62 p2: a mirror-image bleed-through ghost of its own front
+#   0.19%  - row 62 p3: a REAL, full Certificate of Sponsorship (faint scan)
+#   0.7-6% - ordinary content pages
+# The gap between the faintest real page and the densest ghost is only ~2.4x,
+# so the threshold sits LOW and deliberately lets some ghosts through: sending
+# a blank page wastes a fraction of a penny, dropping a real page loses a
+# compliance document. Nothing is split on a ghost page's evidence anyway.
+GHOST_INK_LEVEL = 160      # grey level below which a pixel counts as ink
+GHOST_INK_FRAC  = 0.0005   # 0.05% of pixels - see calibration above
+_GHOST_PROBE_PX = 220      # long side of the throwaway probe raster
 
-BUNDLE_SCAN_ZOOM = 1.0     # low-cost render for the bundle scan
-BUNDLE_SCAN_WINDOW = 10    # pages per scan call (1 overlap page carried over)
+# Segmentation only ever looks at a file it can see IN FULL. Beyond this many
+# non-ghost pages the file is classified exactly as before and merely flagged
+# 'possible bundle' - blind segmentation of a file the model only sampled is
+# how a genuine 40-page contract gets cut in half.
+MAX_SEG_PAGES = 12
 
-# Document types that are inherently ONE PAGE (or one card, front/back): when
-# a 2-3 page PDF classifies as one of these, the extra pages are very often a
-# DIFFERENT stacked document (passport + driving licence + BRP scanned into
-# one file was the recurring real-world miss), so such files always get the
-# cheap full bundle scan even without a classifier hint. The scan itself
-# stays the sole authority on whether to split - a same-card back page or a
-# multi-page bank statement simply comes back 'single document'.
-_ID_PAGE_TYPES = {
-    "passport", "brp", "uk driving licence", "non uk driving licence",
-    "visa vignette", "national insurance number", "bank statement",
-    "evisa screenshot", "share code document", "id", "id badge",
-    "proof of address",
-}
+# A segment must be at least this confident to take part in a split. Deliberately
+# above AUTO_REVIEW_MATCH_CONF (60): naming a whole file at 60 is a recoverable
+# mistake, cutting a file at 60 is not.
+SEG_MIN_CONF = 75
 
 
-def _bundle_prone(result: dict) -> bool:
-    """True when the classification itself suggests the file might be a
-    stack of one-page documents: it matched an ID-family type, or the model
-    described the content as a mixed bundle."""
-    for key in ("name", "other_label", "guess"):
-        v = (result.get(key) or "").strip().lower()
-        if not v:
-            continue
-        if _norm_type(v) in _ID_PAGE_TYPES:
-            return True
-        if "bundle" in v or "mixed" in v:
-            return True
-    return False
-
-
-def detect_bundle_starts(api, path: Path, emit_cost=None, log=None):
-    """Scan EVERY page of a PDF for document boundaries and return the sorted
-    1-indexed page numbers where a NEW separate document begins (never 1;
-    empty list = single document).
-
-    This is the authoritative bundle check: classify() only ever sees a
-    <=MAX_PAGES sample, so a second worker's documents hiding at page 4+ are
-    invisible to it - this scan renders ALL pages (at low zoom to keep the
-    cost down) in windows of BUNDLE_SCAN_WINDOW with the previous window's
-    last page repeated as context, so a document straddling a window boundary
-    is still recognised as a continuation."""
-    total = DocRender.page_count(path)
-    if total < 2:
+def page_ink_fractions(path: Path) -> list:
+    """Fraction of dark pixels on each page of a PDF (index = page number - 1).
+    Cheap: every page is rasterised to a ~220px probe. Returns [] when the file
+    is not a readable PDF or Pillow is missing (callers then treat no page as a
+    ghost, i.e. today's behaviour)."""
+    if path.suffix.lower() not in PDF_EXT or not HAS_FITZ or not HAS_PIL:
         return []
-    starts: set = set()
-    idx = 0
-    prev_ctx = None            # (page_no, b64) carried into the next window
-    while idx < total:
-        end = min(idx + BUNDLE_SCAN_WINDOW, total)
-        want = list(range(idx, end))
-        # DocRender caps explicit page lists at MAX_PAGES (a classification
-        # cost guard) - render in chunks so the scan really sees EVERY page
-        imgs = []
-        for k in range(0, len(want), DocRender.MAX_PAGES):
-            chunk = want[k:k + DocRender.MAX_PAGES]
-            ims, _txt = DocRender.render(path, zoom=BUNDLE_SCAN_ZOOM,
-                                         pages=chunk)
-            imgs.extend(ims)
-        if len(imgs) != len(want):
-            return []   # a page failed to render -> labels would misalign;
-                        # never split on uncertain evidence
-        blocks = []
-        if prev_ctx is not None:
-            blocks.append({"type": "text", "text":
-                           f"CONTEXT ONLY - page {prev_ctx[0]} (already part "
-                           f"of the current document; do NOT report it):"})
-            blocks.append(api._img_block(prev_ctx[1]))
-        for off, b64 in enumerate(imgs):
-            blocks.append({"type": "text",
-                           "text": f"Page {want[off] + 1} of {total}:"})
-            blocks.append(api._img_block(b64))
-        blocks.append({"type": "text", "text":
-                       f"Decide for pages {want[0] + 1}-{want[-1] + 1}. "
-                       "JSON only."})
-        raw = api._post(BUNDLE_SCAN_SYSTEM, blocks, max_tokens=300,
-                        cache_system=True)
-        if emit_cost:
-            emit_cost()
-        data = api._json_from(raw)
-        for v in (data.get("starts") or []):
+    out = []
+    try:
+        doc = fitz.open(path)
+        try:
+            from io import BytesIO
+            for page in doc:
+                try:
+                    r = page.rect
+                    if r.width <= 0 or r.height <= 0:
+                        out.append(1.0)      # unmeasurable -> treat as content
+                        continue
+                    z = _GHOST_PROBE_PX / max(r.width, r.height)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+                    im = Image.open(BytesIO(pix.tobytes("png"))).convert("L")
+                    w, h = im.size
+                    if not (w and h):
+                        out.append(1.0)
+                        continue
+                    dark = sum(im.point(lambda v: 1 if v < GHOST_INK_LEVEL else 0,
+                                        mode="L").tobytes())
+                    out.append(dark / float(w * h))
+                except Exception:
+                    out.append(1.0)          # never ghost a page we failed to read
+        finally:
+            doc.close()
+    except Exception:
+        return []
+    return out
+
+
+def ghost_pages(path: Path, inks=None) -> set:
+    """0-based indices of the near-blank pages of a PDF. A file is never
+    reported as ALL ghost - if every page measures blank the measurement is
+    not to be trusted, so none are excluded."""
+    inks = page_ink_fractions(path) if inks is None else inks
+    if not inks:
+        return set()
+    g = {i for i, v in enumerate(inks) if v < GHOST_INK_FRAC}
+    return set() if len(g) == len(inks) else g
+
+
+def segmentation_pages(path: Path, total_pages: int, inks=None):
+    """Decide which pages the classify call should see.
+
+    Returns (page_idxs, ghosts, full_view):
+      page_idxs  0-based pages to render, in order
+      ghosts     0-based ghost pages (excluded from page_idxs)
+      full_view  True when page_idxs is EVERY non-ghost page, i.e. the model
+                 sees the whole file and its answer may be used to split it.
+    When the file has more than MAX_SEG_PAGES non-ghost pages, falls back to
+    today's sample (first two + last) and full_view is False."""
+    if total_pages <= 1 or path.suffix.lower() not in PDF_EXT:
+        return [0], set(), total_pages <= 1
+    ghosts = ghost_pages(path, inks)
+    keep = [i for i in range(total_pages) if i not in ghosts]
+    if not keep:
+        keep = list(range(total_pages))
+        ghosts = set()
+    if len(keep) <= MAX_SEG_PAGES:
+        return keep, ghosts, True
+    # too long to see in full: today's sampling policy, no segmentation
+    sample = [0, 1, total_pages - 1] if total_pages > DocRender.MAX_PAGES \
+        else list(range(total_pages))
+    return sample, ghosts, False
+
+
+def _seg_type_of(seg) -> str:
+    return str((seg or {}).get("type") or "").strip()
+
+
+def plan_segments(kb, result: dict, page_idxs: list, ghosts: set,
+                  total_pages: int):
+    """Turn the classifier's per-page `documents` map into a validated list of
+    physical page ranges to split into, or None to leave the file whole.
+
+    THE GATES (all must hold - a wrong split is worse than no split):
+      1. the model saw the file in full (checked by the caller via full_view);
+      2. at least 2 segments;
+      3. at least 2 DISTINCT controlled types - a multi-page file of ONE type
+         (a contract, an application form, two copies of the same check) is
+         never split;
+      4. every segment resolves to a real vocabulary type (or a confidently
+         described Other document) at >= SEG_MIN_CONF;
+      5. every segment holds at least one NON-GHOST page;
+      6. no segment STARTS on a ghost page (a bleed-through verso is never
+         evidence of a new document);
+      7. the segments tile the file exactly once, in order, with no gaps or
+         overlaps once ghost pages are attached to the segment before them.
+    Returns [{"pages": [0-based...], "type": str, "date": str, "conf": int,
+              "group": str, "matched": bool}] or None."""
+    docs = result.get("documents")
+    if not isinstance(docs, list) or len(docs) < 2:
+        return None
+    seen = set(page_idxs)
+    starts = []      # (0-based first page, segment dict)
+    for seg in docs:
+        if not isinstance(seg, dict):
+            return None
+        pages = seg.get("pages")
+        if not isinstance(pages, list) or not pages:
+            return None
+        nums = []
+        for v in pages:
             try:
                 n = int(v)
             except Exception:
-                continue
-            if want[0] + 1 <= n <= want[-1] + 1 and n != 1:
-                starts.add(n)
-        if imgs:
-            prev_ctx = (want[len(imgs) - 1] + 1, imgs[-1])
-        idx = end
-    out = sorted(starts)
-    if log and out:
-        log(f"      bundle scan: new documents begin at page(s) "
-            f"{', '.join(map(str, out))} of {total}")
+                return None
+            if not (1 <= n <= total_pages):
+                return None
+            nums.append(n - 1)
+        first = min(nums)
+        # gate 6: a segment may not begin on a ghost page
+        if first in ghosts:
+            return None
+        # gate 5: at least one page the model actually looked at
+        if not any(p in seen for p in nums):
+            return None
+        starts.append((first, seg))
+    starts.sort(key=lambda t: t[0])
+    firsts = [f for f, _ in starts]
+    if firsts[0] != 0 or len(set(firsts)) != len(firsts):
+        return None          # must start at page 1, no duplicate starts
+
+    out = []
+    for k, (first, seg) in enumerate(starts):
+        end = (starts[k + 1][0] - 1) if k + 1 < len(starts) else total_pages - 1
+        if end < first:
+            return None
+        rng = list(range(first, end + 1))
+        if all(p in ghosts for p in rng):
+            return None      # gate 5
+        conf = 0
+        try:
+            conf = int(float(seg.get("confidence", 0) or 0))
+        except Exception:
+            conf = 0
+        if conf < SEG_MIN_CONF:
+            return None      # gate 4
+        raw = _seg_type_of(seg)
+        if not raw:
+            return None
+        canon = kb.canonical_name(raw)
+        if canon and canon != "Other":
+            matched, name, group = True, canon, kb.group_of(canon)
+        else:
+            # an Other-group document is a legitimate segment, but only when
+            # the model actually described it (never a bare 'Other'/'Unknown')
+            low = raw.strip().lower()
+            if low in ("", "other", "unknown", "other - unknown"):
+                return None
+            matched, name, group = False, raw, "Other"
+        out.append({"pages": rng, "type": name, "group": group,
+                    "matched": matched, "conf": conf,
+                    "date": str(seg.get("document_date") or "").strip()})
+    # gate 3: at least two DISTINCT types
+    if len({_norm_type(s["type"]) for s in out}) < 2:
+        return None
+    # gate 7: the segments must tile the file exactly
+    covered = [p for s in out for p in s["pages"]]
+    if covered != list(range(total_pages)):
+        return None
     return out
 
 
@@ -5179,6 +5412,14 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
 
     if total_pages is None:
         total_pages = DocRender.page_count(path)
+    # PAGE SELECTION. Near-blank versos are dropped (they teach the model
+    # nothing) and, when what is left is small enough to show IN FULL, every
+    # remaining page is sent instead of the old three-page sample. Measured
+    # over the 130-file Watra ground truth that is a NET REDUCTION in images
+    # sent (296 -> 281, median per file unchanged), because the ghost pages
+    # removed outnumber the extra pages added - and it is what makes the
+    # per-page documents map trustworthy enough to split on.
+    seg_idxs, seg_ghosts, seg_full = segmentation_pages(path, total_pages)
     # PRE-CLASSIFICATION DESKEW. The free local text-direction check knows,
     # for any PDF carrying a text layer, exactly which pages are stored
     # sideways or upside down. It used to run only AFTER the answer came back
@@ -5198,7 +5439,33 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
     out = {"result": {}, "used_imgs": p1_imgs, "used_text": p1_text,
            "total_pages": total_pages, "page1_only": False,
            "triaged": False, "triage_reason": "", "rotation_retried": False,
-           "escalated": False, "page_idxs": [0], "pre_rotations": pre_rot}
+           "escalated": False, "page_idxs": [0], "pre_rotations": pre_rot,
+           "ghost_pages": sorted(seg_ghosts), "segment_view": False,
+           "possible_bundle": False}
+
+    def _render_selected(o):
+        """Render the pages segmentation_pages chose, and decide whether the
+        reply may be used to split. Segmentation is abandoned (silently, back
+        to today's behaviour) whenever the rendered images do not line up
+        one-for-one with the pages we asked for - _pdf drops a page it cannot
+        bring under the API's size limits, and a mislabelled page map is
+        exactly the evidence that produces a wrong boundary."""
+        imgs, text = DocRender.render(path, zoom=resolution, pages=seg_idxs,
+                                      rotate=pre_rot, max_pages=MAX_SEG_PAGES)
+        aligned = len(imgs) == len(seg_idxs)
+        if not aligned and seg_full:
+            # fall back to the historic three-page sample
+            imgs, text = DocRender.render(path, zoom=resolution, pages="all",
+                                          rotate=pre_rot)
+            o["page_idxs"] = _all_idxs()
+        else:
+            o["page_idxs"] = list(seg_idxs)
+        o["used_imgs"], o["used_text"] = imgs, text
+        o["segment_view"] = bool(seg_full and aligned and total_pages > 1)
+        # a file too long to see in full may still be a bundle - say so rather
+        # than segmenting on a sample
+        o["possible_bundle"] = bool(total_pages > 1 and not o["segment_view"])
+
     if adaptive_pages and ext in PDF_EXT and total_pages > 1:
         tri = api.triage(vocab, p1_imgs[0] if p1_imgs else "",
                          p1_text, total_pages)
@@ -5213,26 +5480,22 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
             out["page1_only"] = True
             return _finish(out)
         out["triage_reason"] = str(tri.get("reason", ""))
-        used_imgs, used_text = DocRender.render(path, zoom=resolution,
-                                                pages="all", rotate=pre_rot)
-        out["used_imgs"], out["used_text"] = used_imgs, used_text
-        out["page_idxs"] = _all_idxs()
-        out["result"] = api.classify(vocab, used_imgs, used_text,
+        _render_selected(out)
+        out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"],
                                      page_idxs=out["page_idxs"],
-                                     total_pages=total_pages)
+                                     total_pages=total_pages,
+                                     segment=out["segment_view"])
         if emit_cost:
             emit_cost()
         return _finish(out)
     # single page / image / adaptive off: classify page 1
     # (for single-page docs page 1 IS the whole doc)
     if ext in PDF_EXT and total_pages > 1 and not adaptive_pages:
-        used_imgs, used_text = DocRender.render(path, zoom=resolution,
-                                                pages="all", rotate=pre_rot)
-        out["used_imgs"], out["used_text"] = used_imgs, used_text
-        out["page_idxs"] = _all_idxs()
+        _render_selected(out)
     out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"],
                                  page_idxs=out["page_idxs"],
-                                 total_pages=total_pages)
+                                 total_pages=total_pages,
+                                 segment=out["segment_view"])
     if emit_cost:
         emit_cost()
     return _finish(out)
@@ -5736,7 +5999,12 @@ class Engine:
                       "batch_errored": 0, "batch_expired": 0,
                       "batch_canceled": 0, "batch_missing": 0,
                       "batch_in_tokens": 0, "batch_out_tokens": 0,
-                      "bundles_split": 0}
+                      "bundles_split": 0, "possible_bundles": 0}
+        # files that look like multi-document bundles but were deliberately
+        # NOT split (too long to see in full, or the split gates refused the
+        # boundaries). Surfaced in the processing report so they get a human
+        # look rather than vanishing into one name.
+        self.possible_bundles = []
 
     def _redact(self, name: str) -> str:
         """When redact_logs is on, mask a filename in log output so personal
@@ -6243,75 +6511,105 @@ class Engine:
         # 2-4) DEDUP -> SECOND PASS -> ORGANISE (shared tail, used by batch too).
         self._finish_worker(worker_dir, renamed_records)
 
-    # ---- multi-document bundle detection + split (live + batch) ----
+    # ---- multi-document bundle split, from the classify call's page map ----
+    BUNDLE_ARCHIVE_DIRNAME = "Original Bundles"
+
+    def _bundle_archive_dir(self, worker_dir: Path) -> Path:
+        """Where a split file's ORIGINAL is kept.
+
+        Deliberately OUTSIDE the worker folder. The old '<name>.splitbak'
+        sitting next to the parts was not the durable archive its name implied:
+        flatten_worker() moves every file under a worker back up into the
+        processing root, and cleanup_leftover_files() deletes '.splitbak'
+        outright (Settings 'clean up leftovers', on by default). Under APP_DIR
+        the original is out of reach of both and sits with the other audit
+        artefacts, so 'a split never destroys a document' is actually true."""
+        d = (APP_DIR / self.BUNDLE_ARCHIVE_DIRNAME
+             / safe_stem(self.care_home or "care home")
+             / safe_stem(worker_dir.name))
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
     def _maybe_split_bundle(self, worker_dir: Path, f: Path, result: dict,
                             vocab: str, records: list, *, interactive: bool,
                             default_source: str, unknown_queue, depth: int):
-        """Detect a file that wrongly contains SEVERAL distinct documents
-        (occasionally other workers' documents) and split it before filing.
+        """Split a file the classification call mapped to SEVERAL distinct
+        documents, before it is filed.
 
-        Trigger: classify() flagged 'bundle_starts' among the pages it saw,
-        OR the PDF has >=4 pages (classify only ever samples 3 pages, so a
-        second document hiding at page 4+ is invisible to it). The trigger is
-        then VERIFIED by detect_bundle_starts(), which scans every page - a
-        false trigger simply comes back 'single document' and costs one cheap
-        low-zoom call.
+        The evidence is the `documents` page map returned by that SAME call
+        (see classify_payload(segment=True)) - no separate boundary scan, and
+        no re-classification of the parts: each part's type, date and
+        confidence were already decided by the model that read the pages. A
+        bundle therefore costs no extra classification call at all, where the
+        previous design paid for a full-file boundary scan plus one classify
+        per part.
 
-        Returns the updated vocabulary block when the file WAS handled as a
-        bundle (each part classified + applied through the normal shared
-        path; the original set aside as '<name>.splitbak', never deleted), or
-        None when the file is a normal single document."""
+        plan_segments() applies the gates; every one of them failing simply
+        means the file is left whole and named exactly as it is today.
+
+        Returns the updated vocabulary block when the file WAS split, or None
+        when it is a normal single document."""
         if f.suffix.lower() not in PDF_EXT or not HAS_FITZ or not f.exists():
             return None
         total = DocRender.page_count(f)
         if total < 2:
             return None
-        hinted = []
-        for v in (result.get("bundle_starts") or []):
-            try:
-                n = int(v)
-            except Exception:
-                continue
-            if 2 <= n <= total:
-                hinted.append(n)
-        # ' [doc N]' parts were already boundary-scanned when created - only
-        # re-check one if the classifier itself raises a fresh suspicion
-        if not hinted and " [doc " in f.stem:
+        # parts of an earlier split are never re-split
+        if " [doc " in f.stem:
             return None
-        # Unhinted short files are normally skipped (classify saw every page
-        # of a 2-3 pager, so no hint usually means one document) - EXCEPT
-        # when the file classified as an inherently one-page ID type: a
-        # 2-3 page 'Passport' is very likely a stacked passport+licence+BRP
-        # scan the classifier failed to flag (the recurring real-world miss).
-        # The full scan below remains the only authority on splitting, so a
-        # false trigger costs one cheap low-zoom call and changes nothing.
-        if not hinted and total < 4 and not _bundle_prone(result):
+        inks = page_ink_fractions(f)
+        seg_idxs, ghosts, full_view = segmentation_pages(f, total, inks)
+        if not full_view:
+            # the model only ever saw a sample of this file - its page map
+            # cannot be trusted to cut it. Flag it for a human instead.
+            if _bundle_prone(result) or result.get("documents"):
+                self._flag_possible_bundle(worker_dir, f, total,
+                                           "too long to segment")
             return None
-        label = self._redact(f.name)
-        self.log(f"    · {label}: bundle check "
-                 f"({total} pages{', flagged by classifier' if hinted else ''})…")
-        starts = detect_bundle_starts(self.api, f, emit_cost=self._emit_cost,
-                                      log=self.log)
-        if not starts:
-            return None
-        # 0-based inclusive page segments between consecutive starts
-        bounds = [1] + starts + [total + 1]
-        segments = [(bounds[i] - 1, bounds[i + 1] - 2)
-                    for i in range(len(bounds) - 1)]
-        segments = [(a, b) for a, b in segments if b >= a]
-        if len(segments) < 2:
+        plan = plan_segments(self.kb, result, seg_idxs, ghosts, total)
+        if not plan:
+            if isinstance(result.get("documents"), list) \
+                    and len(result.get("documents") or []) > 1:
+                # the model saw more than one document but the gates refused
+                # the cut - the safest outcome, still worth a human look
+                self._flag_possible_bundle(worker_dir, f, total,
+                                           "segments failed the split gates")
             return None
 
-        # ---- write the parts, then set the original aside (never delete) --
+        label = self._redact(f.name)
+        # ---- per-page rotation to bake into the parts -------------------
+        # The free text-layer check wins where it speaks (it is exact); the
+        # model's per-page report covers the scans it cannot read. Applying it
+        # to the CHILDREN is what makes split documents open upright - the old
+        # path rotated the parent, which was then archived, and re-classified
+        # each part from scratch to rediscover the same rotation.
+        rot = {}
+        rots = result.get("rotations")
+        if isinstance(rots, list) and len(rots) == len(seg_idxs):
+            for i, d in zip(seg_idxs, rots):
+                try:
+                    d = int(float(d or 0))
+                except Exception:
+                    continue
+                if d in (90, 180, 270):
+                    rot[i] = d
+        rot.update(detect_pdf_page_text_rotations(f) or {})
+
+        # ---- write the parts, then archive the original (never deleted) --
         parts = []
         try:
             src = fitz.open(str(f))
             try:
-                for i, (a, b) in enumerate(segments, 1):
+                for i, seg in enumerate(plan, 1):
+                    a, b = seg["pages"][0], seg["pages"][-1]
                     out_path = unique_path(worker_dir,
                                            f"{f.stem} [doc {i}]", f.suffix)
                     w = fitz.open()
                     w.insert_pdf(src, from_page=a, to_page=b)
+                    for k, src_idx in enumerate(range(a, b + 1)):
+                        deg = rot.get(src_idx)
+                        if deg and k < len(w):
+                            w[k].set_rotation((w[k].rotation + deg) % 360)
                     w.save(str(out_path))
                     w.close()
                     parts.append(out_path)
@@ -6325,66 +6623,89 @@ class Engine:
                     pass
             self.log(f"    ! bundle split failed on {label}: {e} - left intact.")
             return None
-        bak = f.with_name(f.name + ".splitbak")
+
+        archived = None
         try:
-            if bak.exists():
-                bak = unique_path(worker_dir, f.name, ".splitbak")
-            f.rename(bak)
+            dest = self._bundle_archive_dir(worker_dir)
+            archived = unique_path(dest, f.stem, f.suffix)
+            shutil.move(str(f), str(archived))
         except Exception as e:
             for p in parts:
                 try:
                     p.unlink()
                 except Exception:
                     pass
-            self.log(f"    ! could not set aside original {label}: {e} - left intact.")
+            self.log(f"    ! could not archive original {label}: {e} - "
+                     f"left intact.")
             return None
-        self.stats["bundles_split"] = self.stats.get("bundles_split", 0) + 1
-        self.log(f"    ✂ {label}: contained {len(segments)} documents "
-                 f"(pages {', '.join(f'{a + 1}-{b + 1}' for a, b in segments)})"
-                 f" - split; original kept as {bak.name}")
-        try:
-            self.rename_log.record(self.care_home, worker_dir.name, f.name,
-                                   bak.name, "", "bundle-split")
-        except Exception:
-            pass
 
-        # ---- classify + apply each part through the normal shared path ----
-        for p in parts:
+        self.stats["bundles_split"] = self.stats.get("bundles_split", 0) + 1
+        self.log(f"    ✂ {label}: contained {len(plan)} documents "
+                 + ", ".join(f"p{s['pages'][0] + 1}-{s['pages'][-1] + 1} "
+                             f"{s['type']}" for s in plan)
+                 + f" - split; original archived to {archived.parent}")
+        # parent -> children mapping, so the audit tools can trace a split
+        for i, (p, seg) in enumerate(zip(parts, plan), 1):
+            try:
+                self.rename_log.record(
+                    self.care_home, worker_dir.name, f.name, p.name,
+                    f"pages {seg['pages'][0] + 1}-{seg['pages'][-1] + 1} of "
+                    f"{total}; original archived: {archived}",
+                    "bundle-split")
+            except Exception:
+                pass
+
+        # ---- apply each part through the normal shared path --------------
+        # The segment already carries the model's own type/confidence for
+        # exactly these pages, so no part is re-classified. From here a part is
+        # an ordinary document: same naming, same duplicate ranking, same
+        # OVERWRITE_TYPES placement.
+        for p, seg in zip(parts, plan):
             self._check_stop()
             try:
-                core = classify_document_core(
-                    self.api, vocab, p,
-                    resolution=self.resolution,
-                    adaptive_pages=self.adaptive_pages,
-                    emit_cost=self._emit_cost,
-                    escalation_api=self.escalation_api)
-                presult = core["result"] or {}
-                phash = file_hash(p)
-                nh = self._maybe_fix_rotation(p, presult,
-                                              page_idxs=core.get("page_idxs"))
+                presult = {
+                    "match": bool(seg["matched"]),
+                    "name": seg["type"] if seg["matched"] else "",
+                    "group": seg["group"],
+                    "confidence": seg["conf"],
+                    "features": f"page {seg['pages'][0] + 1}-"
+                                f"{seg['pages'][-1] + 1} of a {total}-page "
+                                f"bundle",
+                    "other_label": "" if seg["matched"] else seg["type"],
+                    "guess": seg["type"],
+                    "document_date": seg.get("date", ""),
+                    # already applied to the part's pages above
+                    "rotation": 0, "rotations": [],
+                }
                 vocab = self._apply_classification(
-                    worker_dir, p, presult, nh or phash, vocab, records,
+                    worker_dir, p, presult, file_hash(p), vocab, records,
                     interactive=interactive,
-                    page1_img=(core["used_imgs"][0] if core["used_imgs"] else None),
-                    used_imgs=core["used_imgs"], used_text=core["used_text"],
-                    default_source="bundle-split", unknown_queue=unknown_queue,
+                    used_imgs=[], used_text="",
+                    default_source="bundle-split",
+                    unknown_queue=unknown_queue,
                     _bundle_depth=depth + 1)
             except (StopRequested, CreditExhausted):
                 raise
-            except APIError as e:
-                self.log(f"    ! API error on bundle part "
-                         f"{self._redact(p.name)}: {e.message} - left for a "
-                         f"later pass.")
-                self.failed_log.record(self.care_home, worker_dir.name, p,
-                                       "bundle part API error",
-                                       getattr(e, "detail", ""))
-                self.stats["errors"] += 1
             except Exception as e:
                 self.log(f"    ! failed on bundle part "
                          f"{self._redact(p.name)}: {e}")
                 traceback.print_exc()
                 self.stats["errors"] += 1
         return vocab
+
+    def _flag_possible_bundle(self, worker_dir: Path, f: Path, total: int,
+                              why: str):
+        """Record that a file looks like a bundle that was NOT split, so it
+        reaches the processing report and the recheck queue instead of
+        disappearing silently into a single name."""
+        self.stats["possible_bundles"] = \
+            self.stats.get("possible_bundles", 0) + 1
+        self.possible_bundles.append(
+            {"worker": worker_dir.name, "file": f.name, "pages": total,
+             "reason": why})
+        self.log(f"    ? {self._redact(f.name)}: possible multi-document "
+                 f"bundle ({total} pages, {why}) - left whole, flagged for "
+                 f"review")
 
     # ---- shared apply of one classification result (live + batch) ----
     def _apply_classification(self, worker_dir: Path, f: Path, result: dict,
