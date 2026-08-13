@@ -5004,6 +5004,29 @@ ROTATION_CONFIRM_NOTE = (
 # retry, which is dearer but makes no assumption about which way is up.
 ROTATION_CONFIRM_MIN_CONF = 60
 
+# WHICH ROTATION PATH IS PRIMARY - measured, and currently OFF. Read this
+# before turning it on.
+#
+# The corrected-render confirmation (straighten locally from what the model
+# just reported, then re-ask ONCE) is about a quarter of the four-orientation
+# retry's images and measured 7.9% cheaper per rotated document. It is also
+# LESS ACCURATE, and not by a little: over the 130-file Watra ground truth,
+# the same 67 rotated documents scored
+#     four-orientation retry   64/67
+#     corrected-render         60/67
+# and the confidence floor above cannot recover the difference, because the
+# wrong answers are exactly as confident as the right ones - the seven misses
+# came back at 92, 92, 92, 92, 92, 92 and 95, against a correct-answer
+# distribution that is almost entirely 92-95. There is no threshold that
+# catches the misses without sending correct answers to the dearer path too.
+#
+# Four compliance documents misnamed is not worth 7.9% of the rotation
+# subset, so the proven path stays primary. The cheap path is kept, tested
+# and one flag away for anyone who later finds a signal that separates its
+# good answers from its bad ones (disagreement with the pre-rotation answer
+# is the obvious candidate, and is NOT yet measured).
+ROTATION_FAST_CONFIRM = False
+
 
 def _rotation_retry_four(api, vocab, path, resolution, out, emit_cost=None):
     """LAST RESORT: re-ask with page 1 rendered in all four orientations in a
@@ -5048,6 +5071,10 @@ def _rotation_retry(api, vocab, path, resolution, out, emit_cost=None):
     rot = _rot_of(res)
     if not rot:
         return out
+    if not ROTATION_FAST_CONFIRM:
+        # the proven path (see ROTATION_FAST_CONFIRM for the measurement)
+        return _rotation_retry_four(api, vocab, path, resolution, out,
+                                    emit_cost)
     idxs = list(out.get("page_idxs") or [0])
     # per-page corrections when the reply lines up with the pages shown,
     # otherwise the single whole-file rotation applied to every page
@@ -5288,15 +5315,23 @@ def segmentation_pages(path: Path, total_pages: int, inks=None):
         return [0], set(), total_pages <= 1
     ghosts = ghost_pages(path, inks)
     keep = [i for i in range(total_pages) if i not in ghosts]
-    if not keep:
-        keep = list(range(total_pages))
-        ghosts = set()
-    if len(keep) <= MAX_SEG_PAGES:
-        return keep, ghosts, True
-    # too long to see in full: today's sampling policy, no segmentation
     sample = [0, 1, total_pages - 1] if total_pages > DocRender.MAX_PAGES \
         else list(range(total_pages))
-    return sample, ghosts, False
+    # ONLY change what is sent when segmentation can actually use it. Dropping
+    # blank pages is not free: a request that differs from the one v1.1.0 made
+    # is a request that can come back with a different name, and on the
+    # borderline documents in these folders it measurably does. So a file that
+    # cannot be segmented is sent EXACTLY as before.
+    #
+    # This costs the headline saving. Blank-page exclusion was reducing 47 of
+    # the 130 ground-truth files to a SINGLE image - the two-sided sheet with
+    # a blank back, which is the commonest shape in a care-home folder and the
+    # source of nearly all the saving. It is also where the naming regressions
+    # were: a lone page cannot be split, so that request was being perturbed
+    # for no segmentation benefit at all.
+    if len(keep) < 2 or len(keep) > MAX_SEG_PAGES:
+        return sample, ghosts, False
+    return keep, ghosts, True
 
 
 def _seg_type_of(seg) -> str:
@@ -5493,7 +5528,14 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
         else:
             o["page_idxs"] = list(seg_idxs)
         o["used_imgs"], o["used_text"] = imgs, text
-        o["segment_view"] = bool(seg_full and aligned and total_pages > 1)
+        # Only ask for the documents map when a split is actually POSSIBLE:
+        # two or more pages worth looking at. On a file whose only readable
+        # page is page 1 (a one-sided sheet with a blank back is the commonest
+        # shape in these folders) the map can only ever say "one document",
+        # so the extra instructions buy nothing - and measurably cost
+        # something, having changed the answer on several such files.
+        o["segment_view"] = bool(seg_full and aligned and total_pages > 1
+                                 and len(o["page_idxs"]) >= 2)
         # a file too long to see in full may still be a bundle - say so rather
         # than segmenting on a sample
         o["possible_bundle"] = bool(total_pages > 1 and not o["segment_view"])

@@ -8,7 +8,13 @@ spec = importlib.util.spec_from_file_location("stage2", SRC)
 s2 = importlib.util.module_from_spec(spec); sys.modules["stage2"] = s2
 spec.loader.exec_module(s2)
 
-GT = Path(r"C:\Users\mrali\AppData\Local\Lifted\EvalGT\bundles")
+_root = (os.environ.get("STAGE2_GT_ROOT") or "").strip()
+_base = (Path(_root) if _root else
+         Path(os.environ.get("LOCALAPPDATA", "")) / "Lifted" / "EvalGT"
+         / "watra-postaudit")
+# look in the bundle set first, then the naming set - a file being diagnosed
+# for a SPURIOUS split lives in the naming set, not the bundle set
+SEARCH = [_base.parent / "bundles", _base / "Misnamed Files"]
 cfg = s2.load_config()
 s2.FX_RATE[0] = cfg.get("fx", 0.79)
 model_id = s2.MODELS[cfg["model"]]["id"]
@@ -17,10 +23,12 @@ adaptive = bool(cfg.get("adaptive_pages", True)) and cfg.get("run_mode") == "liv
 kb = s2.KnowledgeBase(); vocab = kb.vocabulary_block()
 api = s2.ClaudeAPI(s2.get_api_key(), model_id)
 
-WANT = [34, 43, 60, 64, 106]
+WANT = [int(a) for a in sys.argv[1:] if a.isdigit()] or [34, 43, 60, 64, 106]
 for n in WANT:
-    f = next(iter(GT.glob(f"row_{n:04d}*")), None)
+    f = next((h for d in SEARCH for h in sorted(d.glob(f"row_{n:04d}*"))
+              if d.is_dir()), None)
     if not f:
+        print(f"\n===== row {n}: no file found in {[str(d) for d in SEARCH]}")
         continue
     total = s2.DocRender.page_count(f)
     inks = s2.page_ink_fractions(f)
