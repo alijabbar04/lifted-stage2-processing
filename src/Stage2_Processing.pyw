@@ -5206,12 +5206,24 @@ _GHOST_PROBE_PX = 220      # long side of the throwaway probe raster
 # non-ghost pages the file is classified exactly as before and merely flagged
 # 'possible bundle' - blind segmentation of a file the model only sampled is
 # how a genuine 40-page contract gets cut in half.
-MAX_SEG_PAGES = 12
+#
+# 7, not the 12 this started at, and the reason is measured. The only wrong
+# boundary the bundle set produced was a 12-page ID bundle (8 non-ghost pages)
+# where the model merged a National Insurance letter and a staff ID badge into
+# one ten-page "Bank Statement" - at confidence 92, so no confidence floor
+# would have caught it. Every bundle that segmented CORRECTLY had at most 5
+# non-ghost pages. Past that the page map stops being reliable, and the design
+# says a wrong cut is worse than no cut: over the cap the file is classified
+# exactly as today and flagged for a human instead.
+MAX_SEG_PAGES = 7
 
-# A segment must be at least this confident to take part in a split. Deliberately
-# above AUTO_REVIEW_MATCH_CONF (60): naming a whole file at 60 is a recoverable
-# mistake, cutting a file at 60 is not.
-SEG_MIN_CONF = 75
+# A segment must be at least this confident to take part in a split. Above the
+# vocabulary's own AUTO_REVIEW_MATCH_CONF (60) - naming a whole file at 60 is
+# recoverable, cutting one is not - but not far above it: at 75 a correctly
+# identified 'ID Badge' reported at 70 was blocking an otherwise perfect
+# two-document split. Confidence guards the TYPE, not the boundary (see the
+# 92-confidence mis-split above), so it does not need to carry more than that.
+SEG_MIN_CONF = 70
 
 
 def page_ink_fractions(path: Path) -> list:
@@ -5331,14 +5343,25 @@ def plan_segments(kb, result: dict, page_idxs: list, ghosts: set,
             if not (1 <= n <= total_pages):
                 return None
             nums.append(n - 1)
+        # A segment made up ENTIRELY of blank pages is not a document - it is
+        # the trailing verso the model listed for completeness because it was
+        # asked to account for every page. Absorb it into the segment before
+        # it (which is what happens anyway once the ranges are tiled below)
+        # rather than refusing the whole split: a real 4-document bundle was
+        # being left whole purely because the model politely accounted for its
+        # last blank page.
+        if all(p in ghosts for p in nums):
+            continue
         first = min(nums)
-        # gate 6: a segment may not begin on a ghost page
+        # gate 6: a segment holding real content may not BEGIN on a ghost page
         if first in ghosts:
             return None
         # gate 5: at least one page the model actually looked at
         if not any(p in seen for p in nums):
             return None
         starts.append((first, seg))
+    if len(starts) < 2:
+        return None
     starts.sort(key=lambda t: t[0])
     firsts = [f for f, _ in starts]
     if firsts[0] != 0 or len(set(firsts)) != len(firsts):
