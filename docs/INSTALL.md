@@ -135,7 +135,8 @@ Inside each finished worker folder you get exactly two sub-folders:
 ```
 Jane Doe\
 ├── Overwrite Documents\    BRP, Share Code Document, CoS, driving licence, ...
-│                           (the 15 types Stage 3 uploads one at a time)
+│                           (the 16 types Stage 3 uploads one at a time,
+│                           including Employment Contract)
 └── Bulk\
     ├── Batch 01\           everything else, 30 files per batch
     └── Batch 02\

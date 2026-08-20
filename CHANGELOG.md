@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.3.0 — 2026-08-20 — autonomous bundles, orientation and upload policy
+
+- Employment Contract is now one of the 16 overwrite document types, keeping
+  Stage 2 and Stage 3 on the same individual-overwrite policy.
+- Short multi-page PDFs no longer exit at page-one triage; the full document map
+  is requested immediately when the file can be shown safely in one call.
+- Long PDFs now get an all-page boundary scan. A proposed cut is applied only
+  after independent high-confidence child classifications confirm every
+  boundary; originals remain archived and ambiguous packs stay whole.
+- Fixed the mixed-orientation control-flow bug where correcting one text-layer
+  page suppressed rotation fixes for scanned pages elsewhere in the same PDF.
+- Added optional one-click Ollama setup and a double-confirmed local vision pass
+  for image-only pages. Runtime/model failure is always a non-blocking fallback.
+
 ## v1.2.0 — UNRELEASED — in-call bundle segmentation + orientation rework
 
 > **Not released, not tagged, not merged.** All four gates were run to

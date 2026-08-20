@@ -54,7 +54,7 @@ For each worker, in order:
          Code Check Result, ECS Notice, Proof of Car Insurance, UK Driving
          Licence, Non UK Driving Licence, DBS Document, eVisa Screenshot, UKVI
          Draft Application, Proof of Vehicle Tax, Proof of Car Ownership, Visa
-         Vignette). Left loose, keeping any rank/date suffix on the filename
+         Vignette, Employment Contract). Left loose, keeping any rank/date suffix on the filename
          (the suffixes encode the upload order).
        - "Bulk"                : EVERY other document (all non-OVERWRITE_TYPES,
          including "Other" and any type not in the set), split into "Batch 01",
@@ -120,6 +120,7 @@ import datetime
 import threading
 import traceback
 import collections
+import tempfile
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -1253,6 +1254,7 @@ OVERWRITE_TYPES = {
     "Proof of Vehicle Tax",
     "Proof of Car Ownership",
     "Visa Vignette",
+    "Employment Contract",
 }
 
 # Normalised lookup (case-, space- and hyphen-insensitive) plus the legacy
@@ -1301,7 +1303,7 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -1500,6 +1502,10 @@ def load_config() -> dict:
            "second_opinion": True,
            # physically rewrite sideways scans upright once identified
            "auto_rotate": True,
+           # optional local Ollama vision pass for image-only pages; disabled
+           # until the operator activates/setup it in Settings
+           "local_ai_orientation": False,
+           "local_ai_model": "gemma3:4b",
            # detect files that wrongly contain SEVERAL documents (sometimes
            # other workers') and split them before classification
            "bundle_split": True,
@@ -1543,6 +1549,10 @@ def load_config() -> dict:
     cfg["convert_pdf"] = bool(cfg.get("convert_pdf", True))
     cfg["second_opinion"] = bool(cfg.get("second_opinion", True))
     cfg["auto_rotate"] = bool(cfg.get("auto_rotate", True))
+    cfg["local_ai_orientation"] = bool(
+        cfg.get("local_ai_orientation", False))
+    cfg["local_ai_model"] = str(
+        cfg.get("local_ai_model", "gemma3:4b") or "gemma3:4b").strip()
     cfg["bundle_split"] = bool(cfg.get("bundle_split", True))
     cfg["cleanup_leftovers"] = bool(cfg.get("cleanup_leftovers", True))
     cfg["post_run_audit"] = bool(cfg.get("post_run_audit", False))
@@ -4875,7 +4885,8 @@ def fix_file_rotation(path: Path, deg_clockwise: int) -> bool:
     return False
 
 
-def detect_pdf_page_text_rotations(path: Path, max_pages: int = None) -> dict:
+def detect_pdf_page_text_rotations(path: Path, max_pages: int = None,
+                                   include_upright: bool = False) -> dict:
     """FREE local PER-PAGE orientation check for PDFs that carry a text
     layer: for each page, infer the clockwise rotation needed to make its
     text read upright from the dominant writing direction of the text lines
@@ -4917,7 +4928,7 @@ def detect_pdf_page_text_rotations(path: Path, max_pages: int = None) -> dict:
                 if total < 40:              # too little text to trust
                     continue
                 best = max(votes, key=votes.get)
-                if best and votes[best] >= 0.8 * total:
+                if votes[best] >= 0.8 * total and (best or include_upright):
                     out[idx] = best
         finally:
             doc.close()
@@ -4935,6 +4946,298 @@ def detect_pdf_text_rotation(path: Path, max_pages: int = 3) -> int:
         return 0
     vals = set(per_page.values())
     return per_page[min(per_page)] if len(vals) == 1 else 0
+
+
+class OllamaOrientationDetector:
+    """Optional, local-only orientation check for image-only PDF pages.
+
+    Each page is checked twice: as stored and with a known 90-degree probe
+    turn.  A decision is accepted only when both high-confidence answers have
+    the mathematically expected relationship.  This costs no API money and no
+    document data leaves the laptop; it talks only to Ollama on 127.0.0.1.
+    """
+    URL = "http://127.0.0.1:11434/api/chat"
+    MIN_CONFIDENCE = 0.82
+    BATCH_SIZE = 6
+    FORMAT = {
+        "type": "object",
+        "properties": {
+            "rotation": {"type": "integer", "enum": [0, 90, 180, 270]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["rotation", "confidence"],
+    }
+    PROMPT = (
+        "Judge only the physical reading orientation of this scanned document "
+        "page. Return the CLOCKWISE turn needed to make normal text, faces, "
+        "logos and document layout upright: 0, 90, 180 or 270. Do not infer "
+        "orientation from the topic. Use a low confidence if the page is blank, "
+        "ambiguous, mostly handwriting, or has no reliable upright cues."
+    )
+
+    def __init__(self, model: str):
+        self.model = (model or "gemma3:4b").strip()
+
+    def _predict_many(self, images_b64: list):
+        schema = {
+            "type": "object",
+            "properties": {
+                "pages": {
+                    "type": "array",
+                    "minItems": len(images_b64),
+                    "maxItems": len(images_b64),
+                    "items": self.FORMAT,
+                }
+            },
+            "required": ["pages"],
+        }
+        body = {
+            "model": self.model,
+            "messages": [{
+                "role": "user",
+                "content": (self.PROMPT + f" There are {len(images_b64)} "
+                            "page images in order. Return exactly one result "
+                            "for each image in the pages array, same order."),
+                "images": images_b64,
+            }],
+            "stream": False,
+            "format": schema,
+            "options": {"temperature": 0},
+            "keep_alive": "5m",
+        }
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(self.URL, data=data, method="POST")
+        req.add_header("content-type", "application/json")
+        with urllib.request.urlopen(req, timeout=180) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        content = ((payload.get("message") or {}).get("content") or "").strip()
+        parsed = json.loads(content)
+        rows = parsed.get("pages") or []
+        if len(rows) != len(images_b64):
+            raise ValueError("local model returned the wrong number of pages")
+        out = []
+        for row in rows:
+            rotation = int(float(row.get("rotation", -1)))
+            confidence = float(row.get("confidence", 0) or 0)
+            if confidence > 1:
+                confidence /= 100.0
+            if rotation not in (0, 90, 180, 270):
+                raise ValueError("local model returned an invalid rotation")
+            out.append((rotation, max(0.0, min(1.0, confidence))))
+        return out
+
+    @staticmethod
+    def decisions_agree(stored_rotation: int, probe_rotation: int) -> bool:
+        """A 90° clockwise probe needs 90° less corrective rotation."""
+        return probe_rotation == ((stored_rotation - 90) % 360)
+
+    def detect_pdf_pages(self, path: Path, page_idxs, *, log=None) -> dict:
+        """Return {page: 0|90|180|270} only for double-confirmed pages."""
+        decisions = {}
+        unavailable_logged = False
+        rendered = []
+        for idx in page_idxs:
+            try:
+                original, _ = DocRender.render(
+                    path, zoom=1.15, pages=[idx], max_pages=1)
+                probe, _ = DocRender.render(
+                    path, zoom=1.15, pages=[idx], rotate={idx: 90},
+                    max_pages=1)
+                if len(original) != 1 or len(probe) != 1:
+                    continue
+                rendered.append((int(idx), original[0], probe[0]))
+            except Exception as exc:
+                if log and not unavailable_logged:
+                    log("    · local AI orientation unavailable for this run "
+                        f"({str(exc)[:100]}); using the standard checks")
+                    unavailable_logged = True
+                # A local service/model problem must never stop processing.
+                break
+        for offset in range(0, len(rendered), self.BATCH_SIZE):
+            batch = rendered[offset:offset + self.BATCH_SIZE]
+            try:
+                base = self._predict_many([row[1] for row in batch])
+                probe = self._predict_many([row[2] for row in batch])
+                for (idx, _original, _probe), base_row, probe_row in zip(
+                        batch, base, probe):
+                    base_deg, base_conf = base_row
+                    probe_deg, probe_conf = probe_row
+                    if (base_conf >= self.MIN_CONFIDENCE
+                            and probe_conf >= self.MIN_CONFIDENCE
+                            and self.decisions_agree(base_deg, probe_deg)):
+                        decisions[idx] = base_deg
+            except Exception as exc:
+                if log and not unavailable_logged:
+                    log("    · local AI orientation unavailable for this run "
+                        f"({str(exc)[:100]}); using the standard checks")
+                    unavailable_logged = True
+                break
+        return decisions
+
+
+def _system_ram_gb() -> float:
+    """Best-effort physical-memory figure for the local-AI suitability gate."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong),
+                            ("memory_load", ctypes.c_ulong),
+                            ("total_phys", ctypes.c_ulonglong),
+                            ("avail_phys", ctypes.c_ulonglong),
+                            ("total_page_file", ctypes.c_ulonglong),
+                            ("avail_page_file", ctypes.c_ulonglong),
+                            ("total_virtual", ctypes.c_ulonglong),
+                            ("avail_virtual", ctypes.c_ulonglong),
+                            ("avail_extended_virtual", ctypes.c_ulonglong)]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                    ctypes.byref(status)):
+                return status.total_phys / (1024 ** 3)
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return pages * page_size / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _ollama_executable():
+    found = shutil.which("ollama")
+    if found:
+        return Path(found)
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" /
+        "ollama.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Ollama" / "ollama.exe",
+    ]
+    return next((p for p in candidates if p.is_file()), None)
+
+
+def _ollama_json(path: str, body=None, timeout=8):
+    url = "http://127.0.0.1:11434" + path
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 method="GET" if data is None else "POST")
+    if data is not None:
+        req.add_header("content-type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _installed_ollama_vision_models() -> list:
+    """Installed Ollama model names whose declared capabilities include vision."""
+    try:
+        tags = _ollama_json("/api/tags").get("models") or []
+    except Exception:
+        return []
+    out = []
+    for row in tags:
+        name = str(row.get("name") or row.get("model") or "").strip()
+        if not name:
+            continue
+        try:
+            shown = _ollama_json("/api/show", {"model": name})
+            caps = {str(v).casefold() for v in shown.get("capabilities") or []}
+            if "vision" in caps:
+                out.append(name)
+        except Exception:
+            continue
+    # Orientation is a small visual task repeated many times. Prefer the 4B
+    # variant; the 12B model was measured taking >120 seconds for one cold page
+    # on a 32 GB mostly-CPU laptop, which is accurate but operationally useless.
+    return sorted(out, key=lambda n: ("gemma3" not in n.casefold(),
+                                      "4b" not in n.casefold(), n))
+
+
+def setup_local_ai(progress=None):
+    """Install/start Ollama if needed and ensure a suitable vision model.
+
+    This is called only by the explicit Settings button. It returns
+    (success, model_name, operator_message) and never raises into the UI.
+    """
+    tell = progress or (lambda _message: None)
+    ram = _system_ram_gb()
+    try:
+        free_gb = shutil.disk_usage(APP_DIR.parent).free / (1024 ** 3)
+    except Exception:
+        free_gb = 0
+    if ram and ram < 12:
+        return False, "", (f"This device has {ram:.0f} GB RAM; local document "
+                           "vision needs at least 12 GB.")
+    if free_gb and free_gb < 8:
+        return False, "", (f"Only {free_gb:.1f} GB is free; keep at least 8 GB "
+                           "free before installing the local model.")
+
+    exe = _ollama_executable()
+    flags = 0x08000000 if os.name == "nt" else 0
+    if exe is None:
+        winget = shutil.which("winget")
+        if not winget:
+            return False, "", ("Ollama is not installed and Windows Package "
+                               "Manager is unavailable. Install Ollama once, "
+                               "then press Set up again.")
+        tell("Installing the local AI runtime…")
+        try:
+            completed = subprocess.run(
+                [winget, "install", "--id", "Ollama.Ollama", "-e",
+                 "--accept-package-agreements", "--accept-source-agreements",
+                 "--silent"], timeout=900, creationflags=flags,
+                capture_output=True, text=True)
+            if completed.returncode != 0:
+                return False, "", "Ollama installation did not complete."
+        except Exception as exc:
+            return False, "", f"Could not install Ollama: {exc}"
+        exe = _ollama_executable()
+        if exe is None:
+            return False, "", "Ollama installed but could not yet be located."
+
+    try:
+        _ollama_json("/api/version", timeout=2)
+    except Exception:
+        tell("Starting the local AI service…")
+        try:
+            subprocess.Popen([str(exe), "serve"], creationflags=flags,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            return False, "", f"Could not start Ollama: {exc}"
+        for _ in range(20):
+            time.sleep(0.5)
+            try:
+                _ollama_json("/api/version", timeout=2)
+                break
+            except Exception:
+                pass
+        else:
+            return False, "", "Ollama did not become ready."
+
+    model = "gemma3:4b"
+    installed = _installed_ollama_vision_models()
+    fast = next((m for m in installed
+                 if m.casefold().startswith("gemma3:4b")), None)
+    if fast:
+        return True, fast, (f"Ready: {fast} will check image-only page "
+                            "orientation locally.")
+
+    tell(f"Downloading {model} once (about 3–4 GB)…")
+    try:
+        completed = subprocess.run(
+            [str(exe), "pull", model], timeout=3600, creationflags=flags,
+            capture_output=True, text=True)
+        if completed.returncode != 0:
+            return False, "", f"The {model} download did not complete."
+    except Exception as exc:
+        return False, "", f"Could not download {model}: {exc}"
+    installed = _installed_ollama_vision_models()
+    if model not in installed and not any(
+            m.casefold().startswith("gemma3:4b") for m in installed):
+        return False, "", "The model downloaded but its vision capability was not found."
+    chosen = next((m for m in installed
+                   if m.casefold().startswith("gemma3:4b")), model)
+    return True, chosen, f"Ready: {chosen} is installed and configured."
 
 
 def fix_pdf_page_rotations(path: Path, rotations: dict) -> int:
@@ -5252,6 +5555,137 @@ MAX_SEG_PAGES = 7
 # 92-confidence mis-split above), so it does not need to carry more than that.
 SEG_MIN_CONF = 70
 
+# Long files cannot safely use the one-call page map above, because the model
+# only sees a sample.  They get a separate low-resolution boundary scan over
+# EVERY page.  A boundary is still only a proposal: before anything is cut,
+# each proposed child is classified independently and every adjacent pair must
+# be confidently different.  This two-signal design keeps the measured
+# zero-mis-split bias while no longer abandoning large passport/visa/BRP packs.
+LONG_BUNDLE_SCAN_ZOOM = 1.0
+LONG_BUNDLE_SCAN_WINDOW = 10
+LONG_BUNDLE_SCAN_OVERLAP = 2
+LONG_BUNDLE_CONFIRM_CONF = 80
+
+_ID_PAGE_TYPES = {
+    "passport", "brp", "uk driving licence", "non uk driving licence",
+    "visa vignette", "national insurance number", "bank statement",
+    "evisa screenshot", "share code document", "id", "id badge",
+    "proof of address",
+}
+
+
+def _bundle_prone(result: dict) -> bool:
+    """Whether a whole-file answer has the shape of a stacked-ID bundle."""
+    for key in ("name", "other_label", "guess"):
+        value = (result.get(key) or "").strip().lower()
+        if not value:
+            continue
+        if _norm_type(value) in _ID_PAGE_TYPES:
+            return True
+        if "bundle" in value or "mixed" in value:
+            return True
+    return False
+
+
+LONG_BUNDLE_SCAN_SYSTEM = (
+    "You are checking whether one scanned worker-compliance PDF contains "
+    "several separate documents concatenated together. Pages are shown in "
+    "their original order and labelled with their real page numbers. Report "
+    "a page only when it BEGINS a new artefact: for example a visa after a "
+    "passport, a BRP after a visa, or a document for a different person. "
+    "A continuation page, the reverse of the same card, a signature page, an "
+    "appendix, or the next page of one contract is NOT a new document. Use "
+    "names, document numbers, headings, page numbering and issuers as evidence. "
+    "When uncertain, do not report a boundary; leaving a bundle whole is safer "
+    "than cutting a real document. Never report page 1. Respond only as JSON: "
+    "{\"multiple_documents\": true|false, \"starts\": [real page numbers "
+    "that begin a new document], \"note\": \"short reason\"}."
+)
+
+
+def bundle_page_ranges(total_pages: int, starts) -> list:
+    """Convert 1-based boundary pages into complete 0-based page ranges."""
+    clean = set()
+    for value in starts or []:
+        try:
+            n = int(value)
+        except Exception:
+            continue
+        if 2 <= n <= total_pages:
+            clean.add(n)
+    bounds = [1] + sorted(clean) + [total_pages + 1]
+    return [list(range(bounds[i] - 1, bounds[i + 1] - 1))
+            for i in range(len(bounds) - 1)
+            if bounds[i + 1] > bounds[i]]
+
+
+def detect_long_bundle_starts(api, path: Path, *, emit_cost=None, log=None):
+    """Return proposed 1-based boundaries after scanning every PDF page.
+
+    Windows overlap by two pages so a boundary at a window edge is also seen
+    with its preceding page.  A failed/misaligned render returns an empty list
+    and therefore can never cause a cut.  Proposals are independently checked
+    by Engine._confirm_long_bundle_plan before this method's output is acted on.
+    """
+    total = DocRender.page_count(path)
+    if total < 2:
+        return []
+    rotations = detect_pdf_page_text_rotations(path) or {}
+    starts = set()
+    stride = max(1, LONG_BUNDLE_SCAN_WINDOW - LONG_BUNDLE_SCAN_OVERLAP)
+    window_start = 0
+    while window_start < total:
+        window_end = min(total, window_start + LONG_BUNDLE_SCAN_WINDOW)
+        want = list(range(window_start, window_end))
+        imgs = []
+        for offset in range(0, len(want), DocRender.MAX_PAGES):
+            chunk = want[offset:offset + DocRender.MAX_PAGES]
+            chunk_imgs, _ = DocRender.render(
+                path, zoom=LONG_BUNDLE_SCAN_ZOOM, pages=chunk,
+                rotate=rotations, max_pages=len(chunk))
+            imgs.extend(chunk_imgs)
+        if len(imgs) != len(want):
+            if log:
+                log("      long bundle scan skipped: one or more pages could "
+                    "not be rendered safely")
+            return []
+        blocks = []
+        for page_idx, b64 in zip(want, imgs):
+            blocks.append({"type": "text",
+                           "text": f"Page {page_idx + 1} of {total}:"})
+            blocks.append(api._img_block(b64))
+        blocks.append({
+            "type": "text",
+            "text": (f"Assess pages {want[0] + 1}-{want[-1] + 1}. "
+                     "Only report a start when the immediately preceding page "
+                     "is also visible; JSON only."),
+        })
+        raw = api._post(LONG_BUNDLE_SCAN_SYSTEM, blocks, max_tokens=300,
+                        cache_system=True)
+        if emit_cost:
+            emit_cost()
+        data = api._json_from(raw)
+        for value in data.get("starts") or []:
+            try:
+                n = int(value)
+            except Exception:
+                continue
+            # Reject the first page of any later window: there is no visible
+            # preceding page in that framing. The overlap ensures it appeared
+            # near the end of the previous window instead.
+            first_shown = want[0] + 1
+            if (2 <= n <= total and first_shown <= n <= want[-1] + 1
+                    and not (window_start and n == first_shown)):
+                starts.add(n)
+        if window_end >= total:
+            break
+        window_start += stride
+    out = sorted(starts)
+    if log and out:
+        log("      boundary scan proposed new document(s) at page "
+            + ", ".join(map(str, out)))
+    return out
+
 
 def page_ink_fractions(path: Path) -> list:
     """Fraction of dark pixels on each page of a PDF (index = page number - 1).
@@ -5445,7 +5879,8 @@ def plan_segments(kb, result: dict, page_idxs: list, ghosts: set,
 
 def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
                            p1_imgs=None, p1_text=None, total_pages=None,
-                           emit_cost=None, escalation_api=None):
+                           emit_cost=None, escalation_api=None,
+                           bundle_split=True):
     """Classify ONE document file through the live-mode path.
 
     p1_imgs/p1_text/total_pages may be passed in when the caller has already
@@ -5456,6 +5891,10 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
     `emit_cost` is called after every API call (the Engine uses it to update
     the live £ meter and enforce the budget ceiling). `escalation_api` is an
     optional stronger-model client for the low-confidence second opinion.
+    When `bundle_split` is enabled, a short multi-page PDF which can be shown
+    in full deliberately bypasses page-one triage.  Otherwise a confident
+    passport on page 1 can hide a BRP or visa on page 2 before the bundle map
+    is ever requested.
 
     Returns a dict:
       {"result": <classification dict>, "used_imgs": [...], "used_text": str,
@@ -5539,6 +5978,25 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
         # a file too long to see in full may still be a bundle - say so rather
         # than segmenting on a sample
         o["possible_bundle"] = bool(total_pages > 1 and not o["segment_view"])
+
+    # BUNDLE-SAFE ADAPTIVE PATH.  Page-one triage is an optimisation for a
+    # single document; it cannot prove that later pages do not begin a second
+    # document.  When the entire useful short PDF fits in one classification
+    # call, skip that triage call and ask for the page map immediately.  This
+    # both closes the recurring passport+visa+BRP miss and avoids paying for a
+    # triage call immediately followed by classification.
+    if (bundle_split and adaptive_pages and ext in PDF_EXT
+            and total_pages > 1 and seg_full and len(seg_idxs) >= 2):
+        _render_selected(out)
+        if out["segment_view"]:
+            out["triage_reason"] = "short file shown in full for bundle safety"
+            out["result"] = api.classify(
+                vocab, out["used_imgs"], out["used_text"],
+                page_idxs=out["page_idxs"], total_pages=total_pages,
+                segment=True)
+            if emit_cost:
+                emit_cost()
+            return _finish(out)
 
     if adaptive_pages and ext in PDF_EXT and total_pages > 1:
         tri = api.triage(vocab, p1_imgs[0] if p1_imgs else "",
@@ -6000,6 +6458,8 @@ class Engine:
                  review_unknowns=None,
                  escalation_api: "ClaudeAPI" = None,
                  auto_rotate: bool = True,
+                 local_ai_orientation: bool = False,
+                 local_ai_model: str = "gemma3:4b",
                  bundle_split: bool = True,
                  cleanup_leftovers: bool = True,
                  post_run_audit: bool = False):
@@ -6011,6 +6471,10 @@ class Engine:
         self.escalation_api = escalation_api
         # physically rewrite sideways scans upright once identified
         self.auto_rotate = bool(auto_rotate)
+        # optional local-only vision pass for pages without a readable text
+        # layer; model setup is explicit in Settings and failure is non-fatal
+        self.local_ai_orientation = bool(local_ai_orientation)
+        self.local_ai_model = str(local_ai_model or "gemma3:4b")
         # detect+split files that wrongly contain several documents
         self.bundle_split = bool(bundle_split)
         # delete processing residue (.splitbak/.zip) per worker when done
@@ -6140,38 +6604,80 @@ class Engine:
         if not self.auto_rotate:
             return None
         fixed_n = 0
-        # FREE per-page text check first: fixes files that mix upright and
-        # rotated pages (whole-file rotation cannot), across ALL pages
-        per_page = detect_pdf_page_text_rotations(f)
-        if per_page:
-            fixed_n = fix_pdf_page_rotations(f, per_page)
-        if not fixed_n and _conf_int(result) >= 60:
-            # model's per-page report for the pages it actually saw
+        total = DocRender.page_count(f)
+        fixes = {}
+        resolved = set()
+
+        # FREE text direction across every PDF page. Include confident upright
+        # (0°) decisions in `resolved`: they need no rewrite, but prevent a
+        # weaker later signal from turning an already-upright text page.
+        text_decisions = detect_pdf_page_text_rotations(
+            f, include_upright=True)
+        resolved.update(text_decisions)
+        fixes.update({i: d for i, d in text_decisions.items() if d})
+
+        # Optional all-page local vision for pages without enough embedded text.
+        # Double-confirmation inside the detector makes this stronger than the
+        # single model report, so its upright and rotated decisions take
+        # precedence. A missing Ollama service simply falls through.
+        if (self.local_ai_orientation and f.suffix.lower() in PDF_EXT
+                and total > 0):
+            unresolved = [i for i in range(total) if i not in resolved]
+            if unresolved:
+                local = OllamaOrientationDetector(
+                    self.local_ai_model).detect_pdf_pages(
+                        f, unresolved, log=self.log)
+                if local:
+                    resolved.update(local)
+                    fixes.update({i: d for i, d in local.items() if d})
+                    self.log(f"    · local AI verified the orientation of "
+                             f"{len(local)} image-only page(s)")
+
+        # The cloud classifier covers every page it actually saw. Combine its
+        # answers with the text/local decisions instead of the previous
+        # all-or-nothing `if not fixed_n`: that condition meant fixing one text
+        # page accidentally skipped a different image-only rotated page.
+        used_per_page_report = False
+        if _conf_int(result) >= 60:
             rots = result.get("rotations")
-            if isinstance(rots, list) and page_idxs \
-                    and len(rots) == len(page_idxs):
-                fixes = {}
+            if (isinstance(rots, list) and page_idxs
+                    and len(rots) == len(page_idxs)):
+                used_per_page_report = True
                 for idx, d in zip(page_idxs, rots):
+                    if idx in resolved:
+                        continue
                     try:
                         d = int(float(d or 0))
                     except Exception:
                         continue
-                    if d in (90, 180, 270):
-                        fixes[idx] = d
-                if fixes:
-                    total = DocRender.page_count(f)
-                    same = set(fixes.values())
-                    if len(fixes) == total and len(same) == 1:
-                        # every page, same turn: whole-file rotate (also
-                        # covers image files, which have no per-page API)
-                        if fix_file_rotation(f, same.pop()):
-                            fixed_n = total
-                    else:
-                        fixed_n = fix_pdf_page_rotations(f, fixes)
-            if not fixed_n:
+                    if d in (0, 90, 180, 270):
+                        resolved.add(idx)
+                        if d:
+                            fixes[idx] = d
+
+            # Whole-file fallback is retained only when no page-specific
+            # source spoke. Applying a page-1 guess across pages already known
+            # to have mixed orientations would undo correct work.
+            if not used_per_page_report and not resolved:
                 rot = _rot_of(result)
-                if rot and fix_file_rotation(f, rot):
-                    fixed_n = DocRender.page_count(f)
+                if rot:
+                    if f.suffix.lower() in PDF_EXT:
+                        fixes.update({i: rot for i in range(total)})
+                    elif fix_file_rotation(f, rot):
+                        fixed_n = total
+
+        if fixes and f.suffix.lower() in PDF_EXT:
+            same = set(fixes.values())
+            if len(fixes) == total and len(same) == 1:
+                if fix_file_rotation(f, same.pop()):
+                    fixed_n = total
+            else:
+                fixed_n = fix_pdf_page_rotations(f, fixes)
+        elif fixes and f.suffix.lower() in IMG_EXT:
+            # Image files are one page and use the whole-file helper.
+            deg = fixes.get(0)
+            if deg and fix_file_rotation(f, deg):
+                fixed_n = 1
         if not fixed_n:
             return None
         self.stats["rotated_fixed"] = self.stats.get("rotated_fixed", 0) + 1
@@ -6529,7 +7035,8 @@ class Engine:
                             p1_imgs=p1_imgs, p1_text=p1_text,
                             total_pages=total_pages,
                             emit_cost=self._emit_cost,
-                            escalation_api=self.escalation_api)
+                            escalation_api=self.escalation_api,
+                            bundle_split=self.bundle_split)
                         result = core["result"]
                         used_imgs = core["used_imgs"]
                         used_text = core["used_text"]
@@ -6604,22 +7111,109 @@ class Engine:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _confirm_long_bundle_plan(self, f: Path, starts, vocab: str,
+                                  total: int):
+        """Independently classify every proposed child before allowing a cut.
+
+        The boundary scan and the normal document classifier use different
+        prompts and views.  Requiring both to agree makes an accidental break
+        in a long contract fail closed.  Every adjacent child must resolve to
+        a different controlled type at high confidence; same-type packs are
+        left whole and surfaced for review because distinguishing two people
+        of the same document type needs identity-specific evidence.
+        """
+        ranges = bundle_page_ranges(total, starts)
+        if len(ranges) < 2:
+            return None
+        plan = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="lifted-bundle-check-") as td:
+                temp_paths = []
+                src = fitz.open(str(f))
+                try:
+                    for idx, pages in enumerate(ranges, 1):
+                        tmp = Path(td) / f"segment-{idx}.pdf"
+                        child = fitz.open()
+                        try:
+                            child.insert_pdf(src, from_page=pages[0],
+                                             to_page=pages[-1])
+                            child.save(str(tmp))
+                        finally:
+                            child.close()
+                        temp_paths.append((tmp, pages))
+                finally:
+                    src.close()
+
+                for tmp, pages in temp_paths:
+                    core = classify_document_core(
+                        self.api, vocab, tmp,
+                        resolution=self.resolution,
+                        adaptive_pages=False,
+                        emit_cost=self._emit_cost,
+                        escalation_api=self.escalation_api,
+                        bundle_split=False)
+                    result = core.get("result") or {}
+                    matched, name, group, conf, _features, _other = \
+                        validate_result(self.kb, result)
+                    try:
+                        conf_n = int(float(conf or 0))
+                    except Exception:
+                        conf_n = 0
+                    if (not matched or not name
+                            or conf_n < LONG_BUNDLE_CONFIRM_CONF):
+                        return None
+
+                    # Model rotations are relative to this temporary child;
+                    # translate them back to the original PDF's page indexes.
+                    rotations = {}
+                    local_idxs = list(core.get("page_idxs") or [0])
+                    reported = result.get("rotations")
+                    if (isinstance(reported, list)
+                            and len(reported) == len(local_idxs)):
+                        for local, deg in zip(local_idxs, reported):
+                            try:
+                                deg = int(float(deg or 0))
+                            except Exception:
+                                continue
+                            if deg in (90, 180, 270) and local < len(pages):
+                                rotations[pages[local]] = deg
+                    elif _rot_of(result):
+                        for local in local_idxs:
+                            if local < len(pages):
+                                rotations[pages[local]] = _rot_of(result)
+
+                    plan.append({
+                        "pages": pages,
+                        "type": name,
+                        "group": group,
+                        "matched": True,
+                        "conf": conf_n,
+                        "date": str(result.get("document_date") or "").strip(),
+                        "rotations": rotations,
+                    })
+        except (StopRequested, CreditExhausted):
+            raise
+        except Exception:
+            traceback.print_exc()
+            return None
+
+        # Independent confirmation is boundary-specific: each pair on either
+        # side of a proposed cut must be confidently different.
+        if any(_norm_type(a["type"]) == _norm_type(b["type"])
+               for a, b in zip(plan, plan[1:])):
+            return None
+        return plan
+
     def _maybe_split_bundle(self, worker_dir: Path, f: Path, result: dict,
                             vocab: str, records: list, *, interactive: bool,
                             default_source: str, unknown_queue, depth: int):
-        """Split a file the classification call mapped to SEVERAL distinct
-        documents, before it is filed.
+        """Split a confidently verified multi-document file before filing it.
 
-        The evidence is the `documents` page map returned by that SAME call
-        (see classify_payload(segment=True)) - no separate boundary scan, and
-        no re-classification of the parts: each part's type, date and
-        confidence were already decided by the model that read the pages. A
-        bundle therefore costs no extra classification call at all, where the
-        previous design paid for a full-file boundary scan plus one classify
-        per part.
-
-        plan_segments() applies the gates; every one of them failing simply
-        means the file is left whole and named exactly as it is today.
+        Short files use the classification call's full `documents` page map,
+        so there is no extra boundary call. Long files use an all-page,
+        overlapping low-resolution scan and then independently classify every
+        proposed child in a temporary directory. Either route failing a gate
+        leaves the original whole; a cut is never inferred from a sample.
 
         Returns the updated vocabulary block when the file WAS split, or None
         when it is a normal single document."""
@@ -6634,21 +7228,44 @@ class Engine:
         inks = page_ink_fractions(f)
         seg_idxs, ghosts, full_view = segmentation_pages(f, total, inks)
         if not full_view:
-            # the model only ever saw a sample of this file - its page map
-            # cannot be trusted to cut it. Flag it for a human instead.
-            if _bundle_prone(result) or result.get("documents"):
-                self._flag_possible_bundle(worker_dir, f, total,
-                                           "too long to segment")
-            return None
-        plan = plan_segments(self.kb, result, seg_idxs, ghosts, total)
-        if not plan:
-            if isinstance(result.get("documents"), list) \
-                    and len(result.get("documents") or []) > 1:
-                # the model saw more than one document but the gates refused
-                # the cut - the safest outcome, still worth a human look
-                self._flag_possible_bundle(worker_dir, f, total,
-                                           "segments failed the split gates")
-            return None
+            # The ordinary classifier only saw a three-page sample. Scan every
+            # page at low resolution, then classify the proposed children in a
+            # temporary directory before mutating the real file. This replaces
+            # the old "flag every long file and stop" behaviour.
+            label = self._redact(f.name)
+            self.log(f"    · {label}: autonomous long-file bundle scan "
+                     f"({total} pages)")
+            try:
+                starts = detect_long_bundle_starts(
+                    self.api, f, emit_cost=self._emit_cost, log=self.log)
+            except (StopRequested, CreditExhausted):
+                raise
+            except Exception as e:
+                self._flag_possible_bundle(
+                    worker_dir, f, total,
+                    f"automatic boundary scan failed: {str(e)[:80]}")
+                return None
+            if not starts:
+                return None
+            plan = self._confirm_long_bundle_plan(f, starts, vocab, total)
+            if not plan:
+                self._flag_possible_bundle(
+                    worker_dir, f, total,
+                    "boundary proposal was not independently confirmed")
+                return None
+            self.log("      independent child classifications confirmed: "
+                     + " -> ".join(s["type"] for s in plan))
+        else:
+            plan = plan_segments(self.kb, result, seg_idxs, ghosts, total)
+            if not plan:
+                if isinstance(result.get("documents"), list) \
+                        and len(result.get("documents") or []) > 1:
+                    # the model saw more than one document but the gates refused
+                    # the cut - the safest outcome, still worth a human look
+                    self._flag_possible_bundle(
+                        worker_dir, f, total,
+                        "segments failed the split gates")
+                return None
 
         label = self._redact(f.name)
         # ---- per-page rotation to bake into the parts -------------------
@@ -6659,7 +7276,7 @@ class Engine:
         # each part from scratch to rediscover the same rotation.
         rot = {}
         rots = result.get("rotations")
-        if isinstance(rots, list) and len(rots) == len(seg_idxs):
+        if full_view and isinstance(rots, list) and len(rots) == len(seg_idxs):
             for i, d in zip(seg_idxs, rots):
                 try:
                     d = int(float(d or 0))
@@ -6667,6 +7284,8 @@ class Engine:
                     continue
                 if d in (90, 180, 270):
                     rot[i] = d
+        for seg in plan:
+            rot.update(seg.get("rotations") or {})
         rot.update(detect_pdf_page_text_rotations(f) or {})
         # A ghost page was never shown to the model, so it has no correction of
         # its own - but it is the back of the page before it and is stored the
@@ -6724,7 +7343,7 @@ class Engine:
             return None
 
         self.stats["bundles_split"] = self.stats.get("bundles_split", 0) + 1
-        self.log(f"    ✂ {label}: contained {len(plan)} documents "
+        self.log(f"    SPLIT {label}: contained {len(plan)} documents "
                  + ", ".join(f"p{s['pages'][0] + 1}-{s['pages'][-1] + 1} "
                              f"{s['type']}" for s in plan)
                  + f" - split; original archived to {archived.parent}")
@@ -8280,7 +8899,7 @@ class SettingsDialog(tk.Toplevel):
         self.grab_set()
         self.after(0, lambda: style_titlebar_black(self))
         _ui = float(getattr(master, "_ui_scale", 1.0) or 1.0)
-        self.geometry(f"{int(560*_ui)}x{int(760*_ui)}")
+        self.geometry(f"{int(590*_ui)}x{int(820*_ui)}")
 
         # ---- scrollable body so all controls fit on small screens ----
         outer = tk.Frame(self, bg=BG)
@@ -8442,9 +9061,41 @@ class SettingsDialog(tk.Toplevel):
                        wraplength=380, justify="left", anchor="w").grid(
             row=21, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 0))
 
+        # ---------------- OPTIONAL LOCAL AI ----------------
+        tk.Label(b, text="Local AI (private, optional)", bg=BG, fg=ACCENT,
+                 font=UI_B).grid(row=22, column=0, columnspan=2, sticky="w",
+                                 padx=16, pady=(12, 2))
+        self.local_ai_var = tk.BooleanVar(
+            value=bool(cfg.get("local_ai_orientation", False)))
+        self.local_ai_model_var = tk.StringVar(
+            value=str(cfg.get("local_ai_model", "gemma3:4b")))
+        tk.Checkbutton(
+            b, text="Use local AI to double-check every image-only PDF page "
+                    "and save sideways/upside-down pages upright",
+            variable=self.local_ai_var, bg=BG, fg=FG, selectcolor=PANEL2,
+            activebackground=BG, activeforeground=FG, font=UI,
+            wraplength=400, justify="left", anchor="w").grid(
+                row=23, column=0, columnspan=2, sticky="w", padx=16,
+                pady=(2, 0))
+        local_row = tk.Frame(b, bg=BG)
+        local_row.grid(row=24, column=0, columnspan=2, sticky="w", padx=34,
+                       pady=(2, 2))
+        self.local_ai_setup_btn = tk.Button(
+            local_row, text="Set up local AI", command=self._setup_local_ai)
+        style_button(self.local_ai_setup_btn, PANEL2, BORDER)
+        self.local_ai_setup_btn.pack(side="left")
+        initial_local = (f"Configured: {self.local_ai_model_var.get()}"
+                         if self.local_ai_var.get()
+                         else "Off — setup is one click and stays on this laptop")
+        self.local_ai_status = tk.Label(
+            local_row, text=initial_local, bg=BG,
+            fg=GREEN_HI if self.local_ai_var.get() else FG_DIM,
+            font=("Segoe UI", 8), wraplength=315, justify="left")
+        self.local_ai_status.pack(side="left", padx=(10, 0))
+
         # ---------------- CONVERSION (Stage 2) ----------------
         tk.Label(b, text="PDF conversion", bg=BG, fg=ACCENT, font=UI_B).grid(
-            row=22, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
+            row=25, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
         self.convert_var = tk.BooleanVar(value=bool(cfg.get("convert_pdf", True)))
         tk.Checkbutton(b, text="Convert every document to PDF first "
                               "(images, Office files, .msg/.eml and .txt). "
@@ -8455,18 +9106,18 @@ class SettingsDialog(tk.Toplevel):
                        variable=self.convert_var, bg=BG, fg=FG, selectcolor=PANEL2,
                        activebackground=BG, activeforeground=FG, font=UI,
                        wraplength=400, justify="left", anchor="w").grid(
-            row=23, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
+            row=26, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
         lo_state = ("LibreOffice: found"
                     if PdfConverter.has_libreoffice()
                     else "LibreOffice: NOT found (text-only fallback for Office)")
         tk.Label(b, text=lo_state, bg=BG,
                  fg=(GREEN_HI if PdfConverter.has_libreoffice() else AMBER),
-                 font=("Segoe UI", 8)).grid(row=24, column=0, columnspan=2,
+                 font=("Segoe UI", 8)).grid(row=27, column=0, columnspan=2,
                                             sticky="w", padx=34, pady=(0, 0))
 
         # ---------------- FILE MOVEMENT ----------------
         tk.Label(b, text="File movement", bg=BG, fg=ACCENT, font=UI_B).grid(
-            row=25, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
+            row=28, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
         self.move_var = tk.BooleanVar(value=bool(cfg.get("move_mode", False)))
         tk.Checkbutton(b, text="Move processed workers to a destination folder "
                               "instead of renaming in place. You choose a SOURCE "
@@ -8477,11 +9128,11 @@ class SettingsDialog(tk.Toplevel):
                        variable=self.move_var, bg=BG, fg=FG, selectcolor=PANEL2,
                        activebackground=BG, activeforeground=FG, font=UI,
                        wraplength=400, justify="left", anchor="w").grid(
-            row=26, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
+            row=29, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
 
         # ---------------- POST-RUN CHECKS ----------------
         tk.Label(b, text="Post-run checks", bg=BG, fg=ACCENT, font=UI_B).grid(
-            row=27, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
+            row=30, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
         self.audit_var = tk.BooleanVar(
             value=bool(cfg.get("post_run_audit", False)))
         tk.Checkbutton(b, text="Accuracy audit after processing: re-check "
@@ -8495,11 +9146,11 @@ class SettingsDialog(tk.Toplevel):
                        selectcolor=PANEL2, activebackground=BG,
                        activeforeground=FG, font=UI,
                        wraplength=400, justify="left", anchor="w").grid(
-            row=28, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
+            row=31, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
 
         # buttons
         bframe = tk.Frame(b, bg=BG)
-        bframe.grid(row=29, column=0, columnspan=2, sticky="e", padx=16, pady=(12, 16))
+        bframe.grid(row=32, column=0, columnspan=2, sticky="e", padx=16, pady=(12, 16))
         cancel = tk.Button(bframe, text="Cancel", command=self.destroy)
         style_button(cancel, PANEL2, BORDER)
         cancel.pack(side="right", padx=(8, 0))
@@ -8510,7 +9161,7 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(b, text=f"Settings saved to  {CONFIG_PATH}\n"
                          f"(the API key is NOT stored in this file)",
                  bg=BG, fg=FG_DIM, font=("Segoe UI", 8), justify="left").grid(
-            row=25, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 10))
+            row=33, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 10))
 
     def _render_model_choices(self):
         """(Re)build the model radio list, including Opus only when advanced is on."""
@@ -8546,6 +9197,38 @@ class SettingsDialog(tk.Toplevel):
 
     def _toggle_show(self):
         self.key_entry.configure(show="" if self.show_var.get() else "*")
+
+    def _setup_local_ai(self):
+        """One-click suitability check, runtime/model install and activation."""
+        self.local_ai_setup_btn.configure(state="disabled")
+        self.local_ai_status.configure(text="Checking this device…", fg=AMBER)
+
+        def progress(message):
+            try:
+                self.after(0, lambda m=message:
+                           self.local_ai_status.configure(text=m, fg=AMBER))
+            except Exception:
+                pass
+
+        def worker():
+            ok, model, message = setup_local_ai(progress)
+
+            def finish():
+                if not self.winfo_exists():
+                    return
+                self.local_ai_setup_btn.configure(state="normal")
+                self.local_ai_status.configure(
+                    text=message, fg=GREEN_HI if ok else RED_HI)
+                if ok:
+                    self.local_ai_model_var.set(model)
+                    self.local_ai_var.set(True)
+
+            try:
+                self.after(0, finish)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _save(self):
         # FX
@@ -8603,6 +9286,9 @@ class SettingsDialog(tk.Toplevel):
         self.cfg["adaptive_pages"] = bool(self.adapt_var.get())
         self.cfg["skip_when_clear"] = bool(self.skip_var.get())
         self.cfg["auto_other"] = bool(self.auto_other_var.get())
+        self.cfg["local_ai_orientation"] = bool(self.local_ai_var.get())
+        self.cfg["local_ai_model"] = self.local_ai_model_var.get().strip() \
+            or "gemma3:4b"
         self.cfg["redact_logs"] = bool(self.redact_var.get())
         self.cfg["move_mode"] = bool(self.move_var.get())
         self.cfg["convert_pdf"] = bool(self.convert_var.get())
@@ -10410,6 +11096,10 @@ class App(tk.Tk):
             review_unknowns=self.review_unknowns,
             escalation_api=escalation_api,
             auto_rotate=bool(self.cfg.get("auto_rotate", True)),
+            local_ai_orientation=bool(
+                self.cfg.get("local_ai_orientation", False)),
+            local_ai_model=str(
+                self.cfg.get("local_ai_model", "gemma3:4b")),
             bundle_split=bool(self.cfg.get("bundle_split", True)),
             cleanup_leftovers=bool(self.cfg.get("cleanup_leftovers", True)),
             post_run_audit=bool(self.cfg.get("post_run_audit", False)))

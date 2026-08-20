@@ -129,8 +129,9 @@ Each finished worker folder ends up as exactly two sub-folders:
 
 ```
 Jane Doe\
-├── Overwrite Documents\        the 15 types Stage 3 uploads one at a time
+├── Overwrite Documents\        the 16 types Stage 3 uploads one at a time
 │   ├── BRP.pdf                 (BRP, Share Code Document, CoS, driving
+│   ├── Employment Contract.pdf
 │   └── Certificate of Sponsorship - (15-02-2025).pdf    licence, …)
 └── Bulk\
     ├── Batch 01\               everything else, 30 files per batch
@@ -178,7 +179,23 @@ Built-in safeguards, all editable in Settings:
 The live cost meter uses the **real token counts the API returns**, not
 estimates. Prices live in one place — the `MODELS & PRICING` block at the top of
 `src/Stage2_Processing.pyw` (last verified against Anthropic's public pricing
-2026-07-06). All traffic goes to the Anthropic API and nowhere else.
+2026-07-06). Classification traffic goes only to the Anthropic API. If you
+explicitly enable **Local AI** in Settings, image-only orientation checks go only
+to Ollama on `127.0.0.1` and never leave the laptop.
+
+### Optional local AI orientation
+
+Settings now has a one-click **Set up local AI** control. It checks RAM and free
+disk space, installs/starts Ollama if needed, and downloads or reuses
+`gemma3:4b`. The app deliberately prefers 4B over the installed 12B model: on
+this mostly-CPU laptop the 12B cold-page check exceeded two minutes, while
+orientation is a small repeated task where responsiveness matters more.
+
+When enabled, every PDF page that lacks a reliable text layer is examined twice
+locally: once as stored and once with a known 90-degree probe turn. Stage 2 only
+acts when both answers are high-confidence and mathematically consistent. A
+missing/stopped local service never blocks a run; the normal rotation checks
+continue automatically.
 
 ---
 
