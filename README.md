@@ -54,15 +54,14 @@ This gives you the app with Desktop and Start Menu shortcuts, plus the user
 guide wired up to the in-app **Guide** button. No admin rights and no Python
 needed.
 
-**You need:** a Windows 10/11 PC and a GitHub account that has been **invited to
-this repository** (it's private — ask the maintainer for an invite and accept the
-email first).
+**You need:** a Windows 10/11 PC and a GitHub account. The repository is public;
+the GitHub CLI is only used to make downloading and updating the release reliable.
 
 Open **PowerShell** (press the Windows key, type `powershell`, press Enter) and
 run these steps:
 
 **Step 1 — install the GitHub CLI** (one time; it's how the download
-authenticates against this private repo):
+downloads the matching release asset):
 
 ```powershell
 winget install --id GitHub.cli -e
@@ -80,7 +79,7 @@ gh auth login --web
 **Step 3 — download and run the installer:**
 
 ```powershell
-gh release download v1.0.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
+gh release download v1.3.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
 ```
 
 That downloads the app (~57 MB), installs it, creates the shortcuts, and
@@ -91,7 +90,9 @@ verifies what landed:
 | App + Desktop/Start Menu shortcuts | `%LOCALAPPDATA%\Programs\Stage 2 - Processing\` |
 | User guide (in-app **Guide** button) | `%LOCALAPPDATA%\Lifted\Guides\` |
 
-> Prefer to grab the file by hand? Download `Stage2_Processing.exe` from the
+> Prefer a normal Windows setup wizard? Download `Stage2_Processing_Setup.exe`
+> from the same release. It installs the app, shortcuts and guide. Alternatively,
+> download `Stage2_Processing.exe` for a single portable file.
 > [Releases](https://github.com/alijabbar04/lifted-stage2-processing/releases)
 > page — it's a single self-contained exe and runs from anywhere. You just don't
 > get the shortcuts or the in-app guide.
@@ -114,7 +115,8 @@ verifies what landed:
 5. Pick **Live** (results as it goes) or **Overnight Batch** (half price, ready
    within ~1 hour, guaranteed within 24). Start it.
 
-> There is also a full installer that pre-configures the API key for you, so
+> There is also a private installer named
+> `Stage2_Processing_Preconfigured_Setup.exe` that pre-configures the API key, so
 > there is nothing to paste. It is deliberately **not** published here because
 > the key is compiled into it — ask Ali for that one directly if you would rather
 > not handle a key.
@@ -129,8 +131,9 @@ Each finished worker folder ends up as exactly two sub-folders:
 
 ```
 Jane Doe\
-├── Overwrite Documents\        the 15 types Stage 3 uploads one at a time
+├── Overwrite Documents\        the 16 types Stage 3 uploads one at a time
 │   ├── BRP.pdf                 (BRP, Share Code Document, CoS, driving
+│   ├── Employment Contract.pdf
 │   └── Certificate of Sponsorship - (15-02-2025).pdf    licence, …)
 └── Bulk\
     ├── Batch 01\               everything else, 30 files per batch
@@ -178,7 +181,23 @@ Built-in safeguards, all editable in Settings:
 The live cost meter uses the **real token counts the API returns**, not
 estimates. Prices live in one place — the `MODELS & PRICING` block at the top of
 `src/Stage2_Processing.pyw` (last verified against Anthropic's public pricing
-2026-07-06). All traffic goes to the Anthropic API and nowhere else.
+2026-07-06). Classification traffic goes only to the Anthropic API. If you
+explicitly enable **Local AI** in Settings, image-only orientation checks go only
+to Ollama on `127.0.0.1` and never leave the laptop.
+
+### Optional local AI orientation
+
+Settings now has a one-click **Set up local AI** control. It checks RAM and free
+disk space, installs/starts Ollama if needed, and downloads or reuses
+`gemma3:4b`. The app deliberately prefers 4B over the installed 12B model: on
+this mostly-CPU laptop the 12B cold-page check exceeded two minutes, while
+orientation is a small repeated task where responsiveness matters more.
+
+When enabled, every PDF page that lacks a reliable text layer is examined twice
+locally: once as stored and once with a known 90-degree probe turn. Stage 2 only
+acts when both answers are high-confidence and mathematically consistent. A
+missing/stopped local service never blocks a run; the normal rotation checks
+continue automatically.
 
 ---
 
@@ -214,7 +233,7 @@ calls the Messages API and the Message Batches API directly over `urllib`.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` is the exact source that produced the shipped v1.0.0
+`src/Stage2_Processing.pyw` is the exact source that produced the shipped v1.3.0
 exe, so `build\build.ps1` reproduces it. The only edit is one code comment whose
 example filename used a real worker's name, replaced with a synthetic one — no
 functional change.
@@ -285,5 +304,5 @@ anything tracked here. Treat any built installer as a secret.
   `STAGE2_GT_ROOT`.
 - The controlled vocabulary contains document *category* names
   ("DBS Certificate", "Share Code") — categories, not people.
-- Repository is **private**. Keep it that way: the classification prompts encode
-  internal compliance process.
+- The repository is **public**. Never commit API keys, worker documents,
+  generated reports, browser profiles, or credential-bearing installers.

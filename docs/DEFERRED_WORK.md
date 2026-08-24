@@ -65,43 +65,44 @@ protects a control or another row — see `CHANGELOG.md` for the numbers.
 **No further rule tightening on 87, 106 or 108.** Each has been through the
 harness; the next change in either direction costs more than it buys.
 
-## Stage-1 multi-document bundle splitter
+## Stage-1 multi-document bundle splitter — SUPERSEDED (v1.2.0)
 
-**Owner: `lifted-stage1-download-merger`, not this repo.**
+**This entry is closed. Segmentation lives in Stage 2's classification call.**
 
-The 2026-08-11 Watra Care verification found **18 of 113** flagged files were a
-single PDF holding two or more distinct documents — e.g.
+The original decision sent this work to `lifted-stage1-download-merger`, so a
+bundle would arrive at Stage 2 already split. That was wrong for two reasons,
+both of which only became clear when the numbers were measured:
 
-| File | What was actually inside |
-|---|---|
-| row 34 | Consulate appointment booking + Pakistani passport + visa vignette + UK driving licence |
-| row 43 | UK driving licence (front/back) + DWP NI-number letter + staff ID badge |
-| rows 60 / 64 | a council-tax or energy bill + bank statements |
-| rows 106 / 114 | a Criminal Record Check Declaration + an emergency-contact form |
-| rows 109 / 113 | a passport bio page + a BRP |
+- **Stage 1 has no vision budget.** It is a download/merge tool; it never looks
+  inside a PDF and would have to start paying for page images purely to find
+  boundaries. Stage 2 is *already* paying for those page images.
+- **Boundaries alone are not enough.** Knowing that a new document starts at
+  page 3 does not say what is on page 3, so every part still had to be
+  classified afterwards. Asking "where are the cuts" and "what is each piece"
+  as two questions costs two answers; asking once costs one.
 
-Stage 2 classifies a **file**, so a bundle can only ever get *one* name and one
-Stage 3 upload slot — the other documents inside it are silently lost to the
-compliance record. No amount of vocabulary work fixes that.
+v1.2.0 therefore returns a per-page `documents` map from the same call that
+classifies the file (`classify_payload(segment=True)`), and splits locally with
+PyMuPDF, which is free. A file that is not a bundle returns one entry and is
+named exactly as before. The cost of the extra pages is more than covered by
+dropping near-blank pages from the request — measured over the 130-file Watra
+set, images sent fell from 296 to 281.
 
-What Stage 2 **has** done (2026-08-11) is stop the bundle producing the *wrong*
-name: rule 18(b) now says the first complete document wins, and every image is
-labelled with its real page number so the model can tell page 1 from page 5
-even on a sampled long document. That fixed the false alarms (rows 104/109/113)
-and the two `BOTH_WRONG` bundles, but each bundle is still one file.
+The old machinery is gone, not deprecated: `detect_bundle_starts()`,
+`BUNDLE_SCAN_SYSTEM` and `BUNDLE_SCAN_*` were removed so there is only one
+bundle system. What replaced them:
 
-The real fix is to split the PDF **before** Stage 2 sees it, in the Stage 1
-download/merge tool, so each document arrives as its own file and gets its own
-type and its own upload. This repo already has most of the machinery to inform
-that work and should be read first:
+- `segmentation_pages()` / `ghost_pages()` — which pages are sent, and which
+  near-blank versos are skipped (never dropped from disk).
+- `plan_segments()` — the split gates. Conservative by construction: at least
+  two segments of DISTINCT types, every segment ≥ 75 confidence and a real
+  vocabulary type, no segment starting on a blank page, and the segments must
+  tile the file exactly. Anything else leaves the file whole.
+- `Engine._maybe_split_bundle()` — applies the split, archives the original,
+  and files each part through the ordinary naming/ranking/placement path.
 
-- `detect_bundle_starts()` — an authoritative page-by-page boundary scan that
-  renders **every** page at low zoom in overlapping windows (`BUNDLE_SCAN_*`).
-  It is deliberately conservative: when unsure it answers "continuation".
-- `Engine._maybe_split_bundle()` — how a split is actually applied, including
-  the `.splitbak` safety copy.
-- `BUNDLE_SCAN_SYSTEM` — the prompt, including the rules that stop it cutting a
-  genuine multi-page contract in half.
-
-Splitting at Stage 1 also removes the duplicate cost: today a bundle-prone file
-pays for a bundle scan in Stage 2 on every run.
+**Note for whoever reads the old advice:** the `.splitbak` copy that this entry
+described as the safety net was not one. `flatten_worker()` moves every file
+under a worker back into processing and `cleanup_leftover_files()` deletes
+`.splitbak` outright, so the original was being destroyed on the next run.
+Originals now go to `APP_DIR/Original Bundles/<care home>/<worker>/`.

@@ -100,22 +100,26 @@ nothing the classifier can act on — handle it by hand.
 
 ### Sideways or upside-down scans
 
-Handled automatically, three ways: a free text-layer rotation check
-(`detect_pdf_text_rotation`), a rotation retry that re-sends page 1 in all four
-orientations, and — when `auto_rotate` is on (the default) and confidence is
-≥ 60 — physically rewriting the page upright so Stage 3 uploads it the right way
-round.
+Handled automatically per page. Stage 2 combines the free text-layer direction
+check with the model's decisions for every page it saw; fixing one text page no
+longer suppresses a different scanned page's correction. With **Local AI**
+enabled in Settings, pages without readable embedded text are double-checked by
+the local Ollama vision model as well. Only mutually consistent high-confidence
+local answers are applied. The corrected PDF is physically saved upright before
+Stage 3 sees it.
 
 If a scan is still misread, it is usually so skewed that no orientation reads
 cleanly. Straighten it with **🧰 Tools → PDF Rotator** and re-run.
 
 ### One PDF contains several different documents
 
-Also automatic. A file flagged as a bundle by the classifier, or any PDF of 4+
-pages, gets a full page-by-page scan (`detect_bundle_starts`) and is split into
-`<name> [doc N].pdf` parts, each classified separately. 2–3 page PDFs are only
-scanned when they look bundle-prone — e.g. classified as an inherently one-page
-ID type, which is the stacked-passport/licence/BRP case.
+Also automatic. Short PDFs that fit in one request bypass page-one triage and are
+shown in full, so a confident Passport on page 1 cannot hide a visa or BRP later
+in the file. Large PDFs receive a low-resolution scan of every page. Any proposed
+cut is then checked independently by classifying every would-be child; each side
+must resolve to a different controlled type at high confidence before the real
+file is changed. The original bundle is archived outside the worker tree and
+every page is retained. Unconfirmed cuts fail closed and are flagged for review.
 
 If a bundle slips through, split it with **🧰 Tools → AI Document Splitter** and
 re-run that worker.

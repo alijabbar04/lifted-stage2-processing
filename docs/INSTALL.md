@@ -12,13 +12,12 @@ You do not need Python, this repository, or any developer tools.
 
 ## 1. Install it
 
-**You need** a GitHub account that has been **invited to this repository** (it is
-private). Ask Ali Jabbar for an invite and accept the emailed invitation first.
+**You need** a Windows 10/11 PC and a GitHub account. This repository is public.
 
 Open **PowerShell**: press the Windows key, type `powershell`, press Enter.
 
 **Step 1 — install the GitHub CLI.** This is how the download proves who you are,
-because the repository is private. One time only:
+and makes repeatable release downloads easy. One time only:
 
 ```powershell
 winget install --id GitHub.cli -e
@@ -37,7 +36,7 @@ gh auth login --web
 **Step 3 — download and run the installer.** Copy this whole line:
 
 ```powershell
-gh release download v1.0.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
+gh release download v1.3.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
 ```
 
 It downloads the app (about 57 MB), installs it, makes a Desktop and Start Menu
@@ -64,9 +63,9 @@ Nothing needs admin rights, and Python is not involved.
 ### Or download it by hand
 
 If you would rather not use PowerShell: go to the repository's **Releases** page
-and download **`Stage2_Processing.exe`** (about 57 MB). It is a single
-self-contained file and runs from anywhere — your Desktop is fine. You just will
-not get the shortcuts or the in-app guide.
+and download **`Stage2_Processing_Setup.exe`**. Double-click it to install the
+app, shortcuts and guide. The portable **`Stage2_Processing.exe`** is also
+available if you do not want a normal installation.
 
 > Windows may warn that the file is "not commonly downloaded" because it is not
 > code-signed. Choose **Keep**, then if SmartScreen appears, **More info → Run
@@ -92,10 +91,10 @@ The key is stored in the **Windows Credential Manager** — the operating
 system's encrypted credential store — not in a text file. You only do this
 once; it is remembered for every future run.
 
-> If a colleague gave you the packaged **installer** (`Stage2_Processing_Setup.exe`)
-> instead of the bare exe, the key was already configured for you during install
-> and you can skip step 3 entirely. That installer is deliberately not published
-> to GitHub, because it carries the API key inside it.
+> If a colleague gave you the private
+> **`Stage2_Processing_Preconfigured_Setup.exe`** instead of the public setup,
+> the key was configured during install and you can skip this step. That private
+> installer is never published to GitHub because it carries the key inside it.
 
 ## 4. Install LibreOffice (optional but recommended)
 
@@ -135,7 +134,8 @@ Inside each finished worker folder you get exactly two sub-folders:
 ```
 Jane Doe\
 ├── Overwrite Documents\    BRP, Share Code Document, CoS, driving licence, ...
-│                           (the 15 types Stage 3 uploads one at a time)
+│                           (the 16 types Stage 3 uploads one at a time,
+│                           including Employment Contract)
 └── Bulk\
     ├── Batch 01\           everything else, 30 files per batch
     └── Batch 02\
@@ -191,8 +191,8 @@ git clone https://github.com/alijabbar04/lifted-stage2-processing.git
 cd lifted-stage2-processing
 ```
 
-The repository is private, so Git will ask you to sign in to GitHub. If you have
-no access, ask Ali Jabbar to add your GitHub account.
+The repository is public. Git may still ask you to sign in to GitHub, depending
+on your local Git configuration.
 
 ## 4. Run setup
 

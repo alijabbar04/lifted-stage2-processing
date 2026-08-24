@@ -54,7 +54,7 @@ For each worker, in order:
          Code Check Result, ECS Notice, Proof of Car Insurance, UK Driving
          Licence, Non UK Driving Licence, DBS Document, eVisa Screenshot, UKVI
          Draft Application, Proof of Vehicle Tax, Proof of Car Ownership, Visa
-         Vignette). Left loose, keeping any rank/date suffix on the filename
+         Vignette, Employment Contract). Left loose, keeping any rank/date suffix on the filename
          (the suffixes encode the upload order).
        - "Bulk"                : EVERY other document (all non-OVERWRITE_TYPES,
          including "Other" and any type not in the set), split into "Batch 01",
@@ -120,6 +120,7 @@ import datetime
 import threading
 import traceback
 import collections
+import tempfile
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -1253,6 +1254,7 @@ OVERWRITE_TYPES = {
     "Proof of Vehicle Tax",
     "Proof of Car Ownership",
     "Visa Vignette",
+    "Employment Contract",
 }
 
 # Normalised lookup (case-, space- and hyphen-insensitive) plus the legacy
@@ -1301,7 +1303,7 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.0"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -1500,6 +1502,10 @@ def load_config() -> dict:
            "second_opinion": True,
            # physically rewrite sideways scans upright once identified
            "auto_rotate": True,
+           # optional local Ollama vision pass for image-only pages; disabled
+           # until the operator activates/setup it in Settings
+           "local_ai_orientation": False,
+           "local_ai_model": "gemma3:4b",
            # detect files that wrongly contain SEVERAL documents (sometimes
            # other workers') and split them before classification
            "bundle_split": True,
@@ -1543,6 +1549,10 @@ def load_config() -> dict:
     cfg["convert_pdf"] = bool(cfg.get("convert_pdf", True))
     cfg["second_opinion"] = bool(cfg.get("second_opinion", True))
     cfg["auto_rotate"] = bool(cfg.get("auto_rotate", True))
+    cfg["local_ai_orientation"] = bool(
+        cfg.get("local_ai_orientation", False))
+    cfg["local_ai_model"] = str(
+        cfg.get("local_ai_model", "gemma3:4b") or "gemma3:4b").strip()
     cfg["bundle_split"] = bool(cfg.get("bundle_split", True))
     cfg["cleanup_leftovers"] = bool(cfg.get("cleanup_leftovers", True))
     cfg["post_run_audit"] = bool(cfg.get("post_run_audit", False))
@@ -2338,7 +2348,8 @@ class DocRender:
         return 1
 
     @staticmethod
-    def render(path: Path, zoom: float = None, pages="all", rotate: int = 0):
+    def render(path: Path, zoom: float = None, pages="all", rotate: int = 0,
+               max_pages: int = None):
         """Return (list_of_b64_png, extracted_text).
         pages: "all" (a representative sample of up to MAX_PAGES - first two
         pages plus the LAST page for longer documents, so a signature/result
@@ -2359,7 +2370,7 @@ class DocRender:
                     rotate = int(rotate.get(0, 0) or 0)
                 return DocRender._image(path, zoom, rotate)
             if ext in PDF_EXT and HAS_FITZ:
-                return DocRender._pdf(path, zoom, pages, rotate)
+                return DocRender._pdf(path, zoom, pages, rotate, max_pages)
             if ext == ".txt":
                 return [], path.read_text(encoding="utf-8", errors="ignore")[:8000]
             if ext in (".docx", ".doc"):
@@ -2456,7 +2467,8 @@ class DocRender:
             return None, w, h
 
     @staticmethod
-    def _pdf(path: Path, zoom: float, pages, rotate: int = 0):
+    def _pdf(path: Path, zoom: float, pages, rotate: int = 0,
+             max_pages: int = None):
         imgs, text = [], []
         doc = fitz.open(path)
         try:
@@ -2472,7 +2484,12 @@ class DocRender:
                     # seen (same page count as before, so same cost)
                     idxs = [0, 1, total - 1]
             else:  # explicit list of indices
-                idxs = [i for i in pages if 0 <= i < total][:DocRender.MAX_PAGES]
+                # MAX_PAGES is a cost guard on the ordinary classification
+                # sample. Segmentation deliberately raises it (max_pages) so it
+                # can see a whole short file; the bundle scan does the same by
+                # chunking. Everything else keeps the old three-page ceiling.
+                lim = DocRender.MAX_PAGES if max_pages is None else max_pages
+                idxs = [i for i in pages if 0 <= i < total][:lim]
             base_mat = fitz.Matrix(zoom, zoom)
             per_page = rotate if isinstance(rotate, dict) else {}
             if not per_page and rotate in (90, 180, 270):
@@ -3139,7 +3156,8 @@ class ClaudeAPI:
     # ---- 1) classify a document into the controlled vocabulary ----
     def classify_payload(self, vocab_block: str, imgs: list,
                          extracted_text: str, max_tokens: int = 500,
-                         note: str = "", page_idxs=None, total_pages=None):
+                         note: str = "", page_idxs=None, total_pages=None,
+                         segment: bool = False):
         """Build the (system, content_blocks, max_tokens) for a classification
         request. Shared by live classify() and Overnight Batch submission so BOTH
         modes send a byte-for-byte identical request (same system prompt, same
@@ -3151,8 +3169,17 @@ class ClaudeAPI:
         from 'page 3' - and rule 18(b), first complete document wins, is
         decided on exactly that. Omit them and the images go unlabelled, as
         before.
+        `segment=True` (set only when the caller is showing EVERY non-ghost
+        page, see segmentation_pages) additionally asks for the per-page
+        `documents` map that lets a genuine multi-document file be split
+        locally. It is purely ADDITIVE: the top-level match/name/confidence
+        answer keeps exactly its old meaning - the whole file's single name
+        under rule 18(b) - so a file that is not split is named today's way.
         (max_tokens must comfortably exceed the JSON reply: 320 used to truncate
         replies mid-'features', which parsed as {} and mis-filed the document.)"""
+        if segment:
+            # the documents map costs output tokens roughly linear in pages
+            max_tokens = max(max_tokens, 500 + 60 * max(1, len(imgs)))
         system = (
             "You are a meticulous UK care-sector compliance document classifier. "
             "You are given the controlled vocabulary of allowed document names "
@@ -3242,6 +3269,46 @@ class ClaudeAPI:
             'separate document, [] for a single document>]}\n'
             "Set match=true only when confidence is high (>=80)."
         )
+        if segment:
+            # APPENDED, never woven in: a non-segmenting call keeps the exact
+            # system prompt it has always had, so its prompt cache entry and
+            # its answers are unchanged.
+            system += (
+                "\n\nPER-PAGE DOCUMENT MAP (additional task)\n"
+                "You are being shown EVERY readable page of this file, each "
+                "labelled with its REAL page number. As well as the single "
+                "answer above (which must stay the answer for the FIRST "
+                "complete document, exactly as instructed), return a "
+                "'documents' array that maps EVERY page number from 1 to "
+                f"{total_pages or len(imgs)} to the document it belongs to.\n"
+                "- Near-blank pages are NOT shown to you. A page number you "
+                "were not shown is the blank back of the page before it: put "
+                "it in the SAME document as the page before it.\n"
+                "- List the documents in page order. The first must start at "
+                "page 1. Page ranges must not overlap and must leave no gaps.\n"
+                "- A NEW document means a different ARTEFACT (a passport page "
+                "after a right-to-work check, a payslip after a contract) or "
+                "the same artefact for a DIFFERENT PERSON. Continuation pages "
+                "- page 2 of a contract, the BACK of the same card, a "
+                "signature page, an appendix - are the SAME document.\n"
+                "- TWO COPIES OF THE SAME KIND OF DOCUMENT (two right-to-work "
+                "checks, two insurance certificates, two bank statements) are "
+                "two documents of the SAME type: report them as separate "
+                "entries with the SAME 'type'. Never invent a different type "
+                "to make them look distinct.\n"
+                "- 'type' must be copied EXACTLY from the controlled "
+                "vocabulary, or be a short specific description for an "
+                "Other-group document. 'confidence' is per document, judged "
+                "only on the pages of THAT document.\n"
+                "- WHEN UNSURE, return ONE document covering every page. A "
+                "wrong boundary destroys a compliance record; leaving a bundle "
+                "whole merely leaves it as it is today.\n"
+                "Add to the JSON object:\n"
+                '"documents": [{"pages": [<real page numbers>], '
+                '"type": "<exact vocabulary name or short Other description>", '
+                '"document_date": "DD-MM-YYYY" or null, '
+                '"confidence": 0-100}]'
+            )
         blocks = []
         # rotation retries send MORE than MAX_PAGES images (one page rendered
         # in several orientations), so the cap is applied by the caller
@@ -3265,14 +3332,16 @@ class ClaudeAPI:
         return system, blocks, max_tokens
 
     def classify(self, vocab_block: str, imgs: list, extracted_text: str,
-                 note: str = "", page_idxs=None, total_pages=None) -> dict:
+                 note: str = "", page_idxs=None, total_pages=None,
+                 segment: bool = False) -> dict:
         """LIVE classify: build the shared request and POST it synchronously.
         The fixed system prompt is prompt-cached (cache_system=True). `note` is
         an optional per-document instruction appended to the (uncached) user
-        message - used by the rotation retry."""
+        message - used by the rotation retry. `segment` additionally requests
+        the per-page documents map (see classify_payload)."""
         system, blocks, mt = self.classify_payload(
             vocab_block, imgs, extracted_text, note=note,
-            page_idxs=page_idxs, total_pages=total_pages)
+            page_idxs=page_idxs, total_pages=total_pages, segment=segment)
         raw = self._post(system, blocks, max_tokens=mt, cache_system=True)
         return self._json_from(raw)
 
@@ -4816,7 +4885,8 @@ def fix_file_rotation(path: Path, deg_clockwise: int) -> bool:
     return False
 
 
-def detect_pdf_page_text_rotations(path: Path, max_pages: int = None) -> dict:
+def detect_pdf_page_text_rotations(path: Path, max_pages: int = None,
+                                   include_upright: bool = False) -> dict:
     """FREE local PER-PAGE orientation check for PDFs that carry a text
     layer: for each page, infer the clockwise rotation needed to make its
     text read upright from the dominant writing direction of the text lines
@@ -4858,7 +4928,7 @@ def detect_pdf_page_text_rotations(path: Path, max_pages: int = None) -> dict:
                 if total < 40:              # too little text to trust
                     continue
                 best = max(votes, key=votes.get)
-                if best and votes[best] >= 0.8 * total:
+                if votes[best] >= 0.8 * total and (best or include_upright):
                     out[idx] = best
         finally:
             doc.close()
@@ -4876,6 +4946,298 @@ def detect_pdf_text_rotation(path: Path, max_pages: int = 3) -> int:
         return 0
     vals = set(per_page.values())
     return per_page[min(per_page)] if len(vals) == 1 else 0
+
+
+class OllamaOrientationDetector:
+    """Optional, local-only orientation check for image-only PDF pages.
+
+    Each page is checked twice: as stored and with a known 90-degree probe
+    turn.  A decision is accepted only when both high-confidence answers have
+    the mathematically expected relationship.  This costs no API money and no
+    document data leaves the laptop; it talks only to Ollama on 127.0.0.1.
+    """
+    URL = "http://127.0.0.1:11434/api/chat"
+    MIN_CONFIDENCE = 0.82
+    BATCH_SIZE = 6
+    FORMAT = {
+        "type": "object",
+        "properties": {
+            "rotation": {"type": "integer", "enum": [0, 90, 180, 270]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["rotation", "confidence"],
+    }
+    PROMPT = (
+        "Judge only the physical reading orientation of this scanned document "
+        "page. Return the CLOCKWISE turn needed to make normal text, faces, "
+        "logos and document layout upright: 0, 90, 180 or 270. Do not infer "
+        "orientation from the topic. Use a low confidence if the page is blank, "
+        "ambiguous, mostly handwriting, or has no reliable upright cues."
+    )
+
+    def __init__(self, model: str):
+        self.model = (model or "gemma3:4b").strip()
+
+    def _predict_many(self, images_b64: list):
+        schema = {
+            "type": "object",
+            "properties": {
+                "pages": {
+                    "type": "array",
+                    "minItems": len(images_b64),
+                    "maxItems": len(images_b64),
+                    "items": self.FORMAT,
+                }
+            },
+            "required": ["pages"],
+        }
+        body = {
+            "model": self.model,
+            "messages": [{
+                "role": "user",
+                "content": (self.PROMPT + f" There are {len(images_b64)} "
+                            "page images in order. Return exactly one result "
+                            "for each image in the pages array, same order."),
+                "images": images_b64,
+            }],
+            "stream": False,
+            "format": schema,
+            "options": {"temperature": 0},
+            "keep_alive": "5m",
+        }
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(self.URL, data=data, method="POST")
+        req.add_header("content-type", "application/json")
+        with urllib.request.urlopen(req, timeout=180) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        content = ((payload.get("message") or {}).get("content") or "").strip()
+        parsed = json.loads(content)
+        rows = parsed.get("pages") or []
+        if len(rows) != len(images_b64):
+            raise ValueError("local model returned the wrong number of pages")
+        out = []
+        for row in rows:
+            rotation = int(float(row.get("rotation", -1)))
+            confidence = float(row.get("confidence", 0) or 0)
+            if confidence > 1:
+                confidence /= 100.0
+            if rotation not in (0, 90, 180, 270):
+                raise ValueError("local model returned an invalid rotation")
+            out.append((rotation, max(0.0, min(1.0, confidence))))
+        return out
+
+    @staticmethod
+    def decisions_agree(stored_rotation: int, probe_rotation: int) -> bool:
+        """A 90° clockwise probe needs 90° less corrective rotation."""
+        return probe_rotation == ((stored_rotation - 90) % 360)
+
+    def detect_pdf_pages(self, path: Path, page_idxs, *, log=None) -> dict:
+        """Return {page: 0|90|180|270} only for double-confirmed pages."""
+        decisions = {}
+        unavailable_logged = False
+        rendered = []
+        for idx in page_idxs:
+            try:
+                original, _ = DocRender.render(
+                    path, zoom=1.15, pages=[idx], max_pages=1)
+                probe, _ = DocRender.render(
+                    path, zoom=1.15, pages=[idx], rotate={idx: 90},
+                    max_pages=1)
+                if len(original) != 1 or len(probe) != 1:
+                    continue
+                rendered.append((int(idx), original[0], probe[0]))
+            except Exception as exc:
+                if log and not unavailable_logged:
+                    log("    · local AI orientation unavailable for this run "
+                        f"({str(exc)[:100]}); using the standard checks")
+                    unavailable_logged = True
+                # A local service/model problem must never stop processing.
+                break
+        for offset in range(0, len(rendered), self.BATCH_SIZE):
+            batch = rendered[offset:offset + self.BATCH_SIZE]
+            try:
+                base = self._predict_many([row[1] for row in batch])
+                probe = self._predict_many([row[2] for row in batch])
+                for (idx, _original, _probe), base_row, probe_row in zip(
+                        batch, base, probe):
+                    base_deg, base_conf = base_row
+                    probe_deg, probe_conf = probe_row
+                    if (base_conf >= self.MIN_CONFIDENCE
+                            and probe_conf >= self.MIN_CONFIDENCE
+                            and self.decisions_agree(base_deg, probe_deg)):
+                        decisions[idx] = base_deg
+            except Exception as exc:
+                if log and not unavailable_logged:
+                    log("    · local AI orientation unavailable for this run "
+                        f"({str(exc)[:100]}); using the standard checks")
+                    unavailable_logged = True
+                break
+        return decisions
+
+
+def _system_ram_gb() -> float:
+    """Best-effort physical-memory figure for the local-AI suitability gate."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong),
+                            ("memory_load", ctypes.c_ulong),
+                            ("total_phys", ctypes.c_ulonglong),
+                            ("avail_phys", ctypes.c_ulonglong),
+                            ("total_page_file", ctypes.c_ulonglong),
+                            ("avail_page_file", ctypes.c_ulonglong),
+                            ("total_virtual", ctypes.c_ulonglong),
+                            ("avail_virtual", ctypes.c_ulonglong),
+                            ("avail_extended_virtual", ctypes.c_ulonglong)]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                    ctypes.byref(status)):
+                return status.total_phys / (1024 ** 3)
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return pages * page_size / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _ollama_executable():
+    found = shutil.which("ollama")
+    if found:
+        return Path(found)
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" /
+        "ollama.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Ollama" / "ollama.exe",
+    ]
+    return next((p for p in candidates if p.is_file()), None)
+
+
+def _ollama_json(path: str, body=None, timeout=8):
+    url = "http://127.0.0.1:11434" + path
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 method="GET" if data is None else "POST")
+    if data is not None:
+        req.add_header("content-type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _installed_ollama_vision_models() -> list:
+    """Installed Ollama model names whose declared capabilities include vision."""
+    try:
+        tags = _ollama_json("/api/tags").get("models") or []
+    except Exception:
+        return []
+    out = []
+    for row in tags:
+        name = str(row.get("name") or row.get("model") or "").strip()
+        if not name:
+            continue
+        try:
+            shown = _ollama_json("/api/show", {"model": name})
+            caps = {str(v).casefold() for v in shown.get("capabilities") or []}
+            if "vision" in caps:
+                out.append(name)
+        except Exception:
+            continue
+    # Orientation is a small visual task repeated many times. Prefer the 4B
+    # variant; the 12B model was measured taking >120 seconds for one cold page
+    # on a 32 GB mostly-CPU laptop, which is accurate but operationally useless.
+    return sorted(out, key=lambda n: ("gemma3" not in n.casefold(),
+                                      "4b" not in n.casefold(), n))
+
+
+def setup_local_ai(progress=None):
+    """Install/start Ollama if needed and ensure a suitable vision model.
+
+    This is called only by the explicit Settings button. It returns
+    (success, model_name, operator_message) and never raises into the UI.
+    """
+    tell = progress or (lambda _message: None)
+    ram = _system_ram_gb()
+    try:
+        free_gb = shutil.disk_usage(APP_DIR.parent).free / (1024 ** 3)
+    except Exception:
+        free_gb = 0
+    if ram and ram < 12:
+        return False, "", (f"This device has {ram:.0f} GB RAM; local document "
+                           "vision needs at least 12 GB.")
+    if free_gb and free_gb < 8:
+        return False, "", (f"Only {free_gb:.1f} GB is free; keep at least 8 GB "
+                           "free before installing the local model.")
+
+    exe = _ollama_executable()
+    flags = 0x08000000 if os.name == "nt" else 0
+    if exe is None:
+        winget = shutil.which("winget")
+        if not winget:
+            return False, "", ("Ollama is not installed and Windows Package "
+                               "Manager is unavailable. Install Ollama once, "
+                               "then press Set up again.")
+        tell("Installing the local AI runtime…")
+        try:
+            completed = subprocess.run(
+                [winget, "install", "--id", "Ollama.Ollama", "-e",
+                 "--accept-package-agreements", "--accept-source-agreements",
+                 "--silent"], timeout=900, creationflags=flags,
+                capture_output=True, text=True)
+            if completed.returncode != 0:
+                return False, "", "Ollama installation did not complete."
+        except Exception as exc:
+            return False, "", f"Could not install Ollama: {exc}"
+        exe = _ollama_executable()
+        if exe is None:
+            return False, "", "Ollama installed but could not yet be located."
+
+    try:
+        _ollama_json("/api/version", timeout=2)
+    except Exception:
+        tell("Starting the local AI service…")
+        try:
+            subprocess.Popen([str(exe), "serve"], creationflags=flags,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            return False, "", f"Could not start Ollama: {exc}"
+        for _ in range(20):
+            time.sleep(0.5)
+            try:
+                _ollama_json("/api/version", timeout=2)
+                break
+            except Exception:
+                pass
+        else:
+            return False, "", "Ollama did not become ready."
+
+    model = "gemma3:4b"
+    installed = _installed_ollama_vision_models()
+    fast = next((m for m in installed
+                 if m.casefold().startswith("gemma3:4b")), None)
+    if fast:
+        return True, fast, (f"Ready: {fast} will check image-only page "
+                            "orientation locally.")
+
+    tell(f"Downloading {model} once (about 3–4 GB)…")
+    try:
+        completed = subprocess.run(
+            [str(exe), "pull", model], timeout=3600, creationflags=flags,
+            capture_output=True, text=True)
+        if completed.returncode != 0:
+            return False, "", f"The {model} download did not complete."
+    except Exception as exc:
+        return False, "", f"Could not download {model}: {exc}"
+    installed = _installed_ollama_vision_models()
+    if model not in installed and not any(
+            m.casefold().startswith("gemma3:4b") for m in installed):
+        return False, "", "The model downloaded but its vision capability was not found."
+    chosen = next((m for m in installed
+                   if m.casefold().startswith("gemma3:4b")), model)
+    return True, chosen, f"Ready: {chosen} is installed and configured."
 
 
 def fix_pdf_page_rotations(path: Path, rotations: dict) -> int:
@@ -4933,16 +5295,47 @@ def _rot_of(result) -> int:
     return rot if rot in (90, 180, 270) else 0
 
 
-def _rotation_retry(api, vocab, path, resolution, out, emit_cost=None):
-    """If the classification reply says the page image is rotated (sideways
-    phone photos and scans are endemic in these files, and the model misreads
-    or refuses them), retry ONCE with page 1 rendered in all four orientations
-    in a single call. The retry is strictly better-informed, so its result
-    replaces the first one. No-op when the reply reports rotation 0."""
-    res = out.get("result") or {}
-    rot = _rot_of(res)
-    if not rot:
-        return out
+ROTATION_CONFIRM_NOTE = (
+    "NOTE: your previous view of this document reported it as scanned "
+    "rotated. Every page above has now been TURNED UPRIGHT accordingly and "
+    "re-rendered - read it as it now appears and classify it. In the "
+    "'rotation'/'rotations' fields report only any turn STILL needed for what "
+    "you can see now (0 when a page is now upright).")
+
+# Confidence the corrected-orientation view must reach for its answer to be
+# trusted. Below it the document falls through to the old four-orientation
+# retry, which is dearer but makes no assumption about which way is up.
+ROTATION_CONFIRM_MIN_CONF = 60
+
+# WHICH ROTATION PATH IS PRIMARY - measured, and currently OFF. Read this
+# before turning it on.
+#
+# The corrected-render confirmation (straighten locally from what the model
+# just reported, then re-ask ONCE) is about a quarter of the four-orientation
+# retry's images and measured 7.9% cheaper per rotated document. It is also
+# LESS ACCURATE, and not by a little: over the 130-file Watra ground truth,
+# the same 67 rotated documents scored
+#     four-orientation retry   64/67
+#     corrected-render         60/67
+# and the confidence floor above cannot recover the difference, because the
+# wrong answers are exactly as confident as the right ones - the seven misses
+# came back at 92, 92, 92, 92, 92, 92 and 95, against a correct-answer
+# distribution that is almost entirely 92-95. There is no threshold that
+# catches the misses without sending correct answers to the dearer path too.
+#
+# Four compliance documents misnamed is not worth 7.9% of the rotation
+# subset, so the proven path stays primary. The cheap path is kept, tested
+# and one flag away for anyone who later finds a signal that separates its
+# good answers from its bad ones (disagreement with the pre-rotation answer
+# is the obvious candidate, and is NOT yet measured).
+ROTATION_FAST_CONFIRM = False
+
+
+def _rotation_retry_four(api, vocab, path, resolution, out, emit_cost=None):
+    """LAST RESORT: re-ask with page 1 rendered in all four orientations in a
+    single call, letting the model pick the upright copy. Four images for one
+    page, so it is the dearest way to settle orientation - used only when the
+    cheap corrected-render confirmation below could not."""
     rot_imgs = DocRender.render_page1_rotations(path, zoom=resolution)
     if len(rot_imgs) < 2:
         return out
@@ -4958,6 +5351,98 @@ def _rotation_retry(api, vocab, path, resolution, out, emit_cost=None):
         retry.pop("rotations", None)
         out["result"] = retry
         out["rotation_retried"] = True
+        out["rotation_path"] = "four-orientation"
+    return out
+
+
+def _rotation_retry(api, vocab, path, resolution, out, emit_cost=None):
+    """Settle a document the classifier reported as scanned rotated.
+
+    The reply already says WHICH WAY each page is turned (per-page
+    'rotations', or the whole-file 'rotation'). So instead of re-sending page 1
+    four times and asking the model to pick the upright copy - four images for
+    one page - straighten the render LOCALLY using what it just told us and
+    re-ask ONCE, at the same page count as the original call. That is roughly a
+    quarter of the old retry's images when it fires.
+
+    The confirmation sees pages already turned by `fixes`, so its own rotation
+    report is only the RESIDUAL turn still needed; the two are composed before
+    anything is physically rotated. If the confirmation comes back unconvinced
+    (below ROTATION_CONFIRM_MIN_CONF), the old four-orientation retry still
+    runs - a rotated document that cannot be read is worse than a dear one."""
+    res = out.get("result") or {}
+    rot = _rot_of(res)
+    if not rot:
+        return out
+    if not ROTATION_FAST_CONFIRM:
+        # the proven path (see ROTATION_FAST_CONFIRM for the measurement)
+        return _rotation_retry_four(api, vocab, path, resolution, out,
+                                    emit_cost)
+    idxs = list(out.get("page_idxs") or [0])
+    # per-page corrections when the reply lines up with the pages shown,
+    # otherwise the single whole-file rotation applied to every page
+    fixes = {}
+    rots = res.get("rotations")
+    if isinstance(rots, list) and len(rots) == len(idxs):
+        for i, d in zip(idxs, rots):
+            try:
+                d = int(float(d or 0))
+            except Exception:
+                continue
+            if d in (90, 180, 270):
+                fixes[i] = d
+    if not fixes:
+        fixes = {i: rot for i in idxs}
+    # the first render was already straightened by the free text-layer check,
+    # so the model's report is a turn ON TOP of that - compose the two or the
+    # confirmation would undo the deskew it never saw
+    pre = out.get("pre_rotations") or {}
+    render_rot = {}
+    for i in idxs:
+        deg = (int(pre.get(i, 0) or 0) + fixes.get(i, 0)) % 360
+        if deg in (90, 180, 270):
+            render_rot[i] = deg
+    imgs, text = DocRender.render(path, zoom=resolution, pages=idxs,
+                                  rotate=render_rot, max_pages=MAX_SEG_PAGES)
+    if len(imgs) != len(idxs):
+        return _rotation_retry_four(api, vocab, path, resolution, out,
+                                    emit_cost)
+    confirm = api.classify(vocab, imgs, text, note=ROTATION_CONFIRM_NOTE,
+                           page_idxs=idxs,
+                           total_pages=out.get("total_pages"),
+                           segment=bool(out.get("segment_view")))
+    if emit_cost:
+        emit_cost()
+    if not confirm or _conf_int(confirm) < ROTATION_CONFIRM_MIN_CONF:
+        return _rotation_retry_four(api, vocab, path, resolution, out,
+                                    emit_cost)
+    # compose what we turned with any residual the confirmation still reports,
+    # so the stored file ends up upright in ONE physical rotation
+    residual = {}
+    crots = confirm.get("rotations")
+    if isinstance(crots, list) and len(crots) == len(idxs):
+        for i, d in zip(idxs, crots):
+            try:
+                d = int(float(d or 0))
+            except Exception:
+                continue
+            if d in (90, 180, 270):
+                residual[i] = d
+    else:
+        cr = _rot_of(confirm)
+        if cr:
+            residual = {i: cr for i in idxs}
+    final = {}
+    for i in idxs:
+        deg = (fixes.get(i, 0) + residual.get(i, 0)) % 360
+        if deg in (90, 180, 270):
+            final[i] = deg
+    confirm["rotations"] = [final.get(i, 0) for i in idxs]
+    confirm["rotation"] = final.get(idxs[0], 0) if idxs else 0
+    out["result"] = confirm
+    out["used_imgs"], out["used_text"] = imgs, text
+    out["rotation_retried"] = True
+    out["rotation_path"] = "corrected-render"
     return out
 
 
@@ -5010,50 +5495,77 @@ def rescue_result(api, vocab, path, resolution, result, *, emit_cost=None,
     Both steps are no-ops on confident, upright results, so this costs nothing
     for the vast majority of documents.
     Returns the same dict shape as classify_document_core."""
+    total = DocRender.page_count(path)
+    seg_idxs, seg_ghosts, seg_full = segmentation_pages(path, total)
     out = {"result": result or {}, "used_imgs": [], "used_text": "",
-           "rotation_retried": False, "escalated": False}
+           "rotation_retried": False, "escalated": False,
+           "total_pages": total, "page_idxs": seg_idxs,
+           "ghost_pages": sorted(seg_ghosts), "segment_view": seg_full,
+           "possible_bundle": bool(total > 1 and not seg_full)}
     out = _rotation_retry(api, vocab, path, resolution, out, emit_cost)
     return _second_opinion(escalation_api, vocab, path, resolution, out,
                            emit_cost)
 
 
-BUNDLE_SCAN_SYSTEM = (
-    "You are checking whether ONE scanned compliance file wrongly contains "
-    "SEVERAL distinct documents concatenated together (occasionally including "
-    "documents belonging to a DIFFERENT PERSON than the rest of the file).\n\n"
-    "You are shown the file's pages IN ORDER, each labelled with its real page "
-    "number. For EVERY page decide: does this page BEGIN a new, separate "
-    "document, or does it continue the document the previous page belongs to?\n\n"
-    "STRICT RULES - read carefully:\n"
-    "- A new document = a different ARTEFACT (a passport page after a DBS "
-    "certificate, a contract after an ID card) or the same kind of artefact "
-    "for a DIFFERENT PERSON (a second passport with a different name).\n"
-    "- NOT new: continuation pages of the same document - page 2+ of a "
-    "contract/letter/certificate/policy, the BACK of the same card, a "
-    "signature page at the end of the same form, an appendix of the same "
-    "report. Repetitive multi-page forms are ONE document.\n"
-    "- Judge by content: headings, letterheads, person names, document "
-    "numbers, page footers ('page 2 of 3' means continuation).\n"
-    "- WHEN UNCERTAIN, ANSWER false (continuation). Splitting a real "
-    "multi-page document in half is worse than leaving a bundle intact.\n"
-    "- Page 1 always begins the first document; never report it.\n\n"
-    "Respond ONLY with JSON, no prose:\n"
-    '{"multiple_documents": true|false, '
-    '"starts": [<real page numbers (as labelled) that BEGIN a new separate '
-    'document - never page 1; [] when the file is one document>], '
-    '"note": "<one short sentence>"}'
-)
+# ====================================================================
+# GHOST (near-blank) PAGES
+# --------------------------------------------------------------------
+# Care-home scanners produce a huge number of near-empty versos: the blank
+# back of a single-sided sheet, often carrying a faint mirror-image
+# bleed-through of its own front. 26% of the pages in the 2026-08-11 Watra
+# ground truth are such pages. They are worthless to the classifier, so they
+# are dropped from the images sent to the API - which is what pays for the
+# extra pages segmentation needs - but they are NEVER dropped from disk: a
+# ghost page is attached to the preceding segment when a file is split.
+#
+# CALIBRATION (measured over all 544 GT pages, threshold = fraction of pixels
+# darker than GHOST_INK_LEVEL on a small probe raster):
+#   0.00%  - 139 pages, truly blank versos (the dominant cluster)
+#   0.08%  - row 62 p2: a mirror-image bleed-through ghost of its own front
+#   0.19%  - row 62 p3: a REAL, full Certificate of Sponsorship (faint scan)
+#   0.7-6% - ordinary content pages
+# The gap between the faintest real page and the densest ghost is only ~2.4x,
+# so the threshold sits LOW and deliberately lets some ghosts through: sending
+# a blank page wastes a fraction of a penny, dropping a real page loses a
+# compliance document. Nothing is split on a ghost page's evidence anyway.
+GHOST_INK_LEVEL = 160      # grey level below which a pixel counts as ink
+GHOST_INK_FRAC  = 0.0005   # 0.05% of pixels - see calibration above
+_GHOST_PROBE_PX = 220      # long side of the throwaway probe raster
 
-BUNDLE_SCAN_ZOOM = 1.0     # low-cost render for the bundle scan
-BUNDLE_SCAN_WINDOW = 10    # pages per scan call (1 overlap page carried over)
+# Segmentation only ever looks at a file it can see IN FULL. Beyond this many
+# non-ghost pages the file is classified exactly as before and merely flagged
+# 'possible bundle' - blind segmentation of a file the model only sampled is
+# how a genuine 40-page contract gets cut in half.
+#
+# 7, not the 12 this started at, and the reason is measured. The only wrong
+# boundary the bundle set produced was a 12-page ID bundle (8 non-ghost pages)
+# where the model merged a National Insurance letter and a staff ID badge into
+# one ten-page "Bank Statement" - at confidence 92, so no confidence floor
+# would have caught it. Every bundle that segmented CORRECTLY had at most 5
+# non-ghost pages. Past that the page map stops being reliable, and the design
+# says a wrong cut is worse than no cut: over the cap the file is classified
+# exactly as today and flagged for a human instead.
+MAX_SEG_PAGES = 7
 
-# Document types that are inherently ONE PAGE (or one card, front/back): when
-# a 2-3 page PDF classifies as one of these, the extra pages are very often a
-# DIFFERENT stacked document (passport + driving licence + BRP scanned into
-# one file was the recurring real-world miss), so such files always get the
-# cheap full bundle scan even without a classifier hint. The scan itself
-# stays the sole authority on whether to split - a same-card back page or a
-# multi-page bank statement simply comes back 'single document'.
+# A segment must be at least this confident to take part in a split. Above the
+# vocabulary's own AUTO_REVIEW_MATCH_CONF (60) - naming a whole file at 60 is
+# recoverable, cutting one is not - but not far above it: at 75 a correctly
+# identified 'ID Badge' reported at 70 was blocking an otherwise perfect
+# two-document split. Confidence guards the TYPE, not the boundary (see the
+# 92-confidence mis-split above), so it does not need to carry more than that.
+SEG_MIN_CONF = 70
+
+# Long files cannot safely use the one-call page map above, because the model
+# only sees a sample.  They get a separate low-resolution boundary scan over
+# EVERY page.  A boundary is still only a proposal: before anything is cut,
+# each proposed child is classified independently and every adjacent pair must
+# be confidently different.  This two-signal design keeps the measured
+# zero-mis-split bias while no longer abandoning large passport/visa/BRP packs.
+LONG_BUNDLE_SCAN_ZOOM = 1.0
+LONG_BUNDLE_SCAN_WINDOW = 10
+LONG_BUNDLE_SCAN_OVERLAP = 2
+LONG_BUNDLE_CONFIRM_CONF = 80
+
 _ID_PAGE_TYPES = {
     "passport", "brp", "uk driving licence", "non uk driving licence",
     "visa vignette", "national insurance number", "bank statement",
@@ -5063,89 +5575,312 @@ _ID_PAGE_TYPES = {
 
 
 def _bundle_prone(result: dict) -> bool:
-    """True when the classification itself suggests the file might be a
-    stack of one-page documents: it matched an ID-family type, or the model
-    described the content as a mixed bundle."""
+    """Whether a whole-file answer has the shape of a stacked-ID bundle."""
     for key in ("name", "other_label", "guess"):
-        v = (result.get(key) or "").strip().lower()
-        if not v:
+        value = (result.get(key) or "").strip().lower()
+        if not value:
             continue
-        if _norm_type(v) in _ID_PAGE_TYPES:
+        if _norm_type(value) in _ID_PAGE_TYPES:
             return True
-        if "bundle" in v or "mixed" in v:
+        if "bundle" in value or "mixed" in value:
             return True
     return False
 
 
-def detect_bundle_starts(api, path: Path, emit_cost=None, log=None):
-    """Scan EVERY page of a PDF for document boundaries and return the sorted
-    1-indexed page numbers where a NEW separate document begins (never 1;
-    empty list = single document).
+LONG_BUNDLE_SCAN_SYSTEM = (
+    "You are checking whether one scanned worker-compliance PDF contains "
+    "several separate documents concatenated together. Pages are shown in "
+    "their original order and labelled with their real page numbers. Report "
+    "a page only when it BEGINS a new artefact: for example a visa after a "
+    "passport, a BRP after a visa, or a document for a different person. "
+    "A continuation page, the reverse of the same card, a signature page, an "
+    "appendix, or the next page of one contract is NOT a new document. Use "
+    "names, document numbers, headings, page numbering and issuers as evidence. "
+    "When uncertain, do not report a boundary; leaving a bundle whole is safer "
+    "than cutting a real document. Never report page 1. Respond only as JSON: "
+    "{\"multiple_documents\": true|false, \"starts\": [real page numbers "
+    "that begin a new document], \"note\": \"short reason\"}."
+)
 
-    This is the authoritative bundle check: classify() only ever sees a
-    <=MAX_PAGES sample, so a second worker's documents hiding at page 4+ are
-    invisible to it - this scan renders ALL pages (at low zoom to keep the
-    cost down) in windows of BUNDLE_SCAN_WINDOW with the previous window's
-    last page repeated as context, so a document straddling a window boundary
-    is still recognised as a continuation."""
+
+def bundle_page_ranges(total_pages: int, starts) -> list:
+    """Convert 1-based boundary pages into complete 0-based page ranges."""
+    clean = set()
+    for value in starts or []:
+        try:
+            n = int(value)
+        except Exception:
+            continue
+        if 2 <= n <= total_pages:
+            clean.add(n)
+    bounds = [1] + sorted(clean) + [total_pages + 1]
+    return [list(range(bounds[i] - 1, bounds[i + 1] - 1))
+            for i in range(len(bounds) - 1)
+            if bounds[i + 1] > bounds[i]]
+
+
+def detect_long_bundle_starts(api, path: Path, *, emit_cost=None, log=None):
+    """Return proposed 1-based boundaries after scanning every PDF page.
+
+    Windows overlap by two pages so a boundary at a window edge is also seen
+    with its preceding page.  A failed/misaligned render returns an empty list
+    and therefore can never cause a cut.  Proposals are independently checked
+    by Engine._confirm_long_bundle_plan before this method's output is acted on.
+    """
     total = DocRender.page_count(path)
     if total < 2:
         return []
-    starts: set = set()
-    idx = 0
-    prev_ctx = None            # (page_no, b64) carried into the next window
-    while idx < total:
-        end = min(idx + BUNDLE_SCAN_WINDOW, total)
-        want = list(range(idx, end))
-        # DocRender caps explicit page lists at MAX_PAGES (a classification
-        # cost guard) - render in chunks so the scan really sees EVERY page
+    rotations = detect_pdf_page_text_rotations(path) or {}
+    starts = set()
+    stride = max(1, LONG_BUNDLE_SCAN_WINDOW - LONG_BUNDLE_SCAN_OVERLAP)
+    window_start = 0
+    while window_start < total:
+        window_end = min(total, window_start + LONG_BUNDLE_SCAN_WINDOW)
+        want = list(range(window_start, window_end))
         imgs = []
-        for k in range(0, len(want), DocRender.MAX_PAGES):
-            chunk = want[k:k + DocRender.MAX_PAGES]
-            ims, _txt = DocRender.render(path, zoom=BUNDLE_SCAN_ZOOM,
-                                         pages=chunk)
-            imgs.extend(ims)
+        for offset in range(0, len(want), DocRender.MAX_PAGES):
+            chunk = want[offset:offset + DocRender.MAX_PAGES]
+            chunk_imgs, _ = DocRender.render(
+                path, zoom=LONG_BUNDLE_SCAN_ZOOM, pages=chunk,
+                rotate=rotations, max_pages=len(chunk))
+            imgs.extend(chunk_imgs)
         if len(imgs) != len(want):
-            return []   # a page failed to render -> labels would misalign;
-                        # never split on uncertain evidence
+            if log:
+                log("      long bundle scan skipped: one or more pages could "
+                    "not be rendered safely")
+            return []
         blocks = []
-        if prev_ctx is not None:
-            blocks.append({"type": "text", "text":
-                           f"CONTEXT ONLY - page {prev_ctx[0]} (already part "
-                           f"of the current document; do NOT report it):"})
-            blocks.append(api._img_block(prev_ctx[1]))
-        for off, b64 in enumerate(imgs):
+        for page_idx, b64 in zip(want, imgs):
             blocks.append({"type": "text",
-                           "text": f"Page {want[off] + 1} of {total}:"})
+                           "text": f"Page {page_idx + 1} of {total}:"})
             blocks.append(api._img_block(b64))
-        blocks.append({"type": "text", "text":
-                       f"Decide for pages {want[0] + 1}-{want[-1] + 1}. "
-                       "JSON only."})
-        raw = api._post(BUNDLE_SCAN_SYSTEM, blocks, max_tokens=300,
+        blocks.append({
+            "type": "text",
+            "text": (f"Assess pages {want[0] + 1}-{want[-1] + 1}. "
+                     "Only report a start when the immediately preceding page "
+                     "is also visible; JSON only."),
+        })
+        raw = api._post(LONG_BUNDLE_SCAN_SYSTEM, blocks, max_tokens=300,
                         cache_system=True)
         if emit_cost:
             emit_cost()
         data = api._json_from(raw)
-        for v in (data.get("starts") or []):
+        for value in data.get("starts") or []:
+            try:
+                n = int(value)
+            except Exception:
+                continue
+            # Reject the first page of any later window: there is no visible
+            # preceding page in that framing. The overlap ensures it appeared
+            # near the end of the previous window instead.
+            first_shown = want[0] + 1
+            if (2 <= n <= total and first_shown <= n <= want[-1] + 1
+                    and not (window_start and n == first_shown)):
+                starts.add(n)
+        if window_end >= total:
+            break
+        window_start += stride
+    out = sorted(starts)
+    if log and out:
+        log("      boundary scan proposed new document(s) at page "
+            + ", ".join(map(str, out)))
+    return out
+
+
+def page_ink_fractions(path: Path) -> list:
+    """Fraction of dark pixels on each page of a PDF (index = page number - 1).
+    Cheap: every page is rasterised to a ~220px probe. Returns [] when the file
+    is not a readable PDF or Pillow is missing (callers then treat no page as a
+    ghost, i.e. today's behaviour)."""
+    if path.suffix.lower() not in PDF_EXT or not HAS_FITZ or not HAS_PIL:
+        return []
+    out = []
+    try:
+        doc = fitz.open(path)
+        try:
+            from io import BytesIO
+            for page in doc:
+                try:
+                    r = page.rect
+                    if r.width <= 0 or r.height <= 0:
+                        out.append(1.0)      # unmeasurable -> treat as content
+                        continue
+                    z = _GHOST_PROBE_PX / max(r.width, r.height)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+                    im = Image.open(BytesIO(pix.tobytes("png"))).convert("L")
+                    w, h = im.size
+                    if not (w and h):
+                        out.append(1.0)
+                        continue
+                    dark = sum(im.point(lambda v: 1 if v < GHOST_INK_LEVEL else 0,
+                                        mode="L").tobytes())
+                    out.append(dark / float(w * h))
+                except Exception:
+                    out.append(1.0)          # never ghost a page we failed to read
+        finally:
+            doc.close()
+    except Exception:
+        return []
+    return out
+
+
+def ghost_pages(path: Path, inks=None) -> set:
+    """0-based indices of the near-blank pages of a PDF. A file is never
+    reported as ALL ghost - if every page measures blank the measurement is
+    not to be trusted, so none are excluded."""
+    inks = page_ink_fractions(path) if inks is None else inks
+    if not inks:
+        return set()
+    g = {i for i, v in enumerate(inks) if v < GHOST_INK_FRAC}
+    return set() if len(g) == len(inks) else g
+
+
+def segmentation_pages(path: Path, total_pages: int, inks=None):
+    """Decide which pages the classify call should see.
+
+    Returns (page_idxs, ghosts, full_view):
+      page_idxs  0-based pages to render, in order
+      ghosts     0-based ghost pages (excluded from page_idxs)
+      full_view  True when page_idxs is EVERY non-ghost page, i.e. the model
+                 sees the whole file and its answer may be used to split it.
+    When the file has more than MAX_SEG_PAGES non-ghost pages, falls back to
+    today's sample (first two + last) and full_view is False."""
+    if total_pages <= 1 or path.suffix.lower() not in PDF_EXT:
+        return [0], set(), total_pages <= 1
+    ghosts = ghost_pages(path, inks)
+    keep = [i for i in range(total_pages) if i not in ghosts]
+    sample = [0, 1, total_pages - 1] if total_pages > DocRender.MAX_PAGES \
+        else list(range(total_pages))
+    # ONLY change what is sent when segmentation can actually use it. Dropping
+    # blank pages is not free: a request that differs from the one v1.1.0 made
+    # is a request that can come back with a different name, and on the
+    # borderline documents in these folders it measurably does. So a file that
+    # cannot be segmented is sent EXACTLY as before.
+    #
+    # This costs the headline saving. Blank-page exclusion was reducing 47 of
+    # the 130 ground-truth files to a SINGLE image - the two-sided sheet with
+    # a blank back, which is the commonest shape in a care-home folder and the
+    # source of nearly all the saving. It is also where the naming regressions
+    # were: a lone page cannot be split, so that request was being perturbed
+    # for no segmentation benefit at all.
+    if len(keep) < 2 or len(keep) > MAX_SEG_PAGES:
+        return sample, ghosts, False
+    return keep, ghosts, True
+
+
+def _seg_type_of(seg) -> str:
+    return str((seg or {}).get("type") or "").strip()
+
+
+def plan_segments(kb, result: dict, page_idxs: list, ghosts: set,
+                  total_pages: int):
+    """Turn the classifier's per-page `documents` map into a validated list of
+    physical page ranges to split into, or None to leave the file whole.
+
+    THE GATES (all must hold - a wrong split is worse than no split):
+      1. the model saw the file in full (checked by the caller via full_view);
+      2. at least 2 segments;
+      3. at least 2 DISTINCT controlled types - a multi-page file of ONE type
+         (a contract, an application form, two copies of the same check) is
+         never split;
+      4. every segment resolves to a real vocabulary type (or a confidently
+         described Other document) at >= SEG_MIN_CONF;
+      5. every segment holds at least one NON-GHOST page;
+      6. no segment STARTS on a ghost page (a bleed-through verso is never
+         evidence of a new document);
+      7. the segments tile the file exactly once, in order, with no gaps or
+         overlaps once ghost pages are attached to the segment before them.
+    Returns [{"pages": [0-based...], "type": str, "date": str, "conf": int,
+              "group": str, "matched": bool}] or None."""
+    docs = result.get("documents")
+    if not isinstance(docs, list) or len(docs) < 2:
+        return None
+    seen = set(page_idxs)
+    starts = []      # (0-based first page, segment dict)
+    for seg in docs:
+        if not isinstance(seg, dict):
+            return None
+        pages = seg.get("pages")
+        if not isinstance(pages, list) or not pages:
+            return None
+        nums = []
+        for v in pages:
             try:
                 n = int(v)
             except Exception:
-                continue
-            if want[0] + 1 <= n <= want[-1] + 1 and n != 1:
-                starts.add(n)
-        if imgs:
-            prev_ctx = (want[len(imgs) - 1] + 1, imgs[-1])
-        idx = end
-    out = sorted(starts)
-    if log and out:
-        log(f"      bundle scan: new documents begin at page(s) "
-            f"{', '.join(map(str, out))} of {total}")
+                return None
+            if not (1 <= n <= total_pages):
+                return None
+            nums.append(n - 1)
+        # A segment made up ENTIRELY of blank pages is not a document - it is
+        # the trailing verso the model listed for completeness because it was
+        # asked to account for every page. Absorb it into the segment before
+        # it (which is what happens anyway once the ranges are tiled below)
+        # rather than refusing the whole split: a real 4-document bundle was
+        # being left whole purely because the model politely accounted for its
+        # last blank page.
+        if all(p in ghosts for p in nums):
+            continue
+        first = min(nums)
+        # gate 6: a segment holding real content may not BEGIN on a ghost page
+        if first in ghosts:
+            return None
+        # gate 5: at least one page the model actually looked at
+        if not any(p in seen for p in nums):
+            return None
+        starts.append((first, seg))
+    if len(starts) < 2:
+        return None
+    starts.sort(key=lambda t: t[0])
+    firsts = [f for f, _ in starts]
+    if firsts[0] != 0 or len(set(firsts)) != len(firsts):
+        return None          # must start at page 1, no duplicate starts
+
+    out = []
+    for k, (first, seg) in enumerate(starts):
+        end = (starts[k + 1][0] - 1) if k + 1 < len(starts) else total_pages - 1
+        if end < first:
+            return None
+        rng = list(range(first, end + 1))
+        if all(p in ghosts for p in rng):
+            return None      # gate 5
+        conf = 0
+        try:
+            conf = int(float(seg.get("confidence", 0) or 0))
+        except Exception:
+            conf = 0
+        if conf < SEG_MIN_CONF:
+            return None      # gate 4
+        raw = _seg_type_of(seg)
+        if not raw:
+            return None
+        canon = kb.canonical_name(raw)
+        if canon and canon != "Other":
+            matched, name, group = True, canon, kb.group_of(canon)
+        else:
+            # an Other-group document is a legitimate segment, but only when
+            # the model actually described it (never a bare 'Other'/'Unknown')
+            low = raw.strip().lower()
+            if low in ("", "other", "unknown", "other - unknown"):
+                return None
+            matched, name, group = False, raw, "Other"
+        out.append({"pages": rng, "type": name, "group": group,
+                    "matched": matched, "conf": conf,
+                    "date": str(seg.get("document_date") or "").strip()})
+    # gate 3: at least two DISTINCT types
+    if len({_norm_type(s["type"]) for s in out}) < 2:
+        return None
+    # gate 7: the segments must tile the file exactly
+    covered = [p for s in out for p in s["pages"]]
+    if covered != list(range(total_pages)):
+        return None
     return out
 
 
 def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
                            p1_imgs=None, p1_text=None, total_pages=None,
-                           emit_cost=None, escalation_api=None):
+                           emit_cost=None, escalation_api=None,
+                           bundle_split=True):
     """Classify ONE document file through the live-mode path.
 
     p1_imgs/p1_text/total_pages may be passed in when the caller has already
@@ -5156,6 +5891,10 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
     `emit_cost` is called after every API call (the Engine uses it to update
     the live £ meter and enforce the budget ceiling). `escalation_api` is an
     optional stronger-model client for the low-confidence second opinion.
+    When `bundle_split` is enabled, a short multi-page PDF which can be shown
+    in full deliberately bypasses page-one triage.  Otherwise a confident
+    passport on page 1 can hide a BRP or visa on page 2 before the bundle map
+    is ever requested.
 
     Returns a dict:
       {"result": <classification dict>, "used_imgs": [...], "used_text": str,
@@ -5179,6 +5918,14 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
 
     if total_pages is None:
         total_pages = DocRender.page_count(path)
+    # PAGE SELECTION. Near-blank versos are dropped (they teach the model
+    # nothing) and, when what is left is small enough to show IN FULL, every
+    # remaining page is sent instead of the old three-page sample. Measured
+    # over the 130-file Watra ground truth that is a NET REDUCTION in images
+    # sent (296 -> 281, median per file unchanged), because the ghost pages
+    # removed outnumber the extra pages added - and it is what makes the
+    # per-page documents map trustworthy enough to split on.
+    seg_idxs, seg_ghosts, seg_full = segmentation_pages(path, total_pages)
     # PRE-CLASSIFICATION DESKEW. The free local text-direction check knows,
     # for any PDF carrying a text layer, exactly which pages are stored
     # sideways or upside down. It used to run only AFTER the answer came back
@@ -5198,7 +5945,59 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
     out = {"result": {}, "used_imgs": p1_imgs, "used_text": p1_text,
            "total_pages": total_pages, "page1_only": False,
            "triaged": False, "triage_reason": "", "rotation_retried": False,
-           "escalated": False, "page_idxs": [0], "pre_rotations": pre_rot}
+           "escalated": False, "page_idxs": [0], "pre_rotations": pre_rot,
+           "ghost_pages": sorted(seg_ghosts), "segment_view": False,
+           "possible_bundle": False}
+
+    def _render_selected(o):
+        """Render the pages segmentation_pages chose, and decide whether the
+        reply may be used to split. Segmentation is abandoned (silently, back
+        to today's behaviour) whenever the rendered images do not line up
+        one-for-one with the pages we asked for - _pdf drops a page it cannot
+        bring under the API's size limits, and a mislabelled page map is
+        exactly the evidence that produces a wrong boundary."""
+        imgs, text = DocRender.render(path, zoom=resolution, pages=seg_idxs,
+                                      rotate=pre_rot, max_pages=MAX_SEG_PAGES)
+        aligned = len(imgs) == len(seg_idxs)
+        if not aligned and seg_full:
+            # fall back to the historic three-page sample
+            imgs, text = DocRender.render(path, zoom=resolution, pages="all",
+                                          rotate=pre_rot)
+            o["page_idxs"] = _all_idxs()
+        else:
+            o["page_idxs"] = list(seg_idxs)
+        o["used_imgs"], o["used_text"] = imgs, text
+        # Only ask for the documents map when a split is actually POSSIBLE:
+        # two or more pages worth looking at. On a file whose only readable
+        # page is page 1 (a one-sided sheet with a blank back is the commonest
+        # shape in these folders) the map can only ever say "one document",
+        # so the extra instructions buy nothing - and measurably cost
+        # something, having changed the answer on several such files.
+        o["segment_view"] = bool(seg_full and aligned and total_pages > 1
+                                 and len(o["page_idxs"]) >= 2)
+        # a file too long to see in full may still be a bundle - say so rather
+        # than segmenting on a sample
+        o["possible_bundle"] = bool(total_pages > 1 and not o["segment_view"])
+
+    # BUNDLE-SAFE ADAPTIVE PATH.  Page-one triage is an optimisation for a
+    # single document; it cannot prove that later pages do not begin a second
+    # document.  When the entire useful short PDF fits in one classification
+    # call, skip that triage call and ask for the page map immediately.  This
+    # both closes the recurring passport+visa+BRP miss and avoids paying for a
+    # triage call immediately followed by classification.
+    if (bundle_split and adaptive_pages and ext in PDF_EXT
+            and total_pages > 1 and seg_full and len(seg_idxs) >= 2):
+        _render_selected(out)
+        if out["segment_view"]:
+            out["triage_reason"] = "short file shown in full for bundle safety"
+            out["result"] = api.classify(
+                vocab, out["used_imgs"], out["used_text"],
+                page_idxs=out["page_idxs"], total_pages=total_pages,
+                segment=True)
+            if emit_cost:
+                emit_cost()
+            return _finish(out)
+
     if adaptive_pages and ext in PDF_EXT and total_pages > 1:
         tri = api.triage(vocab, p1_imgs[0] if p1_imgs else "",
                          p1_text, total_pages)
@@ -5213,26 +6012,22 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
             out["page1_only"] = True
             return _finish(out)
         out["triage_reason"] = str(tri.get("reason", ""))
-        used_imgs, used_text = DocRender.render(path, zoom=resolution,
-                                                pages="all", rotate=pre_rot)
-        out["used_imgs"], out["used_text"] = used_imgs, used_text
-        out["page_idxs"] = _all_idxs()
-        out["result"] = api.classify(vocab, used_imgs, used_text,
+        _render_selected(out)
+        out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"],
                                      page_idxs=out["page_idxs"],
-                                     total_pages=total_pages)
+                                     total_pages=total_pages,
+                                     segment=out["segment_view"])
         if emit_cost:
             emit_cost()
         return _finish(out)
     # single page / image / adaptive off: classify page 1
     # (for single-page docs page 1 IS the whole doc)
     if ext in PDF_EXT and total_pages > 1 and not adaptive_pages:
-        used_imgs, used_text = DocRender.render(path, zoom=resolution,
-                                                pages="all", rotate=pre_rot)
-        out["used_imgs"], out["used_text"] = used_imgs, used_text
-        out["page_idxs"] = _all_idxs()
+        _render_selected(out)
     out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"],
                                  page_idxs=out["page_idxs"],
-                                 total_pages=total_pages)
+                                 total_pages=total_pages,
+                                 segment=out["segment_view"])
     if emit_cost:
         emit_cost()
     return _finish(out)
@@ -5663,6 +6458,8 @@ class Engine:
                  review_unknowns=None,
                  escalation_api: "ClaudeAPI" = None,
                  auto_rotate: bool = True,
+                 local_ai_orientation: bool = False,
+                 local_ai_model: str = "gemma3:4b",
                  bundle_split: bool = True,
                  cleanup_leftovers: bool = True,
                  post_run_audit: bool = False):
@@ -5674,6 +6471,10 @@ class Engine:
         self.escalation_api = escalation_api
         # physically rewrite sideways scans upright once identified
         self.auto_rotate = bool(auto_rotate)
+        # optional local-only vision pass for pages without a readable text
+        # layer; model setup is explicit in Settings and failure is non-fatal
+        self.local_ai_orientation = bool(local_ai_orientation)
+        self.local_ai_model = str(local_ai_model or "gemma3:4b")
         # detect+split files that wrongly contain several documents
         self.bundle_split = bool(bundle_split)
         # delete processing residue (.splitbak/.zip) per worker when done
@@ -5736,7 +6537,12 @@ class Engine:
                       "batch_errored": 0, "batch_expired": 0,
                       "batch_canceled": 0, "batch_missing": 0,
                       "batch_in_tokens": 0, "batch_out_tokens": 0,
-                      "bundles_split": 0}
+                      "bundles_split": 0, "possible_bundles": 0}
+        # files that look like multi-document bundles but were deliberately
+        # NOT split (too long to see in full, or the split gates refused the
+        # boundaries). Surfaced in the processing report so they get a human
+        # look rather than vanishing into one name.
+        self.possible_bundles = []
 
     def _redact(self, name: str) -> str:
         """When redact_logs is on, mask a filename in log output so personal
@@ -5798,38 +6604,80 @@ class Engine:
         if not self.auto_rotate:
             return None
         fixed_n = 0
-        # FREE per-page text check first: fixes files that mix upright and
-        # rotated pages (whole-file rotation cannot), across ALL pages
-        per_page = detect_pdf_page_text_rotations(f)
-        if per_page:
-            fixed_n = fix_pdf_page_rotations(f, per_page)
-        if not fixed_n and _conf_int(result) >= 60:
-            # model's per-page report for the pages it actually saw
+        total = DocRender.page_count(f)
+        fixes = {}
+        resolved = set()
+
+        # FREE text direction across every PDF page. Include confident upright
+        # (0°) decisions in `resolved`: they need no rewrite, but prevent a
+        # weaker later signal from turning an already-upright text page.
+        text_decisions = detect_pdf_page_text_rotations(
+            f, include_upright=True)
+        resolved.update(text_decisions)
+        fixes.update({i: d for i, d in text_decisions.items() if d})
+
+        # Optional all-page local vision for pages without enough embedded text.
+        # Double-confirmation inside the detector makes this stronger than the
+        # single model report, so its upright and rotated decisions take
+        # precedence. A missing Ollama service simply falls through.
+        if (self.local_ai_orientation and f.suffix.lower() in PDF_EXT
+                and total > 0):
+            unresolved = [i for i in range(total) if i not in resolved]
+            if unresolved:
+                local = OllamaOrientationDetector(
+                    self.local_ai_model).detect_pdf_pages(
+                        f, unresolved, log=self.log)
+                if local:
+                    resolved.update(local)
+                    fixes.update({i: d for i, d in local.items() if d})
+                    self.log(f"    · local AI verified the orientation of "
+                             f"{len(local)} image-only page(s)")
+
+        # The cloud classifier covers every page it actually saw. Combine its
+        # answers with the text/local decisions instead of the previous
+        # all-or-nothing `if not fixed_n`: that condition meant fixing one text
+        # page accidentally skipped a different image-only rotated page.
+        used_per_page_report = False
+        if _conf_int(result) >= 60:
             rots = result.get("rotations")
-            if isinstance(rots, list) and page_idxs \
-                    and len(rots) == len(page_idxs):
-                fixes = {}
+            if (isinstance(rots, list) and page_idxs
+                    and len(rots) == len(page_idxs)):
+                used_per_page_report = True
                 for idx, d in zip(page_idxs, rots):
+                    if idx in resolved:
+                        continue
                     try:
                         d = int(float(d or 0))
                     except Exception:
                         continue
-                    if d in (90, 180, 270):
-                        fixes[idx] = d
-                if fixes:
-                    total = DocRender.page_count(f)
-                    same = set(fixes.values())
-                    if len(fixes) == total and len(same) == 1:
-                        # every page, same turn: whole-file rotate (also
-                        # covers image files, which have no per-page API)
-                        if fix_file_rotation(f, same.pop()):
-                            fixed_n = total
-                    else:
-                        fixed_n = fix_pdf_page_rotations(f, fixes)
-            if not fixed_n:
+                    if d in (0, 90, 180, 270):
+                        resolved.add(idx)
+                        if d:
+                            fixes[idx] = d
+
+            # Whole-file fallback is retained only when no page-specific
+            # source spoke. Applying a page-1 guess across pages already known
+            # to have mixed orientations would undo correct work.
+            if not used_per_page_report and not resolved:
                 rot = _rot_of(result)
-                if rot and fix_file_rotation(f, rot):
-                    fixed_n = DocRender.page_count(f)
+                if rot:
+                    if f.suffix.lower() in PDF_EXT:
+                        fixes.update({i: rot for i in range(total)})
+                    elif fix_file_rotation(f, rot):
+                        fixed_n = total
+
+        if fixes and f.suffix.lower() in PDF_EXT:
+            same = set(fixes.values())
+            if len(fixes) == total and len(same) == 1:
+                if fix_file_rotation(f, same.pop()):
+                    fixed_n = total
+            else:
+                fixed_n = fix_pdf_page_rotations(f, fixes)
+        elif fixes and f.suffix.lower() in IMG_EXT:
+            # Image files are one page and use the whole-file helper.
+            deg = fixes.get(0)
+            if deg and fix_file_rotation(f, deg):
+                fixed_n = 1
         if not fixed_n:
             return None
         self.stats["rotated_fixed"] = self.stats.get("rotated_fixed", 0) + 1
@@ -6187,7 +7035,8 @@ class Engine:
                             p1_imgs=p1_imgs, p1_text=p1_text,
                             total_pages=total_pages,
                             emit_cost=self._emit_cost,
-                            escalation_api=self.escalation_api)
+                            escalation_api=self.escalation_api,
+                            bundle_split=self.bundle_split)
                         result = core["result"]
                         used_imgs = core["used_imgs"]
                         used_text = core["used_text"]
@@ -6243,75 +7092,227 @@ class Engine:
         # 2-4) DEDUP -> SECOND PASS -> ORGANISE (shared tail, used by batch too).
         self._finish_worker(worker_dir, renamed_records)
 
-    # ---- multi-document bundle detection + split (live + batch) ----
+    # ---- multi-document bundle split, from the classify call's page map ----
+    BUNDLE_ARCHIVE_DIRNAME = "Original Bundles"
+
+    def _bundle_archive_dir(self, worker_dir: Path) -> Path:
+        """Where a split file's ORIGINAL is kept.
+
+        Deliberately OUTSIDE the worker folder. The old '<name>.splitbak'
+        sitting next to the parts was not the durable archive its name implied:
+        flatten_worker() moves every file under a worker back up into the
+        processing root, and cleanup_leftover_files() deletes '.splitbak'
+        outright (Settings 'clean up leftovers', on by default). Under APP_DIR
+        the original is out of reach of both and sits with the other audit
+        artefacts, so 'a split never destroys a document' is actually true."""
+        d = (APP_DIR / self.BUNDLE_ARCHIVE_DIRNAME
+             / safe_stem(self.care_home or "care home")
+             / safe_stem(worker_dir.name))
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _confirm_long_bundle_plan(self, f: Path, starts, vocab: str,
+                                  total: int):
+        """Independently classify every proposed child before allowing a cut.
+
+        The boundary scan and the normal document classifier use different
+        prompts and views.  Requiring both to agree makes an accidental break
+        in a long contract fail closed.  Every adjacent child must resolve to
+        a different controlled type at high confidence; same-type packs are
+        left whole and surfaced for review because distinguishing two people
+        of the same document type needs identity-specific evidence.
+        """
+        ranges = bundle_page_ranges(total, starts)
+        if len(ranges) < 2:
+            return None
+        plan = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="lifted-bundle-check-") as td:
+                temp_paths = []
+                src = fitz.open(str(f))
+                try:
+                    for idx, pages in enumerate(ranges, 1):
+                        tmp = Path(td) / f"segment-{idx}.pdf"
+                        child = fitz.open()
+                        try:
+                            child.insert_pdf(src, from_page=pages[0],
+                                             to_page=pages[-1])
+                            child.save(str(tmp))
+                        finally:
+                            child.close()
+                        temp_paths.append((tmp, pages))
+                finally:
+                    src.close()
+
+                for tmp, pages in temp_paths:
+                    core = classify_document_core(
+                        self.api, vocab, tmp,
+                        resolution=self.resolution,
+                        adaptive_pages=False,
+                        emit_cost=self._emit_cost,
+                        escalation_api=self.escalation_api,
+                        bundle_split=False)
+                    result = core.get("result") or {}
+                    matched, name, group, conf, _features, _other = \
+                        validate_result(self.kb, result)
+                    try:
+                        conf_n = int(float(conf or 0))
+                    except Exception:
+                        conf_n = 0
+                    if (not matched or not name
+                            or conf_n < LONG_BUNDLE_CONFIRM_CONF):
+                        return None
+
+                    # Model rotations are relative to this temporary child;
+                    # translate them back to the original PDF's page indexes.
+                    rotations = {}
+                    local_idxs = list(core.get("page_idxs") or [0])
+                    reported = result.get("rotations")
+                    if (isinstance(reported, list)
+                            and len(reported) == len(local_idxs)):
+                        for local, deg in zip(local_idxs, reported):
+                            try:
+                                deg = int(float(deg or 0))
+                            except Exception:
+                                continue
+                            if deg in (90, 180, 270) and local < len(pages):
+                                rotations[pages[local]] = deg
+                    elif _rot_of(result):
+                        for local in local_idxs:
+                            if local < len(pages):
+                                rotations[pages[local]] = _rot_of(result)
+
+                    plan.append({
+                        "pages": pages,
+                        "type": name,
+                        "group": group,
+                        "matched": True,
+                        "conf": conf_n,
+                        "date": str(result.get("document_date") or "").strip(),
+                        "rotations": rotations,
+                    })
+        except (StopRequested, CreditExhausted):
+            raise
+        except Exception:
+            traceback.print_exc()
+            return None
+
+        # Independent confirmation is boundary-specific: each pair on either
+        # side of a proposed cut must be confidently different.
+        if any(_norm_type(a["type"]) == _norm_type(b["type"])
+               for a, b in zip(plan, plan[1:])):
+            return None
+        return plan
+
     def _maybe_split_bundle(self, worker_dir: Path, f: Path, result: dict,
                             vocab: str, records: list, *, interactive: bool,
                             default_source: str, unknown_queue, depth: int):
-        """Detect a file that wrongly contains SEVERAL distinct documents
-        (occasionally other workers' documents) and split it before filing.
+        """Split a confidently verified multi-document file before filing it.
 
-        Trigger: classify() flagged 'bundle_starts' among the pages it saw,
-        OR the PDF has >=4 pages (classify only ever samples 3 pages, so a
-        second document hiding at page 4+ is invisible to it). The trigger is
-        then VERIFIED by detect_bundle_starts(), which scans every page - a
-        false trigger simply comes back 'single document' and costs one cheap
-        low-zoom call.
+        Short files use the classification call's full `documents` page map,
+        so there is no extra boundary call. Long files use an all-page,
+        overlapping low-resolution scan and then independently classify every
+        proposed child in a temporary directory. Either route failing a gate
+        leaves the original whole; a cut is never inferred from a sample.
 
-        Returns the updated vocabulary block when the file WAS handled as a
-        bundle (each part classified + applied through the normal shared
-        path; the original set aside as '<name>.splitbak', never deleted), or
-        None when the file is a normal single document."""
+        Returns the updated vocabulary block when the file WAS split, or None
+        when it is a normal single document."""
         if f.suffix.lower() not in PDF_EXT or not HAS_FITZ or not f.exists():
             return None
         total = DocRender.page_count(f)
         if total < 2:
             return None
-        hinted = []
-        for v in (result.get("bundle_starts") or []):
+        # parts of an earlier split are never re-split
+        if " [doc " in f.stem:
+            return None
+        inks = page_ink_fractions(f)
+        seg_idxs, ghosts, full_view = segmentation_pages(f, total, inks)
+        if not full_view:
+            # The ordinary classifier only saw a three-page sample. Scan every
+            # page at low resolution, then classify the proposed children in a
+            # temporary directory before mutating the real file. This replaces
+            # the old "flag every long file and stop" behaviour.
+            label = self._redact(f.name)
+            self.log(f"    · {label}: autonomous long-file bundle scan "
+                     f"({total} pages)")
             try:
-                n = int(v)
-            except Exception:
-                continue
-            if 2 <= n <= total:
-                hinted.append(n)
-        # ' [doc N]' parts were already boundary-scanned when created - only
-        # re-check one if the classifier itself raises a fresh suspicion
-        if not hinted and " [doc " in f.stem:
-            return None
-        # Unhinted short files are normally skipped (classify saw every page
-        # of a 2-3 pager, so no hint usually means one document) - EXCEPT
-        # when the file classified as an inherently one-page ID type: a
-        # 2-3 page 'Passport' is very likely a stacked passport+licence+BRP
-        # scan the classifier failed to flag (the recurring real-world miss).
-        # The full scan below remains the only authority on splitting, so a
-        # false trigger costs one cheap low-zoom call and changes nothing.
-        if not hinted and total < 4 and not _bundle_prone(result):
-            return None
-        label = self._redact(f.name)
-        self.log(f"    · {label}: bundle check "
-                 f"({total} pages{', flagged by classifier' if hinted else ''})…")
-        starts = detect_bundle_starts(self.api, f, emit_cost=self._emit_cost,
-                                      log=self.log)
-        if not starts:
-            return None
-        # 0-based inclusive page segments between consecutive starts
-        bounds = [1] + starts + [total + 1]
-        segments = [(bounds[i] - 1, bounds[i + 1] - 2)
-                    for i in range(len(bounds) - 1)]
-        segments = [(a, b) for a, b in segments if b >= a]
-        if len(segments) < 2:
-            return None
+                starts = detect_long_bundle_starts(
+                    self.api, f, emit_cost=self._emit_cost, log=self.log)
+            except (StopRequested, CreditExhausted):
+                raise
+            except Exception as e:
+                self._flag_possible_bundle(
+                    worker_dir, f, total,
+                    f"automatic boundary scan failed: {str(e)[:80]}")
+                return None
+            if not starts:
+                return None
+            plan = self._confirm_long_bundle_plan(f, starts, vocab, total)
+            if not plan:
+                self._flag_possible_bundle(
+                    worker_dir, f, total,
+                    "boundary proposal was not independently confirmed")
+                return None
+            self.log("      independent child classifications confirmed: "
+                     + " -> ".join(s["type"] for s in plan))
+        else:
+            plan = plan_segments(self.kb, result, seg_idxs, ghosts, total)
+            if not plan:
+                if isinstance(result.get("documents"), list) \
+                        and len(result.get("documents") or []) > 1:
+                    # the model saw more than one document but the gates refused
+                    # the cut - the safest outcome, still worth a human look
+                    self._flag_possible_bundle(
+                        worker_dir, f, total,
+                        "segments failed the split gates")
+                return None
 
-        # ---- write the parts, then set the original aside (never delete) --
+        label = self._redact(f.name)
+        # ---- per-page rotation to bake into the parts -------------------
+        # The free text-layer check wins where it speaks (it is exact); the
+        # model's per-page report covers the scans it cannot read. Applying it
+        # to the CHILDREN is what makes split documents open upright - the old
+        # path rotated the parent, which was then archived, and re-classified
+        # each part from scratch to rediscover the same rotation.
+        rot = {}
+        rots = result.get("rotations")
+        if full_view and isinstance(rots, list) and len(rots) == len(seg_idxs):
+            for i, d in zip(seg_idxs, rots):
+                try:
+                    d = int(float(d or 0))
+                except Exception:
+                    continue
+                if d in (90, 180, 270):
+                    rot[i] = d
+        for seg in plan:
+            rot.update(seg.get("rotations") or {})
+        rot.update(detect_pdf_page_text_rotations(f) or {})
+        # A ghost page was never shown to the model, so it has no correction of
+        # its own - but it is the back of the page before it and is stored the
+        # same way up. Give it that page's turn, or a split child ends up half
+        # upright and half sideways.
+        carry = 0
+        for i in range(total):
+            if i in rot:
+                carry = rot[i]
+            elif i in ghosts and carry:
+                rot[i] = carry
+
+        # ---- write the parts, then archive the original (never deleted) --
         parts = []
         try:
             src = fitz.open(str(f))
             try:
-                for i, (a, b) in enumerate(segments, 1):
+                for i, seg in enumerate(plan, 1):
+                    a, b = seg["pages"][0], seg["pages"][-1]
                     out_path = unique_path(worker_dir,
                                            f"{f.stem} [doc {i}]", f.suffix)
                     w = fitz.open()
                     w.insert_pdf(src, from_page=a, to_page=b)
+                    for k, src_idx in enumerate(range(a, b + 1)):
+                        deg = rot.get(src_idx)
+                        if deg and k < len(w):
+                            w[k].set_rotation((w[k].rotation + deg) % 360)
                     w.save(str(out_path))
                     w.close()
                     parts.append(out_path)
@@ -6325,66 +7326,89 @@ class Engine:
                     pass
             self.log(f"    ! bundle split failed on {label}: {e} - left intact.")
             return None
-        bak = f.with_name(f.name + ".splitbak")
+
+        archived = None
         try:
-            if bak.exists():
-                bak = unique_path(worker_dir, f.name, ".splitbak")
-            f.rename(bak)
+            dest = self._bundle_archive_dir(worker_dir)
+            archived = unique_path(dest, f.stem, f.suffix)
+            shutil.move(str(f), str(archived))
         except Exception as e:
             for p in parts:
                 try:
                     p.unlink()
                 except Exception:
                     pass
-            self.log(f"    ! could not set aside original {label}: {e} - left intact.")
+            self.log(f"    ! could not archive original {label}: {e} - "
+                     f"left intact.")
             return None
-        self.stats["bundles_split"] = self.stats.get("bundles_split", 0) + 1
-        self.log(f"    ✂ {label}: contained {len(segments)} documents "
-                 f"(pages {', '.join(f'{a + 1}-{b + 1}' for a, b in segments)})"
-                 f" - split; original kept as {bak.name}")
-        try:
-            self.rename_log.record(self.care_home, worker_dir.name, f.name,
-                                   bak.name, "", "bundle-split")
-        except Exception:
-            pass
 
-        # ---- classify + apply each part through the normal shared path ----
-        for p in parts:
+        self.stats["bundles_split"] = self.stats.get("bundles_split", 0) + 1
+        self.log(f"    SPLIT {label}: contained {len(plan)} documents "
+                 + ", ".join(f"p{s['pages'][0] + 1}-{s['pages'][-1] + 1} "
+                             f"{s['type']}" for s in plan)
+                 + f" - split; original archived to {archived.parent}")
+        # parent -> children mapping, so the audit tools can trace a split
+        for i, (p, seg) in enumerate(zip(parts, plan), 1):
+            try:
+                self.rename_log.record(
+                    self.care_home, worker_dir.name, f.name, p.name,
+                    f"pages {seg['pages'][0] + 1}-{seg['pages'][-1] + 1} of "
+                    f"{total}; original archived: {archived}",
+                    "bundle-split")
+            except Exception:
+                pass
+
+        # ---- apply each part through the normal shared path --------------
+        # The segment already carries the model's own type/confidence for
+        # exactly these pages, so no part is re-classified. From here a part is
+        # an ordinary document: same naming, same duplicate ranking, same
+        # OVERWRITE_TYPES placement.
+        for p, seg in zip(parts, plan):
             self._check_stop()
             try:
-                core = classify_document_core(
-                    self.api, vocab, p,
-                    resolution=self.resolution,
-                    adaptive_pages=self.adaptive_pages,
-                    emit_cost=self._emit_cost,
-                    escalation_api=self.escalation_api)
-                presult = core["result"] or {}
-                phash = file_hash(p)
-                nh = self._maybe_fix_rotation(p, presult,
-                                              page_idxs=core.get("page_idxs"))
+                presult = {
+                    "match": bool(seg["matched"]),
+                    "name": seg["type"] if seg["matched"] else "",
+                    "group": seg["group"],
+                    "confidence": seg["conf"],
+                    "features": f"page {seg['pages'][0] + 1}-"
+                                f"{seg['pages'][-1] + 1} of a {total}-page "
+                                f"bundle",
+                    "other_label": "" if seg["matched"] else seg["type"],
+                    "guess": seg["type"],
+                    "document_date": seg.get("date", ""),
+                    # already applied to the part's pages above
+                    "rotation": 0, "rotations": [],
+                }
                 vocab = self._apply_classification(
-                    worker_dir, p, presult, nh or phash, vocab, records,
+                    worker_dir, p, presult, file_hash(p), vocab, records,
                     interactive=interactive,
-                    page1_img=(core["used_imgs"][0] if core["used_imgs"] else None),
-                    used_imgs=core["used_imgs"], used_text=core["used_text"],
-                    default_source="bundle-split", unknown_queue=unknown_queue,
+                    used_imgs=[], used_text="",
+                    default_source="bundle-split",
+                    unknown_queue=unknown_queue,
                     _bundle_depth=depth + 1)
             except (StopRequested, CreditExhausted):
                 raise
-            except APIError as e:
-                self.log(f"    ! API error on bundle part "
-                         f"{self._redact(p.name)}: {e.message} - left for a "
-                         f"later pass.")
-                self.failed_log.record(self.care_home, worker_dir.name, p,
-                                       "bundle part API error",
-                                       getattr(e, "detail", ""))
-                self.stats["errors"] += 1
             except Exception as e:
                 self.log(f"    ! failed on bundle part "
                          f"{self._redact(p.name)}: {e}")
                 traceback.print_exc()
                 self.stats["errors"] += 1
         return vocab
+
+    def _flag_possible_bundle(self, worker_dir: Path, f: Path, total: int,
+                              why: str):
+        """Record that a file looks like a bundle that was NOT split, so it
+        reaches the processing report and the recheck queue instead of
+        disappearing silently into a single name."""
+        self.stats["possible_bundles"] = \
+            self.stats.get("possible_bundles", 0) + 1
+        self.possible_bundles.append(
+            {"worker": worker_dir.name, "file": f.name, "pages": total,
+             "reason": why})
+        self.log(f"    ? {self._redact(f.name)}: possible multi-document "
+                 f"bundle ({total} pages, {why}) - left whole, flagged for "
+                 f"review")
 
     # ---- shared apply of one classification result (live + batch) ----
     def _apply_classification(self, worker_dir: Path, f: Path, result: dict,
@@ -7875,7 +8899,7 @@ class SettingsDialog(tk.Toplevel):
         self.grab_set()
         self.after(0, lambda: style_titlebar_black(self))
         _ui = float(getattr(master, "_ui_scale", 1.0) or 1.0)
-        self.geometry(f"{int(560*_ui)}x{int(760*_ui)}")
+        self.geometry(f"{int(590*_ui)}x{int(820*_ui)}")
 
         # ---- scrollable body so all controls fit on small screens ----
         outer = tk.Frame(self, bg=BG)
@@ -8037,9 +9061,41 @@ class SettingsDialog(tk.Toplevel):
                        wraplength=380, justify="left", anchor="w").grid(
             row=21, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 0))
 
+        # ---------------- OPTIONAL LOCAL AI ----------------
+        tk.Label(b, text="Local AI (private, optional)", bg=BG, fg=ACCENT,
+                 font=UI_B).grid(row=22, column=0, columnspan=2, sticky="w",
+                                 padx=16, pady=(12, 2))
+        self.local_ai_var = tk.BooleanVar(
+            value=bool(cfg.get("local_ai_orientation", False)))
+        self.local_ai_model_var = tk.StringVar(
+            value=str(cfg.get("local_ai_model", "gemma3:4b")))
+        tk.Checkbutton(
+            b, text="Use local AI to double-check every image-only PDF page "
+                    "and save sideways/upside-down pages upright",
+            variable=self.local_ai_var, bg=BG, fg=FG, selectcolor=PANEL2,
+            activebackground=BG, activeforeground=FG, font=UI,
+            wraplength=400, justify="left", anchor="w").grid(
+                row=23, column=0, columnspan=2, sticky="w", padx=16,
+                pady=(2, 0))
+        local_row = tk.Frame(b, bg=BG)
+        local_row.grid(row=24, column=0, columnspan=2, sticky="w", padx=34,
+                       pady=(2, 2))
+        self.local_ai_setup_btn = tk.Button(
+            local_row, text="Set up local AI", command=self._setup_local_ai)
+        style_button(self.local_ai_setup_btn, PANEL2, BORDER)
+        self.local_ai_setup_btn.pack(side="left")
+        initial_local = (f"Configured: {self.local_ai_model_var.get()}"
+                         if self.local_ai_var.get()
+                         else "Off — setup is one click and stays on this laptop")
+        self.local_ai_status = tk.Label(
+            local_row, text=initial_local, bg=BG,
+            fg=GREEN_HI if self.local_ai_var.get() else FG_DIM,
+            font=("Segoe UI", 8), wraplength=315, justify="left")
+        self.local_ai_status.pack(side="left", padx=(10, 0))
+
         # ---------------- CONVERSION (Stage 2) ----------------
         tk.Label(b, text="PDF conversion", bg=BG, fg=ACCENT, font=UI_B).grid(
-            row=22, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
+            row=25, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
         self.convert_var = tk.BooleanVar(value=bool(cfg.get("convert_pdf", True)))
         tk.Checkbutton(b, text="Convert every document to PDF first "
                               "(images, Office files, .msg/.eml and .txt). "
@@ -8050,18 +9106,18 @@ class SettingsDialog(tk.Toplevel):
                        variable=self.convert_var, bg=BG, fg=FG, selectcolor=PANEL2,
                        activebackground=BG, activeforeground=FG, font=UI,
                        wraplength=400, justify="left", anchor="w").grid(
-            row=23, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
+            row=26, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
         lo_state = ("LibreOffice: found"
                     if PdfConverter.has_libreoffice()
                     else "LibreOffice: NOT found (text-only fallback for Office)")
         tk.Label(b, text=lo_state, bg=BG,
                  fg=(GREEN_HI if PdfConverter.has_libreoffice() else AMBER),
-                 font=("Segoe UI", 8)).grid(row=24, column=0, columnspan=2,
+                 font=("Segoe UI", 8)).grid(row=27, column=0, columnspan=2,
                                             sticky="w", padx=34, pady=(0, 0))
 
         # ---------------- FILE MOVEMENT ----------------
         tk.Label(b, text="File movement", bg=BG, fg=ACCENT, font=UI_B).grid(
-            row=25, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
+            row=28, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
         self.move_var = tk.BooleanVar(value=bool(cfg.get("move_mode", False)))
         tk.Checkbutton(b, text="Move processed workers to a destination folder "
                               "instead of renaming in place. You choose a SOURCE "
@@ -8072,11 +9128,11 @@ class SettingsDialog(tk.Toplevel):
                        variable=self.move_var, bg=BG, fg=FG, selectcolor=PANEL2,
                        activebackground=BG, activeforeground=FG, font=UI,
                        wraplength=400, justify="left", anchor="w").grid(
-            row=26, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
+            row=29, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
 
         # ---------------- POST-RUN CHECKS ----------------
         tk.Label(b, text="Post-run checks", bg=BG, fg=ACCENT, font=UI_B).grid(
-            row=27, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
+            row=30, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 2))
         self.audit_var = tk.BooleanVar(
             value=bool(cfg.get("post_run_audit", False)))
         tk.Checkbutton(b, text="Accuracy audit after processing: re-check "
@@ -8090,11 +9146,11 @@ class SettingsDialog(tk.Toplevel):
                        selectcolor=PANEL2, activebackground=BG,
                        activeforeground=FG, font=UI,
                        wraplength=400, justify="left", anchor="w").grid(
-            row=28, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
+            row=31, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
 
         # buttons
         bframe = tk.Frame(b, bg=BG)
-        bframe.grid(row=29, column=0, columnspan=2, sticky="e", padx=16, pady=(12, 16))
+        bframe.grid(row=32, column=0, columnspan=2, sticky="e", padx=16, pady=(12, 16))
         cancel = tk.Button(bframe, text="Cancel", command=self.destroy)
         style_button(cancel, PANEL2, BORDER)
         cancel.pack(side="right", padx=(8, 0))
@@ -8105,7 +9161,7 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(b, text=f"Settings saved to  {CONFIG_PATH}\n"
                          f"(the API key is NOT stored in this file)",
                  bg=BG, fg=FG_DIM, font=("Segoe UI", 8), justify="left").grid(
-            row=25, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 10))
+            row=33, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 10))
 
     def _render_model_choices(self):
         """(Re)build the model radio list, including Opus only when advanced is on."""
@@ -8141,6 +9197,38 @@ class SettingsDialog(tk.Toplevel):
 
     def _toggle_show(self):
         self.key_entry.configure(show="" if self.show_var.get() else "*")
+
+    def _setup_local_ai(self):
+        """One-click suitability check, runtime/model install and activation."""
+        self.local_ai_setup_btn.configure(state="disabled")
+        self.local_ai_status.configure(text="Checking this device…", fg=AMBER)
+
+        def progress(message):
+            try:
+                self.after(0, lambda m=message:
+                           self.local_ai_status.configure(text=m, fg=AMBER))
+            except Exception:
+                pass
+
+        def worker():
+            ok, model, message = setup_local_ai(progress)
+
+            def finish():
+                if not self.winfo_exists():
+                    return
+                self.local_ai_setup_btn.configure(state="normal")
+                self.local_ai_status.configure(
+                    text=message, fg=GREEN_HI if ok else RED_HI)
+                if ok:
+                    self.local_ai_model_var.set(model)
+                    self.local_ai_var.set(True)
+
+            try:
+                self.after(0, finish)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _save(self):
         # FX
@@ -8198,6 +9286,9 @@ class SettingsDialog(tk.Toplevel):
         self.cfg["adaptive_pages"] = bool(self.adapt_var.get())
         self.cfg["skip_when_clear"] = bool(self.skip_var.get())
         self.cfg["auto_other"] = bool(self.auto_other_var.get())
+        self.cfg["local_ai_orientation"] = bool(self.local_ai_var.get())
+        self.cfg["local_ai_model"] = self.local_ai_model_var.get().strip() \
+            or "gemma3:4b"
         self.cfg["redact_logs"] = bool(self.redact_var.get())
         self.cfg["move_mode"] = bool(self.move_var.get())
         self.cfg["convert_pdf"] = bool(self.convert_var.get())
@@ -10005,6 +11096,10 @@ class App(tk.Tk):
             review_unknowns=self.review_unknowns,
             escalation_api=escalation_api,
             auto_rotate=bool(self.cfg.get("auto_rotate", True)),
+            local_ai_orientation=bool(
+                self.cfg.get("local_ai_orientation", False)),
+            local_ai_model=str(
+                self.cfg.get("local_ai_model", "gemma3:4b")),
             bundle_split=bool(self.cfg.get("bundle_split", True)),
             cleanup_leftovers=bool(self.cfg.get("cleanup_leftovers", True)),
             post_run_audit=bool(self.cfg.get("post_run_audit", False)))

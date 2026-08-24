@@ -9,8 +9,9 @@ Phases
 A. PyInstaller-build the payload exe ("Stage2 Processing.exe") and the tiny
    credential helper ("stage2_credhelper.exe").
 B. (Stage2_Installer.iss is a static file in this folder.)
-C. Compile the Inno Setup installer with iscc.exe (installing Inno Setup via
-   winget if it's missing), producing Output\Stage2_Processing_Setup.exe.
+C. Compile the private, credential-bearing Inno Setup installer with iscc.exe
+   (installing Inno Setup via winget if it is missing), producing
+   Output\Stage2_Processing_Preconfigured_Setup.exe.
 
 The Anthropic API key
 ---------------------
@@ -251,7 +252,7 @@ def phase_c_compile(iscc: str, ico: Path, api_key: str, lo_url: str,
         except Exception:
             pass
 
-    out = HERE / "Output" / "Stage2_Processing_Setup.exe"
+    out = HERE / "Output" / "Stage2_Processing_Preconfigured_Setup.exe"
     if not out.exists():
         die(f"Inno Setup did not produce {out}")
     info(f"Phase C OK: {out}")

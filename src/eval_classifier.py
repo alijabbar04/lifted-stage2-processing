@@ -33,13 +33,28 @@ Costs real API money (~1-2 calls per document). Prints an estimate and asks
 for a y/N confirmation before sending anything.
 
 Usage:
-    python eval_classifier.py [--tag baseline|fixed] [--yes]
-      --tag   label written into the output filename (default: run timestamp)
-      --yes   skip the interactive cost confirmation (for re-runs)
+    python eval_classifier.py [--tag baseline|fixed] [--yes] [--bundles]
+      --tag      label written into the output filename (default: timestamp)
+      --yes      skip the interactive cost confirmation (for re-runs)
+      --bundles  score SEGMENTATION against the bundle ground truth instead of
+                 naming against the misnamed set (see below)
 
 Output: eval_results[_<tag>].csv on the Desktop, one row per document plus a
 summary line, with a baseline-reproduction column (does today's on-disk code
-still produce the same wrong answer the spreadsheet recorded?).
+still produce the same wrong answer the spreadsheet recorded?). Every row also
+carries its OWN measured token counts and cost, so per-document cost can be
+compared between runs rather than estimated.
+
+BUNDLE MODE (--bundles) scores the split decision, not the name. Its ground
+truth is <GT root>/bundles/bundle_ground_truth.json, one entry per file:
+  {"split": false, "type": "..."}            must NOT be split
+  {"split": true, "exact": [{"type","pages"}]} must split exactly so
+  {"split": true, "sampled": true, "types": [...], "min_segments": n}
+                                             must split, types must appear
+The outcomes are deliberately asymmetric: a MISSED split (the file was left
+whole) is acceptable and merely loses a document to the old behaviour, while a
+MIS-SPLIT (a boundary that disagrees with the ground truth, or any split of a
+must-not-split file) is a hard failure - it destroys a compliance record.
 """
 
 import csv
@@ -78,6 +93,10 @@ GT_FOLDER = next((r / "Misnamed Files" for r in _GT_ROOTS
 GT_XLSX = next((r / "misnamed files record.xlsx" for r in _GT_ROOTS
                 if (r / "misnamed files record.xlsx").is_file()),
                _GT_ROOTS[0] / "misnamed files record.xlsx")
+# bundle ground truth sits beside the naming set, one level up
+BUNDLE_DIR = next((r.parent / "bundles" for r in _GT_ROOTS
+                   if (r.parent / "bundles").is_dir()),
+                  _GT_ROOTS[0].parent / "bundles")
 
 
 def load_stage2():
@@ -169,7 +188,10 @@ OTHER_LABEL_PATTERNS = {
         r"(offer|employment).*(accept)|accept.*(offer|employment)",
     "Other - Consulate appointment booking confirmation":
         r"(consulate|embassy|high commission).*(appoint|booking)|"
-        r"appointment.*(booking|confirmation)",
+        r"appointment.*(booking|confirmation)|"
+        # the segmentation call describes this document more tersely than the
+        # whole-file call did - 'Booking Confirmation' on its own
+        r"^\s*booking confirmation\s*$",
     "Other - NHS GP Registration Confirmation Letter":
         r"(gp|doctor|surgery|nhs|practice).*(registrat|confirm)",
     "Other - employment verification confirmation letter":
@@ -211,9 +233,188 @@ def prediction_matches(pred_name: str, canonical: str, stage2) -> bool:
     return False
 
 
+def make_apis(stage2, cfg, api_key, model_id):
+    """The primary client plus the low-confidence second-opinion client,
+    mirroring Engine._make_engine exactly so the harness pays for - and
+    measures - the same calls production would make."""
+    api = stage2.ClaudeAPI(api_key, model_id)
+    esc_api = None
+    if bool(cfg.get("second_opinion", True)):
+        prim = stage2.MODELS_BY_ID.get(model_id, {})
+        strong = stage2.MODELS_BY_ID.get(stage2.SECOND_OPINION_MODEL_ID, {})
+        if (model_id != stage2.SECOND_OPINION_MODEL_ID
+                and prim.get("in", 99.0) < strong.get("in", 0.0)):
+            esc_api = stage2.ClaudeAPI(api_key, stage2.SECOND_OPINION_MODEL_ID)
+    return api, esc_api
+
+
+def _seg_types(plan):
+    return [s["type"] for s in (plan or [])]
+
+
+def _seg_pages(plan):
+    """1-based inclusive page ranges of a plan, for reporting/comparison."""
+    return [[p + 1 for p in s["pages"]] for s in (plan or [])]
+
+
+def score_bundle(spec, plan, possible_bundle, stage2):
+    """Compare one segmentation decision with its ground truth.
+    Returns (outcome, detail) where outcome is one of:
+      CORRECT     did exactly the right thing
+      MISSED      should have split, left whole (acceptable - old behaviour)
+      MIS-SPLIT   split where it must not, or split to the wrong boundaries
+                  (a hard failure: this destroys a compliance record)"""
+    want_split = bool(spec.get("split"))
+    got = _seg_pages(plan)
+    types = _seg_types(plan)
+    if not want_split:
+        if plan is None:
+            note = "left whole"
+            if spec.get("too_long"):
+                note += (" and flagged" if possible_bundle else
+                         " but NOT flagged")
+            return ("CORRECT", note)
+        return ("MIS-SPLIT", f"split a must-not-split file into {got}")
+    if plan is None:
+        return ("MISSED", "left whole"
+                + (" (flagged)" if possible_bundle else ""))
+    if spec.get("sampled"):
+        want_types = spec.get("types", [])
+        missing = [t for t in want_types
+                   if not any(prediction_matches(a, t, stage2)
+                              or prediction_matches(stage2.other_name(a), t,
+                                                    stage2)
+                              for a in types)]
+        if len(plan) < int(spec.get("min_segments", 2)):
+            return ("MIS-SPLIT",
+                    f"only {len(plan)} segments, expected at least "
+                    f"{spec.get('min_segments')}: {got} {types}")
+        if missing:
+            return ("MIS-SPLIT",
+                    f"missing expected type(s) {missing}: {types}")
+        return ("CORRECT", f"{len(plan)} segments {types}")
+    exact = spec.get("exact") or []
+    want_pages = [list(e["pages"]) for e in exact]
+    if got != want_pages:
+        return ("MIS-SPLIT", f"boundaries {got}, expected {want_pages}")
+    # Boundaries are right. Types are judged with prediction_matches(), the
+    # SAME comparison the naming half of this harness uses - including its
+    # Other-group tolerance, which exists because the model words a
+    # descriptive Other label slightly differently every time.
+    # Compare the name each segment would actually be FILED under. A segment
+    # the model described rather than matched (an Other-group document) is
+    # filed as 'Other - <label>', and prediction_matches' Other tolerance only
+    # engages on that filed form - passing the bare label made a perfectly
+    # placed 4-document split look like a type error.
+    bad = [(a, b) for a, b in zip(types, [e["type"] for e in exact])
+           if not (prediction_matches(a, b, stage2)
+                   or prediction_matches(stage2.other_name(a), b, stage2))]
+    if bad:
+        # NOT a mis-split. Every boundary is where it should be; only a label
+        # differs, and an Other-group label lands in the platform's "Other"
+        # bucket either way. Calling this the same failure as cutting a
+        # document in half would make the zero-mis-split gate meaningless.
+        return ("TYPE-DIFF", f"right boundaries, label differs: {bad}")
+    return ("CORRECT", f"{len(plan)} segments {types}")
+
+
+def run_bundles(stage2, kb, vocab, api, esc_api, model_id, resolution,
+                adaptive, tag, auto_yes):
+    """Score the SPLIT decision over the bundle ground truth."""
+    manifest = BUNDLE_DIR / "bundle_ground_truth.json"
+    if not manifest.is_file():
+        print(f"No bundle ground truth at {manifest}.")
+        return 1
+    specs = json.loads(manifest.read_text(encoding="utf-8"))
+    todo = [s for s in specs if (BUNDLE_DIR / s["file"]).is_file()]
+    print(f"Bundle ground truth: {len(specs)} rows, {len(todo)} files found "
+          f"in {BUNDLE_DIR}")
+    missing = [s["file"] for s in specs if not (BUNDLE_DIR / s["file"]).is_file()]
+    for m in missing:
+        print(f"  ! missing file: {m}")
+    est = stage2.estimate_run_cost_gbp(
+        len(todo), model_id, resolution, adaptive, vocab_block=vocab,
+        batch=False, include_second_pass=False, cached_prefix=True)
+    print(f"Estimated cost: ~GBP {est['gbp']:.2f} (billed on real usage)")
+    if not auto_yes:
+        if input("Send these documents to the Anthropic API? [y/N] ").strip().lower() != "y":
+            print("Aborted - nothing sent.")
+            return 0
+
+    rows, counts = [], {"CORRECT": 0, "TYPE-DIFF": 0, "MISSED": 0,
+                        "MIS-SPLIT": 0}
+    for i, spec in enumerate(todo, 1):
+        p = BUNDLE_DIR / spec["file"]
+        t0i, t0o = api.in_tokens, api.out_tokens
+        e0i, e0o = ((esc_api.in_tokens, esc_api.out_tokens)
+                    if esc_api else (0, 0))
+        print(f"[{i}/{len(todo)}] row {spec['row']} {p.name[:44]} "
+              f"({spec['pages']}p) ...", end=" ", flush=True)
+        try:
+            core = stage2.classify_document_core(
+                api, vocab, p, resolution=resolution,
+                adaptive_pages=adaptive, escalation_api=esc_api)
+        except Exception as e:
+            print(f"ERROR {e}")
+            rows.append([spec["row"], p.name, spec["pages"], "ERROR", str(e),
+                         "", "", 0, 0, 0.0])
+            continue
+        result = core["result"] or {}
+        total = stage2.DocRender.page_count(p)
+        inks = stage2.page_ink_fractions(p)
+        idxs, ghosts, full = stage2.segmentation_pages(p, total, inks)
+        plan = stage2.plan_segments(kb, result, idxs, ghosts, total) if full \
+            else None
+        outcome, detail = score_bundle(spec, plan,
+                                       core.get("possible_bundle"), stage2)
+        counts[outcome] = counts.get(outcome, 0) + 1
+        din = api.in_tokens - t0i
+        dout = api.out_tokens - t0o
+        cost = stage2.tokens_cost_gbp(model_id, din, dout)
+        if esc_api:
+            ein = esc_api.in_tokens - e0i
+            eout = esc_api.out_tokens - e0o
+            cost += stage2.tokens_cost_gbp(esc_api.model_id, ein, eout)
+            din += ein; dout += eout
+        print(f"{outcome} - {detail}  [{len(idxs)} imgs, {len(ghosts)} ghost, "
+              f"GBP {cost:.4f}]")
+        rows.append([spec["row"], p.name, spec["pages"], outcome, detail,
+                     json.dumps(_seg_pages(plan)),
+                     json.dumps(_seg_types(plan)), din, dout, round(cost, 5)])
+
+    out = stage2.desktop_path() / f"eval_bundles_{tag}.csv"
+    with open(out, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["row", "file", "pages", "outcome", "detail",
+                    "segment_pages", "segment_types", "in_tokens",
+                    "out_tokens", "gbp"])
+        w.writerows(rows)
+        w.writerow([])
+        for k in ("CORRECT", "TYPE-DIFF", "MISSED", "MIS-SPLIT"):
+            w.writerow([f"{k}: {counts.get(k, 0)}"])
+    n = max(1, len(rows))
+    print(f"\nSUMMARY  correct {counts.get('CORRECT',0)}/{len(rows)} "
+          f"({100.0*counts.get('CORRECT',0)/n:.0f}%), "
+          f"type-diff {counts.get('TYPE-DIFF',0)}, "
+          f"missed {counts.get('MISSED',0)}, "
+          f"MIS-SPLIT {counts.get('MIS-SPLIT',0)}")
+    print("GATE: >=80% correct AND zero mis-splits -> "
+          + ("PASS" if counts.get("CORRECT", 0) >= 0.8 * n
+             and not counts.get("MIS-SPLIT", 0) else "FAIL"))
+    spent = stage2.tokens_cost_gbp(model_id, api.in_tokens, api.out_tokens)
+    if esc_api:
+        spent += stage2.tokens_cost_gbp(esc_api.model_id, esc_api.in_tokens,
+                                        esc_api.out_tokens)
+    print(f"Actual API usage: {api.in_tokens:,} in / {api.out_tokens:,} out "
+          f"(~GBP {spent:.2f})")
+    print(f"Results written to: {out}")
+    return 0
+
+
 def main():
     tag = ""
     auto_yes = False
+    bundles = False
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
@@ -221,6 +422,8 @@ def main():
             tag = args.pop(0)
         elif a == "--yes":
             auto_yes = True
+        elif a == "--bundles":
+            bundles = True
     if not tag:
         tag = time.strftime("%Y%m%d_%H%M%S")
 
@@ -244,6 +447,16 @@ def main():
 
     kb = stage2.KnowledgeBase()
     vocab = kb.vocabulary_block()
+
+    print(f"Model: {model_id}   resolution: {resolution}x   "
+          f"page policy: "
+          f"{'adaptive triage (live)' if adaptive else 'all pages, no triage (batch payload)'}")
+
+    if bundles:
+        api, esc_api = make_apis(stage2, cfg, api_key, model_id)
+        print(f"Second opinion: {esc_api.model_id if esc_api else 'off'}")
+        return run_bundles(stage2, kb, vocab, api, esc_api, model_id,
+                           resolution, adaptive, tag, auto_yes)
 
     # ---- read the ground truth ----
     wb = openpyxl.load_workbook(GT_XLSX)
@@ -279,8 +492,6 @@ def main():
     est = stage2.estimate_run_cost_gbp(
         len(todo), model_id, resolution, adaptive, vocab_block=vocab,
         batch=False, include_second_pass=False, cached_prefix=True)
-    print(f"Model: {model_id}   resolution: {resolution}x   "
-          f"page policy: {'adaptive triage (live)' if adaptive else 'all pages, no triage (batch payload)'}")
     print(f"Estimated cost for {len(todo)} classification(s): "
           f"~GBP {est['gbp']:.2f} (billed on real usage)")
     if not auto_yes:
@@ -289,16 +500,7 @@ def main():
             print("Aborted - nothing sent.")
             return 0
 
-    api = stage2.ClaudeAPI(api_key, model_id)
-    # low-confidence second opinion, mirroring Engine._make_engine exactly
-    esc_api = None
-    if bool(cfg.get("second_opinion", True)):
-        prim = stage2.MODELS_BY_ID.get(model_id, {})
-        strong = stage2.MODELS_BY_ID.get(stage2.SECOND_OPINION_MODEL_ID, {})
-        if (model_id != stage2.SECOND_OPINION_MODEL_ID
-                and prim.get("in", 99.0) < strong.get("in", 0.0)):
-            esc_api = stage2.ClaudeAPI(api_key,
-                                       stage2.SECOND_OPINION_MODEL_ID)
+    api, esc_api = make_apis(stage2, cfg, api_key, model_id)
     print(f"Second opinion: "
           f"{esc_api.model_id if esc_api else 'off'}")
 
@@ -313,8 +515,24 @@ def main():
     n_repro = 0
     kind_hits = {k: [0, 0] for k in by_kind}      # kind -> [correct, total]
     misses = []
+    percost = []          # per-document GBP, for the median/mean comparison
     for i, r in enumerate(todo, 1):
         p = r["path"]
+        t0i, t0o = api.in_tokens, api.out_tokens
+        e0i, e0o = (esc_api.in_tokens, esc_api.out_tokens) if esc_api else (0, 0)
+
+        def _spent():
+            """Tokens and GBP this document actually cost, primary plus any
+            second opinion. Measured, not estimated."""
+            din, dout = api.in_tokens - t0i, api.out_tokens - t0o
+            g = stage2.tokens_cost_gbp(model_id, din, dout)
+            if esc_api:
+                ein = esc_api.in_tokens - e0i
+                eout = esc_api.out_tokens - e0o
+                g += stage2.tokens_cost_gbp(esc_api.model_id, ein, eout)
+                din += ein; dout += eout
+            return din, dout, g
+
         print(f"[{i}/{len(todo)}] {p.name} ...", end=" ", flush=True)
         try:
             # the core never sends the filename to the model (essential here:
@@ -327,8 +545,10 @@ def main():
             print(f"ERROR {e}")
             kind_hits[r["kind"]][1] += 1
             misses.append((r["kind"], p.name, r["canonical"], f"ERROR: {e}"))
+            din, dout, gbp = _spent()
             out_rows.append([str(p), r["ai_name"], f"ERROR: {e}", "",
-                             r["canonical"], "no", "", r["kind"]])
+                             r["canonical"], "no", "", r["kind"],
+                             0, 0, "", "", din, dout, round(gbp, 5), 0])
             continue
 
         # interpret the result exactly as production does (auto-Other path)
@@ -354,15 +574,41 @@ def main():
         n_repro += 1 if repro else 0
         tags = ""
         if core.get("rotation_retried"):
-            tags += " [rotation retry]"
+            tags += f" [rotation: {core.get('rotation_path', 'retry')}]"
         if core.get("escalated"):
             tags += " [2nd opinion]"
+        # a SPLIT on the naming set would be a regression: these files were
+        # each filed under one name and the gate is that that does not change
+        nseg = 0
+        try:
+            plan = stage2.plan_segments(
+                kb, result, core.get("page_idxs") or [],
+                set(core.get("ghost_pages") or []),
+                core.get("total_pages") or 1) if core.get("segment_view") else None
+            nseg = len(plan or [])
+        except Exception:
+            nseg = 0
+        if nseg:
+            tags += f" [WOULD SPLIT into {nseg}]"
+        din, dout, gbp = _spent()
+        percost.append(gbp)
         print(f"-> {name!r} (conf {conf}) "
               f"{'MATCH' if ok else 'MISS'}"
-              f"{' [reproduces old error]' if repro else ''}{tags}")
+              f"{' [reproduces old error]' if repro else ''}{tags} "
+              f"[{len(core.get('used_imgs') or [])} imgs, "
+              f"{len(core.get('ghost_pages') or [])} ghost, GBP {gbp:.4f}]")
         out_rows.append([str(p), r["ai_name"], name, conf, r["canonical"],
                          "yes" if ok else "no",
-                         "yes" if repro else "no", r["kind"]])
+                         "yes" if repro else "no", r["kind"],
+                         len(core.get("used_imgs") or []),
+                         len(core.get("ghost_pages") or []),
+                         # `rotation_path` only exists from v1.2.0; record the
+                         # boolean too or a BASELINE run (which sets only
+                         # rotation_retried) looks like it never rotated
+                         # anything and the rotation gate cannot be scored
+                         "yes" if core.get("rotation_retried") else "",
+                         core.get("rotation_path", ""),
+                         din, dout, round(gbp, 5), nseg])
 
     # ---- write CSV ----
     desk = stage2.desktop_path()
@@ -371,7 +617,10 @@ def main():
         w = csv.writer(f)
         w.writerow(["file", "previous_AI_name", "new_prediction",
                     "confidence", "normalised_ideal", "match",
-                    "reproduces_previous_error", "kind"])
+                    "reproduces_previous_error", "kind",
+                    "images_sent", "ghost_pages", "rotation_retried",
+                    "rotation_path",
+                    "in_tokens", "out_tokens", "gbp", "would_split_into"])
         w.writerows(out_rows)
         w.writerow([])
         w.writerow([f"SUMMARY: {n_match} correct / {len(out_rows)} total "
@@ -380,6 +629,11 @@ def main():
         for k, (hit, tot) in sorted(kind_hits.items()):
             w.writerow([f"  {k}: {hit}/{tot} "
                         f"({100.0*hit/max(1,tot):.0f}%)"])
+        if percost:
+            srt = sorted(percost)
+            w.writerow([f"  cost/doc: median GBP {srt[len(srt)//2]:.5f}, "
+                        f"mean GBP {sum(srt)/len(srt):.5f}, "
+                        f"total GBP {sum(srt):.4f}"])
     cost = stage2.tokens_cost_gbp(model_id, api.in_tokens, api.out_tokens)
     if esc_api is not None:
         cost += stage2.tokens_cost_gbp(esc_api.model_id, esc_api.in_tokens,
@@ -389,6 +643,16 @@ def main():
           f"{n_repro} reproduce the old wrong answer.")
     for k, (hit, tot) in sorted(kind_hits.items()):
         print(f"  {k:<9} {hit}/{tot} ({100.0*hit/max(1,tot):.0f}%)")
+    if percost:
+        srt = sorted(percost)
+        print(f"  cost/doc:  median GBP {srt[len(srt)//2]:.5f}   "
+              f"mean GBP {sum(srt)/len(srt):.5f}   "
+              f"total GBP {sum(srt):.4f}")
+    spurious = [row for row in out_rows if row[-1]]
+    print(f"  spurious splits on the naming set: {len(spurious)}"
+          + (" (REGRESSION - the gate is zero)" if spurious else ""))
+    for row in spurious:
+        print(f"    ! {Path(row[0]).name} would split into {row[-1]}")
     if misses:
         print("\nMISSES (kind | file | wanted | got):")
         for k, fname, want, got in misses:

@@ -1,5 +1,351 @@
 # Changelog
 
+## v1.3.0 — 2026-08-20 — autonomous bundles, orientation and upload policy
+
+- Employment Contract is now one of the 16 overwrite document types, keeping
+  Stage 2 and Stage 3 on the same individual-overwrite policy.
+- Short multi-page PDFs no longer exit at page-one triage; the full document map
+  is requested immediately when the file can be shown safely in one call.
+- Long PDFs now get an all-page boundary scan. A proposed cut is applied only
+  after independent high-confidence child classifications confirm every
+  boundary; originals remain archived and ambiguous packs stay whole.
+- Fixed the mixed-orientation control-flow bug where correcting one text-layer
+  page suppressed rotation fixes for scanned pages elsewhere in the same PDF.
+- Added optional one-click Ollama setup and a double-confirmed local vision pass
+  for image-only pages. Runtime/model failure is always a non-blocking fallback.
+
+## v1.2.0 — UNRELEASED — in-call bundle segmentation + orientation rework
+
+> **Not released, not tagged, not merged.** All four gates were run to
+> completion this time (~£18 of API spend across seven runs). Two pass, two do
+> not, and the two that do not need a decision that is not the classifier's to
+> make — see "The two open decisions" at the end.
+>
+> The headline: **bundle segmentation works and is worth having** — it finds
+> real multi-document files, including five the 2026-08-11 verification never
+> caught. **The orientation cost saving does not ship**: measured, the cheap
+> rotation path costs four misnamed compliance documents, and no confidence
+> threshold can separate its good answers from its bad ones.
+
+### What changed
+
+Stage 2 classifies a *file*, so a scan holding four documents got one name and
+the other three left the compliance record. v1.2.0 asks the classification call
+— which already has the pages in front of it — to also return a per-page
+`documents` map, then splits locally with PyMuPDF.
+
+**Same-call segmentation shipped, not the escalation ladder.** The choice was
+made on measurement, before any API spend. Over the 130-file ground truth,
+sending every non-ghost page of a short file and dropping near-blank pages
+*reduces* images sent from 296 to 281 (−5.1%), with the median per file
+unchanged at 2. An escalation ladder would have cost a second call on every
+suspected bundle to buy a saving that ghost-page exclusion already pays for.
+
+**Ghost pages.** 141 of the 544 GT pages (26%) are near-blank versos, most
+carrying a mirror-image bleed-through of their own front. They are no longer
+sent to the model. They are never dropped from disk, and never start a segment.
+
+The ink threshold is 0.05% of pixels below grey 160, and it is deliberately
+low. Measured on real pages:
+
+| Page | Ink | What it is |
+|---|---:|---|
+| row 62 p2 | 0.08% | bleed-through ghost — *not* excluded at this threshold |
+| row 62 p3 | 0.19% | a real, full Certificate of Sponsorship |
+| typical content | 0.7–6% | ordinary pages |
+
+Only ~2.4× separates the faintest real page from the densest ghost, so some
+ghosts are let through on purpose: sending a blank page wastes a fraction of a
+penny, dropping a real one loses a document.
+
+**Split gates.** A split needs all of: the model saw the file in full; ≥2
+segments; ≥2 *distinct* types; every segment ≥75 confidence and a real
+vocabulary type; no segment starting on a blank page; segments tiling the file
+exactly. Two copies of one type are one type and are never split. Anything else
+leaves the file whole and flags it.
+
+**Orientation.** The four-orientation retry (four images to settle one page,
+fired on 40 of 130 documents in v1.1.0) is replaced by straightening the render
+locally from the rotation the model just reported and re-asking **once**. The
+old retry remains as the fallback when that confirmation is unconvinced.
+Rotation is now baked into split children, so split documents open upright.
+
+**A safety bug fixed on the way.** The `.splitbak` copy that was supposed to
+guarantee "a split never deletes a document" was being destroyed:
+`flatten_worker()` moves everything under a worker back into processing, and
+`cleanup_leftover_files()` deletes `.splitbak` outright (on by default).
+Originals now go to `APP_DIR/Original Bundles/<care home>/<worker>/`.
+
+### Gate 2 — bundles: **the safety half passes, the 80% bar is marginal**
+
+Ground truth: the 18 `multi_doc_bundle` rows of the Watra verification, expected
+maps derived from the notes written after a human read the evidence pages.
+
+Final configuration:
+
+| Outcome | n | |
+|---|---:|---|
+| CORRECT | 14 | **78%** — the bar is 80% |
+| MISSED (left whole; acceptable) | 4 | rows 43, 62, 64, 106 |
+| **MIS-SPLIT (a wrong boundary)** | **0** | the bar is zero ✔ |
+
+| Expectation | n | Result |
+|---|---:|---|
+| must NOT be split (8 same-type bundles, 3 too long to see in full) | 11 | **11/11** — no file that should be left alone was split |
+| must be split | 7 | 3 correct (rows 34, 60, 114), 4 missed |
+
+**Read the 78% as a range, not a number.** Three measured runs scored 78%, 83%
+and 78%, with individual files (34, 62, 64) flipping between correct and missed
+across runs at identical or near-identical settings. The bar sits inside the
+measurement noise, so "does it clear 80%" is not currently answerable — what IS
+stable across every run is the part that matters most:
+
+- **zero mis-splits, every time.** No file was ever cut on a wrong boundary.
+- **11/11 must-not-split files left alone, every time**, including all eight
+  bundles of two same-type documents.
+
+Which is the intended asymmetry: the gates are built to fail safe, and they do.
+A missed split leaves a file exactly as v1.1.0 left it; nothing is lost that was
+not already lost.
+
+It took two measured rounds to get here, and what the first round exposed was
+mostly wrong *gates*, not a wrong model:
+
+- **A trailing blank page cancelled a real split.** Asked to account for every
+  page, the model dutifully listed the blank verso at the end as a fifth
+  "document" at confidence 30. That entry starts on a ghost page and fails the
+  confidence floor, so the gates threw away the entire plan — and a 6-page
+  bundle the model had segmented *perfectly* (booking confirmation, passport,
+  visa vignette, driving licence) was left whole. An all-blank segment is now
+  absorbed into the one before it. A segment that starts on a blank page but
+  holds real content is still refused.
+- **The confidence floor was set too high on a guess.** 75 blocked a correctly
+  identified `ID Badge` reported at 70. Confidence guards the *type*, not the
+  boundary — the one wrong boundary in the set arrived at confidence 92 — so it
+  is now 70, still above the vocabulary's own 60 for naming a whole file.
+- **`MAX_SEG_PAGES` 12 → 7, and this one is tuned, not derived.** The only
+  wrong boundary in the set was the only file with more than 5 non-ghost pages:
+  a 12-page ID bundle (8 non-ghost) where the model merged a DWP National
+  Insurance letter and a staff ID badge into one ten-page "Bank Statement". The
+  pages were rendered and read to confirm this was a real defect and not a
+  ground-truth artefact — page 5 is the NI letter ("Page 1 of 4"), page 11 the
+  ID badge, and there is no bank statement anywhere in the file. Over the cap a
+  file is now classified exactly as today and flagged, so this fails safe; but
+  it rests on **one data point** and should be revisited when more bundle
+  ground truth exists.
+
+Two scoring corrections were made, and both are called out here rather than
+quietly applied, because a gate you adjust after seeing the result is worth
+nothing if it is adjusted silently:
+
+- **Row 60** was scored MIS-SPLIT for returning `[council tax][statement +
+  statement]` instead of three segments. That contradicted this design's own
+  rule — two copies of one type are one upload slot, which is exactly why the
+  eight same-type bundles count as correctly *not* split. The entry now
+  requires the council-tax boundary and lets the two statements share a segment.
+- **Row 34** was scored MIS-SPLIT with *every boundary exactly right*, purely
+  because the model said "Booking Confirmation" where the ground truth says
+  "Other - Consulate appointment booking confirmation". That is the wording
+  variance `OTHER_LABEL_PATTERNS` has existed for since v1.1.0. The bundle
+  scorer now uses the same `prediction_matches()` comparison as the naming half
+  of the harness, against the name each segment would actually be *filed*
+  under. A label difference also gets its own `TYPE-DIFF` outcome now: calling
+  it the same failure as cutting a document in half would make the
+  zero-mis-split gate meaningless.
+
+**Stability caveat.** Rows 34 and 62 swapped outcomes between the two rounds
+(62 split correctly in the first and was missed in the second; 34 the reverse)
+with no code change between them that touches either. Segmentation on
+borderline files is not deterministic, so 15/18 should be read as approximate,
+not as a fixed score.
+
+### Gate 1 — regression: **FAIL as written**, by 2 documents
+
+Both runs are the full 130-file set, same harness, measured per document.
+
+The naming ground truth **contains** the 18 `multi_doc_bundle` rows, so those
+files are expected to behave differently — that is the feature. The gate is
+therefore scored on the other 112, where a changed name is a real regression.
+
+| | baseline v1.1.0 | v1.2.0 |
+|---|---:|---:|
+| accuracy, 112 non-bundle files | 107/112 | **105/112** |
+| names changed | — | 6 (3 worse, 1 better, 2 same verdict) |
+
+Two of the three "worse" cancel out: row 23 lost the MOT-history/vehicle-tax
+call while row 53 *gained* it — the same documented-flaky pair from v1.1.0's
+residuals, swapping places. The genuine remainder is **two documents**, rows 81
+and 105, both of which are demonstrably unstable: an isolation test ran each of
+them four ways (baseline images, ghost-excluded, with and without the
+segmentation prompt) and **all four configurations were wrong** for both. The
+baseline's correct answers on them were luck, not signal.
+
+**Two documents is exactly the run-to-run noise of this set.** Two v1.2.0 runs
+of identical code over the same 130 files differed on 2 files. (Measured on
+v1.2.0, not on the baseline — so treat it as an order of magnitude, not a
+proof.)
+
+**The "5 spurious splits" are not spurious.** Every one was checked by
+rendering and reading its pages:
+
+| File | What is actually inside |
+|---|---|
+| row 83 | Share Code Check Result + a Pakistani passport bio page (MRZ `P<PAK…`) |
+| row 109 | Passport + Visa Vignette |
+| row 111 | Employment offer acceptance letter + a reference request email |
+| row 113 | Passport + Visa Vignette + **BRP** (a "RESIDENCE PERMIT" card) |
+| row 75 | UK Driving Licence photocard + a licence-summary printout (borderline; the gates refuse it on a re-ask) |
+
+These are real multi-document files. The control set was wrong, not the
+splitter: `multi_doc_bundle` only tagged files where the bundle produced a
+*wrong name*. A bundle that rule 18(b) happened to name correctly was never
+tagged, even though its other documents were still lost. `DEFERRED_WORK.md`
+corroborates — its own table already listed rows 109/113 as "a passport bio
+page + a BRP". **So the real bundle rate in this set is ~27 of 130, not 18.**
+
+### Gate 3 — rotation: **the cost half does not ship**
+
+The free text-layer tier and persisting rotation into split children both ship.
+The cheap model tier does not, and this is the most important measurement in
+the release.
+
+Replacing the four-orientation retry with a corrected-render confirmation is
+genuinely cheaper — **−7.9% per rotated document** — and genuinely less
+accurate, over the same 67 rotated documents:
+
+| rotation path | rescued | cost/doc (median) |
+|---|---:|---:|
+| four-orientation retry (v1.1.0) | **64/67** | £0.02854 |
+| corrected-render confirmation | 60/67 | £0.02628 |
+
+**No confidence threshold recovers the difference.** The seven misses came back
+at 92, 92, 92, 92, 92, 92 and 95 — indistinguishable from a correct-answer
+distribution that is almost entirely 92–95. At a 95 floor you would catch six
+of the seven misses and drag nine correct answers to the dearer path with them.
+Confidence carries no signal here, which is also why zero of 67 confirmations
+ever fell back.
+
+Four misnamed compliance documents is not worth 7.9% of the rotation subset, so
+the proven path stays primary (`ROTATION_FAST_CONFIRM = False`). The cheap path
+is kept, tested and one flag away for anyone who finds a signal that *does*
+separate its good answers from its bad — disagreement with the pre-rotation
+answer is the obvious candidate and is **not** measured.
+
+With the proven path restored, rotation is at parity: 64/67 (95.5%) against the
+baseline's 69/72 (95.8%), at +0.3% cost.
+
+### Gate 4 — cost: **PASS on the stated metric**, but read the caveat
+
+| | baseline | v1.2.0 |
+|---|---:|---:|
+| **median £/doc (the gate)** | £0.02809 | **£0.02758** |
+| mean £/doc | £0.02191 | £0.02211 |
+| total, 130 files | £2.8482 | £2.8747 |
+| images sent | 296 | 303 |
+
+The median improves; the mean and total rise slightly. The brief expected
+ghost-page exclusion to *fund* segmentation, and in an earlier configuration it
+did — **−13.5% images, −15% median cost**. That version was abandoned on
+purpose, and the reason is worth recording:
+
+Dropping blank pages everywhere reduced **47 of the 130 files to a single
+image** — the two-sided sheet with a blank back, the commonest shape in a
+care-home folder. A lone page cannot be split, so those requests were being
+perturbed for no segmentation benefit at all, and on borderline documents any
+perturbation reshuffles the answer. Every policy that prevents that collapse
+costs *more* than the baseline:
+
+| page policy | images vs v1.1.0 | files left byte-identical |
+|---|---:|---:|
+| drop blank pages everywhere | −13.5% | 54/130 |
+| never collapse to one image | +2.4% | 101/130 |
+| only touch files longer than the old sample | +3.4% | 104/130 |
+
+The saving and the guardrail are in direct conflict, and the brief makes the
+guardrait inviolable, so the rule is now: **only change what is sent when
+segmentation can actually use it.** A file that cannot be segmented is sent
+exactly as v1.1.0 sent it.
+
+(The built-in pre-flight estimator is still low on rotated scans — it estimated
+£0.07 for the 18 bundle files, which cost £0.43. Known in v1.1.0, not fixed
+here.)
+
+### The two open decisions
+
+Neither is the classifier's to make, which is why this is not merged.
+
+**1. Is finding ~9 more bundles worth 2 borderline naming changes?**
+
+Segmentation splits real multi-document files that previously lost everything
+after page 1 — 5 of the tagged bundle set plus 5 the verification never tagged.
+Against that, two documents (rows 81 and 105) that the baseline happened to get
+right now come out wrong. Both are unstable regardless of this change; both are
+in the "Other" group, so both land in the platform's Other bucket either way.
+
+Gate 1 as written says *identical* classifications, so as written it fails. The
+honest reading is that it fails by an amount indistinguishable from the noise
+floor of the measurement, in exchange for documents that were being silently
+lost.
+
+**2. Accept rotation at cost parity?**
+
+The brief asked for the rotated-document path to get both more accurate and
+cheaper. Measured, those two are in conflict: the cheap path costs four
+documents. Shipping as-is means the orientation work delivers the free
+text-layer tier and upright split children, but **no cost saving** — the
+"≈¼ the retry cost" in the brief is not achievable at current accuracy.
+
+If the answer to either is no, the fallback is clean: `bundle_split` is already
+a Settings toggle, and `ROTATION_FAST_CONFIRM` is a one-line switch.
+
+### What to do once those are decided
+
+1. Merge, tag `v1.2.0`, rebuild, publish the release, then let `install.ps1`
+   point at it (the tag it names does not exist yet — see below).
+2. Worth doing regardless of the decision: **re-tag the bundle ground truth.**
+   The five newly found bundles (rows 75, 83, 109, 111, 113) should be added to
+   it with expected maps, so the next change to this code is measured against
+   27 known bundles rather than 18.
+
+**Version strings are already bumped on this branch** — `APP_VERSION = "1.2.0"`,
+`install.ps1 $Tag = "v1.2.0"`, installer `MyAppVersion 1.2`. The v1.2.0 GitHub
+release does not exist yet, so `install.ps1` on this branch would fail to
+download. That is safe while the branch is unmerged and is the reason it must
+not be merged before the release is cut.
+
+### The worked example — not tested
+
+The 8-page worked example from the brief (Share Code + Passport + Visa Vignette
++ BRP, three ghost versos, every page 90° out) is **not on this machine**, so
+the release's headline example has never been run end to end. Its shape is
+covered indirectly — row 113 is the same kind of file (Passport + Visa Vignette
++ BRP) and splits correctly into three. The bundle GT folder and its expected
+map are ready for it at
+`%LOCALAPPDATA%\Lifted\EvalGT\bundles\` — drop the file in as the only
+non-`row_` PDF there and re-run `python src\build_bundle_gt.py`.
+
+### Residual row 106 — still open, but the reason has changed
+
+v1.1.0 recorded this as "needs the file split, not a rule". The splitting
+machinery now exists and is proven on this exact file: `test_split_e2e.py`
+drives a real split of it into `Other - Criminal Record Check Declaration.pdf`
++ `Emergency Contact Details.pdf`, with the blank page 3 travelling with the
+second child and the original archived.
+
+What does not happen reliably is the model *seeing* two documents in it. Asked
+directly, it returns a single segment covering all three pages — `Emergency
+Contact Details` at confidence 85 — so there is nothing for the gates to act
+on. Its sibling row 114, the same form pack for a different worker, is
+segmented correctly every time.
+
+So the residual is now a **recall** problem in the page map rather than a
+missing capability, and it is on the safe side of the trade: the file is left
+whole, exactly as today. Note that the whole-file name it now produces
+(`Emergency Contact Details`, page 2's content) is a *different* wrong answer
+from v1.1.0's `Safeguarding Questionnaire`, and still not the rule-18(b) answer
+of the first complete document. That is a naming question, not a segmentation
+one, and it is untouched here.
+
 ## v1.1.0 — 2026-08-11 — Watra Care post-audit accuracy pass
 
 A post-run accuracy audit of the Watra Care Limited batch flagged 113 documents
