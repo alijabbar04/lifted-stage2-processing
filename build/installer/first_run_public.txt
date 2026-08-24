@@ -1,0 +1,19 @@
+STAGE 2 - PROCESSING
+====================
+
+This safe public installer adds:
+  - Stage 2 v1.3.0
+  - Desktop and Start Menu shortcuts
+  - the in-app user guide
+
+FIRST RUN
+---------
+Open Settings (the cog), paste your Anthropic API key, and save it. The key is
+stored in Windows Credential Manager, not in a file, and survives app updates.
+
+LibreOffice is recommended for accurate Word, Excel and PowerPoint conversion.
+If it is missing, install it once with:
+  winget install --id TheDocumentFoundation.LibreOffice -e
+
+Existing settings, API credentials and processed documents are not removed or
+overwritten by an update.

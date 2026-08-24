@@ -41,7 +41,7 @@
 #endif
 
 #define MyAppName "Stage2 Processing"
-#define MyAppVersion "1.2"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "Lifted / Ali Jabbar"
 #define MyAppExeName "Stage2 Processing.exe"
 
@@ -55,7 +55,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
 OutputDir=Output
-OutputBaseFilename=Stage2_Processing_Setup
+OutputBaseFilename=Stage2_Processing_Preconfigured_Setup
 ; instructions shown INSIDE the installer (so the exe needs no README beside it)
 InfoBeforeFile=first_run.txt
 SetupIconFile={#AppIco}

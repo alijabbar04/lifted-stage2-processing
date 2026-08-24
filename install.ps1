@@ -10,7 +10,7 @@
 #
 #  Usage (see README for the full walkthrough):
 #      .\install.ps1
-#  Prerequisite: a GitHub account invited to this (private) repo.
+#  Prerequisite: GitHub CLI (the repository itself is public).
 #
 #  NOTE ON THE API KEY: this installs the app only. You paste your own
 #  Anthropic API key on first run (cog -> API key), and it is stored in the
@@ -21,7 +21,7 @@
 # ============================================================================
 $ErrorActionPreference = "Stop"
 $Repo      = "alijabbar04/lifted-stage2-processing"
-$Tag       = "v1.2.0"
+$Tag       = "v1.3.0"
 $AppAsset  = "Stage2_Processing.exe"
 $GuideAsset = "Stage2_Guide_AI_Processing.pdf"
 
@@ -66,7 +66,7 @@ function Invoke-Native {
 
 Write-Host "=== Stage 2 - Processing : install ===" -ForegroundColor Cyan
 
-# --- 1. GitHub CLI (needed because the repo is private) ---------------------
+# --- 1. GitHub CLI ----------------------------------------------------------
 $gh = Find-Gh
 if (-not $gh) {
     Write-Host "`n[1/5] GitHub CLI not found - installing it with winget..." -ForegroundColor Cyan
