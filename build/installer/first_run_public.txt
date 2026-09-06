@@ -2,7 +2,7 @@ STAGE 2 - PROCESSING
 ====================
 
 This safe public installer adds:
-  - Stage 2 v1.3.0
+  - Stage 2 v1.4.0 - Obsidian Compact
   - Desktop and Start Menu shortcuts
   - the in-app user guide
 
@@ -17,3 +17,9 @@ If it is missing, install it once with:
 
 Existing settings, API credentials and processed documents are not removed or
 overwritten by an update.
+
+LOCAL PAGE ORIENTATION
+----------------------
+The bundled CPU-only model checks PDF pages locally and never downloads at
+runtime. v1.3.2 starts in Audit only / shadow mode. Review its report before
+enabling automatic high-confidence correction in Settings.

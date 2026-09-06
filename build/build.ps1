@@ -4,7 +4,7 @@
 #  Output:              <repo>\dist\Stage 2 - Processing.exe
 #
 #  Prerequisite: .\setup.ps1 has been run once (installs pymupdf/pillow/
-#  openpyxl/keyring).
+#  onnxruntime/openpyxl/keyring).
 #
 #  This builds the APP ONLY. To build the end-user installer (app + API key +
 #  LibreOffice + guides/tools payload) see build\installer\build_installer.py -
@@ -16,8 +16,9 @@ $repo = Split-Path $PSScriptRoot -Parent
 
 Write-Host "=== Building Stage 2 - Processing ===" -ForegroundColor Cyan
 
-# Pinned PyInstaller (same version as the production v1.0.0 build)
-python -m pip install "pyinstaller==6.21.0" --quiet
+# Pinned PyInstaller. 6.22.1 includes the current one-file environment
+# validation fix and is the minimum permitted release for distributable builds.
+python -m pip install "pyinstaller==6.22.1" --quiet
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Compile check before the (slow) freeze
@@ -37,6 +38,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $exe = Join-Path $repo "dist\Stage 2 - Processing.exe"
 if (Test-Path $exe) {
     $mb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+    & (Join-Path $repo "tools\smoke_test_frozen_app.ps1") -ExePath $exe
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Host "`nDONE: $exe ($mb MB)" -ForegroundColor Green
     Write-Host "Deploy by copying it over the existing exe (back the old one up first)."
 } else {

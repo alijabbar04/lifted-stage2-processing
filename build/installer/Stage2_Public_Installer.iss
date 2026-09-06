@@ -3,7 +3,7 @@
 ; Windows Credential Manager. Never add a key or apikey.dat to this script.
 
 #define MyAppName "Stage 2 - Processing"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.4.0"
 #define MyAppPublisher "Lifted"
 #define MyAppExeName "Stage 2 - Processing.exe"
 #define SrcExe "..\..\dist\Stage 2 - Processing.exe"
@@ -38,6 +38,7 @@ Source: "{#SrcExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SrcIco}"; DestDir: "{app}"; DestName: "stage2.ico"; Flags: ignoreversion
 Source: "README_public.txt"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion isreadme
 Source: "{#GuideSrc}"; DestDir: "{localappdata}\Lifted\Guides"; DestName: "Stage 2 Guide - AI Processing.pdf"; Flags: ignoreversion
+Source: "{#GuideSrc}"; DestDir: "{app}\Guides"; DestName: "Stage 2 Guide - AI Processing.pdf"; Flags: ignoreversion
 Source: "{#GuideSrc}"; DestDir: "{%USERPROFILE}\Documents\Lifted\Guides"; DestName: "Stage 2 Guide - AI Processing.pdf"; Flags: ignoreversion
 
 [Icons]

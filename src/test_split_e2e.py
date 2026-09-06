@@ -6,8 +6,8 @@ Drives Engine._maybe_split_bundle over a real 3-page bundle with a STUBBED
 classification reply (the stub raises if anything tries to call the API,
 which is itself the assertion that a split child is never re-classified),
 and then checks what actually landed on disk: both children written, the
-parent archived OUTSIDE the worker tree, rotation baked into the children
-including the blank verso, and the archive surviving the two cleanup passes
+parent locally corrected before splitting, children inheriting that correction
+exactly once including after restart, and the archive surviving two cleanup passes
 that used to destroy it.
 
 Needs the bundle ground truth (real worker files, never in the repo) - see
@@ -58,6 +58,13 @@ class StubAPI:
         raise AssertionError("no API call expected during a split")
 
 
+class StubOrientation:
+    def predict(self, images):
+        return [{"predicted_orientation": 90, "correction": 270,
+                 "confidence": 0.99, "runner_up_confidence": 0.005,
+                 "margin": 0.985} for _ in images]
+
+
 care = tmp / "Care Home [Processed]"
 worker = care / "Aqil"
 worker.mkdir(parents=True)
@@ -73,7 +80,8 @@ eng = s2.Engine(
     set_progress=lambda *a: None, set_preview=lambda *a: None,
     ask_unknown=lambda *a, **k: None, on_cost=lambda *a: None,
     on_done=lambda *a: None, auto_other=True, bundle_split=True,
-    auto_rotate=True)
+    orientation_mode="automatic",
+    orientation_predictor=StubOrientation())
 
 # what the classification call would have returned for this file: two
 # documents, page 3 being the blank verso of page 2, and every page sideways
@@ -92,6 +100,20 @@ result = {
 before = {p.name for p in worker.iterdir()}
 records = []
 vocab = kb.vocabulary_block()
+# Deterministic local preflight: make all three pages eligible so this harness
+# specifically verifies correction -> split -> restart idempotence. Blank/sparse
+# vetoes are covered separately by the unit suite.
+old_evidence = s2.thumbnail_evidence
+old_text_orientation = s2.detect_pdf_page_text_rotations
+s2.thumbnail_evidence = lambda _image: {
+    "blank": False, "sparse": False, "photograph_only": False,
+    "ink_fraction": 0.2}
+s2.detect_pdf_page_text_rotations = lambda *a, **k: {}
+orientation = eng._orientation_preflight(target)
+s2.thumbnail_evidence = old_evidence
+s2.detect_pdf_page_text_rotations = old_text_orientation
+check("parent corrected locally before split", orientation.get("changed"))
+eng._consume_rotation_instructions(result)
 out = eng._maybe_split_bundle(worker, target, result, vocab, records,
                               interactive=False, default_source="AI",
                               unknown_queue=None, depth=0)
@@ -131,6 +153,31 @@ check("rotation composed onto the children", sorted(flat) == sorted(want),
       f"-> {rots}")
 check("every page of a child ends up the same way up",
       all(len(set(rr)) == 1 for rr in rots), f"-> {rots}")
+
+# Restart must use inherited child state and never turn a child again.
+class BombOrientation:
+    def predict(self, _images):
+        raise AssertionError("split child orientation must not rerun")
+
+restart = s2.Engine(
+    care_home_dir=care, kb=kb, api=StubAPI(), care_home_name="Care Home",
+    log=lambda *a: None, set_status=lambda *a: None,
+    set_progress=lambda *a: None, set_preview=lambda *a: None,
+    ask_unknown=lambda *a, **k: None, on_cost=lambda *a: None,
+    on_done=lambda *a: None, orientation_mode="automatic",
+    orientation_predictor=BombOrientation())
+restart_ok = True
+try:
+    for p in kids:
+        restart._orientation_preflight(p)
+except AssertionError:
+    restart_ok = False
+check("restart skips inherited child rotations", restart_ok)
+post_restart = []
+for p in kids:
+    d = fitz.open(p); post_restart.extend(pg.rotation for pg in d); d.close()
+check("restart leaves every page rotated exactly once",
+      sorted(post_restart) == sorted(want), f"-> {post_restart}")
 
 # the ghost page must have travelled with the segment before it
 check("blank page 3 kept on disk (never dropped)", sum(counts) == 3)

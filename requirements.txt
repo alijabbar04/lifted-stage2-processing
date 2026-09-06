@@ -9,6 +9,8 @@
 #            rotation when a scan is sideways, and splits multi-document bundles
 # pillow   : image handling - resizing/capping pages before they are sent to the
 #            API, and thumbnails/previews in the GUI
+# onnxruntime: CPU-only inference for the bundled 7 MB four-way document-page
+#            orientation model. No GPU package and no runtime downloads.
 # openpyxl : reads/writes the .xlsx controlled-vocabulary record, the override
 #            log, the misnaming record and the post-run audit report
 # keyring  : stores the Anthropic API key in the OS credential store (Windows
@@ -18,12 +20,15 @@
 #            a permission-restricted local file as a last resort.
 #
 # There is NO Anthropic SDK dependency: the app calls the Messages API and the
-# Message Batches API directly over urllib from the standard library.
+# Message Batches API directly. Windows batch creation uses native WinHTTP
+# through pywin32; read-only polling and results retain urllib.
 #
-# Versions below are the ones the shipped v1.0.0 exe was built and tested with
-# (Python 3.13.14, PyInstaller 6.21.0 - see build\build.ps1).
+# Versions below are the ones the v1.3.1 exe was built and tested with
+# (Python 3.13.14, PyInstaller 6.22.1 - see build\build.ps1).
 
 pymupdf==1.27.2.3
 pillow==12.2.0
+onnxruntime==1.29.0
 openpyxl==3.1.5
 keyring>=24.0
+pywin32==312; sys_platform == "win32"

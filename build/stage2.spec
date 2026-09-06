@@ -8,22 +8,24 @@
 #
 # Build with:  .\build\build.ps1        (from the repo root)
 #
-# NOTE ON datas: deliberately empty, matching the production build. The app
-# resolves stage2.ico from beside the script and falls back to an embedded PNG
-# when it is absent, so the frozen exe gets its icon from the EXE(icon=...)
-# resource below. api_usage.py is picked up automatically by import analysis
-# because it sits next to Stage2_Processing.pyw in src/.
+# Bundle the icon, guide and provider-neutral review rules so the portable
+# executable has the same workflow assets as the installed application.
 
 import os
 
 SRC = os.path.join(SPECPATH, os.pardir, 'src')
+ORIENTATION_ASSETS = os.path.join(
+    SPECPATH, os.pardir, 'assets', 'orientation')
 
 a = Analysis(
     [os.path.join(SRC, 'Stage2_Processing.pyw')],
     pathex=[SRC],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[(ORIENTATION_ASSETS, os.path.join('assets', 'orientation')),
+           (os.path.join(SRC, 'stage2.ico'), '.'),
+           (os.path.join(SPECPATH, os.pardir, 'docs', 'ai-review'), os.path.join('docs', 'ai-review')),
+           (os.path.join(SPECPATH, os.pardir, 'docs', 'USER_GUIDE.pdf'), 'docs')],
+    hiddenimports=['onnxruntime'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -45,7 +47,12 @@ exe = EXE(
     strip=False,
     upx=True,
     upx_exclude=[],
-    runtime_tmpdir=None,
+    # Some managed Windows sessions expose C:\Windows\Temp through
+    # GetTempPathW even for a per-user launch. Tcl/Tk can unpack there but
+    # then fail to read its own init.tcl. Pin one-file extraction to a
+    # per-user directory; PyInstaller expands %LOCALAPPDATA% on Windows and
+    # still creates an isolated _MEI... child for each process.
+    runtime_tmpdir=r'%LOCALAPPDATA%\Lifted\Stage2Runtime',
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,

@@ -28,7 +28,7 @@ if ([int]$parts[0] -lt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -lt 11)) 
 }
 
 # 2. Install pinned Python dependencies
-Write-Host "`n[1/3] Installing Python packages (pymupdf, pillow, openpyxl, keyring)..." -ForegroundColor Cyan
+Write-Host "`n[1/3] Installing Python packages (pymupdf, pillow, onnxruntime, openpyxl, keyring)..." -ForegroundColor Cyan
 python -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 python -m pip install -r (Join-Path $PSScriptRoot "requirements.txt")

@@ -36,12 +36,13 @@ gh auth login --web
 **Step 3 — download and run the installer.** Copy this whole line:
 
 ```powershell
-gh release download v1.3.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
+gh release download v1.4.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
 ```
 
-It downloads the app (about 57 MB), installs it, makes a Desktop and Start Menu
-shortcut, installs the user guide so the in-app **Guide** button works, and then
-lists what it installed so you can see it worked:
+It downloads the app (about 75 MB) plus `SHA256SUMS.txt`, verifies the
+executable before installing it, makes a Desktop and Start Menu shortcut,
+installs the user guide so the in-app **Guide** button works, and then lists
+what it installed so you can see it worked:
 
 | Installed | Where |
 |---|---|
@@ -66,6 +67,17 @@ If you would rather not use PowerShell: go to the repository's **Releases** page
 and download **`Stage2_Processing_Setup.exe`**. Double-click it to install the
 app, shortcuts and guide. The portable **`Stage2_Processing.exe`** is also
 available if you do not want a normal installation.
+
+Download `SHA256SUMS.txt` from the same release and compare it before running a
+manually downloaded file:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\Stage2_Processing_Setup.exe
+Get-Content .\SHA256SUMS.txt
+```
+
+The hash printed for `Stage2_Processing_Setup.exe` must exactly match its line
+in the manifest. Do not run the file if it differs.
 
 > Windows may warn that the file is "not commonly downloaded" because it is not
 > code-signed. Choose **Keep**, then if SmartScreen appears, **More info → Run
@@ -153,8 +165,21 @@ higher number is the **better** copy — `DBS Document (02)` beats
    ready in about an hour, up to 24). Batch is the right choice for a big run
    you can leave overnight.
 4. Start it. The cost estimate in GBP updates live from the real token counts
-   the API returns. The run stops on its own at the budget ceiling
-   (**£25** by default, changeable in Settings).
+   the API returns. The run uses one cumulative budget across primary
+   classification, follow-up, finishing and the optional audit (**£35** by
+   default, changeable in Settings).
+
+For Overnight Batch, use **Check batch status** until all phases finish. A
+confident controlled match or a specific descriptive Other result is settled by
+the primary batch. Only generic, malformed or low-confidence results enter one
+discounted follow-up batch. If second opinion is enabled, that small batch uses
+the stronger model directly. No worker folder is finalised or moved while the
+follow-up is pending.
+
+The estimate screen lists primary batch classification, required live finishing,
+the follow-up reserve and the optional audit separately. An enabled audit shows
+its expected cost before it starts and is skipped—without undoing completed
+processing—when the remaining cumulative budget is insufficient.
 
 Read **`docs/USER_GUIDE.pdf`** for the full walkthrough with screenshots. It is
 also available inside the app from the **Guide** button.
@@ -200,8 +225,9 @@ on your local Git configuration.
 .\setup.ps1
 ```
 
-This checks your Python version, installs the four packages Stage 2 needs
-(`pymupdf`, `pillow`, `openpyxl`, `keyring`), checks for LibreOffice, and then
+This checks your Python version, installs the five packages Stage 2 needs
+(`pymupdf`, `pillow`, `onnxruntime`, `openpyxl`, `keyring`), checks for
+LibreOffice, and then
 offers to store your Anthropic API key in the Windows Credential Manager.
 
 When it asks for the key, paste it and press Enter — the typing is hidden. Press
@@ -235,6 +261,21 @@ Use `pythonw` instead of `python` to run it without a console window behind it.
 
 Takes a few minutes and writes `dist\Stage 2 - Processing.exe`. Back up the old
 exe before replacing it.
+
+After building the public installer, generate the final three-artifact checksum
+manifest with:
+
+```powershell
+.\build\build_public_installer.ps1
+```
+
+This writes `dist\SHA256SUMS.txt` with SHA-256 hashes for the app, public setup
+executable and bundled ONNX model. It is intentionally generated last and does
+not attempt to include a hash of itself.
+
+The 7 MB `PP-LCNet_x1_0_doc_ori` ONNX model is included in the executable. It
+is CPU-only and is never downloaded at runtime. Its pinned revision, Apache-2.0
+licence and SHA-256 are recorded in `assets/orientation/PROVENANCE.md`.
 
 ## What to read next
 

@@ -412,10 +412,10 @@ def page_data(app_name: str, include_all_apps: bool = False, tool_apps=None):
 # ---------------------------------------------------------------------------
 # Tk ANALYTICS WINDOW (shared by the Tkinter apps)
 # ---------------------------------------------------------------------------
-C_BG, C_PANEL, C_PANEL2 = "#0d0f12", "#161a20", "#1d232b"
-C_BORDER, C_GRID = "#2a323d", "#232b35"
-C_FG, C_DIM = "#e8eaed", "#9aa4b0"
-C_MINT, C_MINT_D, C_FILL = "#3ddc97", "#1f9d55", "#12362a"
+C_BG, C_PANEL, C_PANEL2 = "#060708", "#0e1012", "#16191c"
+C_BORDER, C_GRID = "#282c30", "#24282c"
+C_FG, C_DIM = "#eff1f3", "#a2a8af"
+C_MINT, C_MINT_D, C_FILL = "#e4e9ee", "#9da8b3", "#242b32"
 C_RIBBON = "#000000"
 
 
@@ -569,7 +569,7 @@ def render_chart_image(sdata, w, h, kind="line", dpi=96.0):
             # vertical gradient, rounded top corners only
             bar = Image.new("RGBA", (max(1, x1 - x0), bh))
             bd = ImageDraw.Draw(bar)
-            c_top, c_bot = (92, 232, 171), (34, 184, 119)
+            c_top, c_bot = _rgb(C_MINT), _rgb(C_MINT_D)
             for yy in range(bh):
                 t = yy / max(1, bh - 1)
                 col = tuple(int(c_top[ci] + (c_bot[ci] - c_top[ci]) * t)

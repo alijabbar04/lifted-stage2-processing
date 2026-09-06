@@ -1,5 +1,125 @@
 # Changelog
 
+## v1.4.0 — 2026-09-06 — Obsidian Compact and evidence-led AI review
+
+- Implement the compact near-black/silver layout, black native Windows caption
+  and real app icon; keep all navigation, API analytics, guide and detailed log.
+- Report per-document audit progress, adjudication/wait state, cautious ETA and
+  truthful incomplete outcomes. Report-writing must finish before completion.
+- Add report choices, verified account/model handoffs for Luna/Opus audit review
+  and Sol/Fable learning, with role-shared rules and durable file-based memory.
+- Require evidence and complete peer ranking for controlled-category corrections;
+  apply recoverable two-phase transactions and reconcile every changed peer in
+  the master correction ledger. Learning changes require regression evidence.
+- Add configurable Discord/Telegram lifecycle notifications, rate limiting,
+  delivery tests and local credential references without public-build secrets.
+- Replace the guide with a 12-page workflow guide and bundle it and the review
+  rules in the portable executable; refresh installers and release checksums.
+- Preserve the existing paid classification models, resolution and vocabulary.
+
+## v1.3.3 — 2026-09-06 — interrupted primary submission recovery
+
+- Save the entire primary document inventory before the first upload; do not
+  apply a partially submitted inventory as though it were complete.
+- Reconcile interrupted uploads against provider batch records and exact request
+  identities before offering a state-backed, explicitly authorised resume.
+- Recover older partial inventories without repeating conversion or flattening;
+  preserve accepted work and send only the remaining requests in bounded chunks.
+- Back up state before reconciliation and stop on changed sources, inconclusive
+  provider evidence, or concurrent state changes.
+- Make Check batch status offer recovery, refresh pending headers, block
+  conflicting Start/Flatten actions, and avoid 100% progress on failure.
+- Use one-shot Windows-native WinHTTP for primary and follow-up batch creation;
+  preserve exact request bytes and certificate validation, with no automatic
+  POST retry or transport fallback after an uncertain response.
+- Target 10 MiB recovery chunks without lowering document quality, and hold
+  an OS-backed per-care-home lock for each complete write operation.
+- Keep existing classification models, resolution and the dark layout unchanged.
+
+## v1.3.2 — 2026-09-05 — restart-safe follow-up chunking
+
+- Follow-up classification now uses the same bounded multi-batch approach as
+  the primary run. Large unresolved sets are planned below 90 MB per chunk and
+  retain the existing 100 MB hard transport guard.
+- Every follow-up chunk records its request IDs and a durable started/accepted
+  marker. A clean restart continues with unsubmitted chunks; an ambiguous POST
+  remains blocked so duplicate billing is not risked.
+- The follow-up completion dialog now reports the number of submitted chunks.
+  A genuinely oversized single-document request receives an actionable message
+  instead of the previous vague whole-set warning.
+
+## v1.3.1 orientation and restart-safety completion (2026-09-02)
+
+- Fixed the frozen Windows application failing at startup when the host exposed
+  `C:\Windows\Temp` as its runtime directory. One-file extraction is now pinned
+  to `%LOCALAPPDATA%\Lifted\Stage2Runtime`, the PyInstaller pin is upgraded to
+  6.22.1, and every application build must open the real Stage 2 v1.3.1 window
+  under the formerly failing temp environment before it can pass.
+- Added a bundled, CPU-only four-way document orientation preflight using the
+  official 6,788,069-byte `PP-LCNet_x1_0_doc_ori` ONNX model. It checks every
+  processed PDF page locally in bounded batches, never downloads at runtime and
+  never calls an external API. Audit/shadow mode is the v1.3.1 default;
+  automatic correction remains opt-in pending a representative reviewed
+  benchmark.
+- Automatic orientation uses atomic PDF replacement, high-confidence and
+  margin gates, blank/sparse/photo/conflict vetoes, immediate hash persistence
+  and per-page restart state. Corrected parent pages are marked consumed before
+  splitting, and child state follows renames, preventing double rotation.
+- Batch state now separates classification, per-worker finishing, movement and
+  optional audit completion. Live finishing spend and chargeable operations are
+  checkpointed individually; completed workers are not repeated after restart.
+- Every primary batch POST now has a persisted chunk plan, request identities,
+  attempt ID and pre-POST marker. Unknown submission outcomes remain ambiguous
+  and block both resubmission and live processing.
+- Generic format-only Other labels (`email`, `letter`, `form`, `scan`,
+  `screenshot`, `PDF`) now receive the single discounted follow-up. Specific
+  labels such as `P60` and `customer experience email` remain meaningful.
+- Corrected the displayed Claude Opus 4.8 API price to the official $5/M input
+  and $25/M output price (verified 2026-09-02); model IDs are unchanged.
+- Follow-up application now distinguishes a completed generic answer from a
+  failed, expired, canceled or missing answer. A meaningful completed follow-up
+  wins, a completed generic answer stays `Other - Unknown`, and a failed
+  follow-up falls back to the usable primary result without resubmission.
+- Interrupted atomic orientation temps are excluded everywhere and removed only
+  when their exact app-generated name and source-PDF sibling prove they are
+  residue. Orientation work now observes stop requests before a PDF, between
+  pages/batches and immediately before a physical rewrite.
+- Removed the obsolete split-time rotation map. Split children now copy the
+  locally preflighted parent bytes directly, preserving exactly-once rotation.
+- Public release builds now generate a deterministic `SHA256SUMS.txt` last for
+  the app, credential-free setup and ONNX asset; `install.ps1` verifies the app
+  before installation. Application artifact publication remains blocked until
+  the owner selects proprietary terms or an open-source licence.
+
+## v1.3.1 — 2026-09-02 — bounded long PDFs and discounted batch follow-up
+
+- Restored the v1.2 long-PDF cost guard. Long PDFs use the normal first-two-plus-
+  last-page sample, remain intact, and are flagged only when that sample
+  explicitly suggests multiple documents. Production processing no longer calls
+  the all-page overlapping boundary scan or child-confirmation loop.
+- Preserved the one-result short-PDF bundle path, including passport/visa/BRP
+  splits and archival of the original.
+- Preserved the complete controlled vocabulary and canonical snap-to-vocabulary
+  behaviour. Unmatched documents now consistently retain descriptive
+  `Other - <description>` names; specific primary-batch `other_label`/`guess`
+  values are no longer replaced with `Unknown` or added to the workbook.
+- Replaced automatic live per-document batch retries with one persisted,
+  discounted Message Batches follow-up containing only malformed, generic or
+  low-confidence results. When enabled, the stronger configured model is used
+  directly. Resume is idempotent and fails closed if submission status is
+  ambiguous, preventing automatic duplicate billing.
+- Worker finalisation, movement and audit wait for any required follow-up batch.
+  The existing empty-worker-folder movement correction is included.
+- Cost estimates now separate primary batch classification, required live
+  finishing, follow-up reserve and audit, with one cumulative budget. The audit
+  reports its expected cost before starting and is skipped with a clear
+  processing-complete message when the remaining budget is insufficient.
+- The known local £2,500,000 ceiling is backed up and migrated to £35; new
+  installations also default to a £35 cumulative ceiling.
+- Added offline regression coverage for long-PDF call counts, short bundle
+  archival, descriptive Other naming, follow-up batching/restart idempotence,
+  absence of live retry chains and cumulative budgets.
+
 ## v1.3.0 — 2026-08-20 — autonomous bundles, orientation and upload policy
 
 - Employment Contract is now one of the 16 overwrite document types, keeping

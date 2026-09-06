@@ -1,0 +1,4 @@
+# Keep binary artifact bytes exact, including text-only synthetic PDF fixtures.
+*.pdf binary
+*.onnx binary
+*.ico binary

@@ -41,7 +41,7 @@
 #endif
 
 #define MyAppName "Stage2 Processing"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.4.0"
 #define MyAppPublisher "Lifted / Ali Jabbar"
 #define MyAppExeName "Stage2 Processing.exe"
 
@@ -79,15 +79,19 @@ Source: "{#CredHelper}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#AppIco}"; DestDir: "{app}"; DestName: "stage2.ico"; Flags: ignoreversion
 Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
 ; ---- USER GUIDES (all three stages; <1 MB) -------------------------------
-Source: "{#AddOns}\Guides\*.pdf"; DestDir: "{localappdata}\Lifted\Guides"; Flags: ignoreversion
+Source: "{#AddOns}\Guides\*.pdf"; DestDir: "{localappdata}\Lifted\Guides"; Flags: ignoreversion skipifsourcedoesntexist
 ; also the legacy folder an OLDER app build reads (exactly
 ; Path.home()/"Documents"/"Lifted"/"Guides"), so guides work even if
 ; another stage on this PC has not been updated yet.
-Source: "{#AddOns}\Guides\*.pdf"; DestDir: "{%USERPROFILE}\Documents\Lifted\Guides"; Flags: ignoreversion
+Source: "{#AddOns}\Guides\*.pdf"; DestDir: "{%USERPROFILE}\Documents\Lifted\Guides"; Flags: ignoreversion skipifsourcedoesntexist
+; Stage 2's current guide is mandatory and wins over any older add-on copy.
+Source: "..\..\docs\USER_GUIDE.pdf"; DestDir: "{app}\Guides"; DestName: "Stage 2 Guide - AI Processing.pdf"; Flags: ignoreversion
+Source: "..\..\docs\USER_GUIDE.pdf"; DestDir: "{localappdata}\Lifted\Guides"; DestName: "Stage 2 Guide - AI Processing.pdf"; Flags: ignoreversion
+Source: "..\..\docs\USER_GUIDE.pdf"; DestDir: "{%USERPROFILE}\Documents\Lifted\Guides"; DestName: "Stage 2 Guide - AI Processing.pdf"; Flags: ignoreversion
 ; ---- STAGE 2 HELPER TOOLS (the Tools panel) ------------------------------
 ; Per-user, so no elevation is needed for them and they survive an app
 ; upgrade. Stage 2 is the only consumer, so they ship only here.
-Source: "{#AddOns}\Tools\*.exe"; DestDir: "{localappdata}\Lifted\Tools"; Flags: ignoreversion
+Source: "{#AddOns}\Tools\*.exe"; DestDir: "{localappdata}\Lifted\Tools"; Flags: ignoreversion skipifsourcedoesntexist
 ; The API key, embedded as a compiled-in resource only (never copied to {app}).
 ; ExtractTemporaryFile() drops it in {tmp} just long enough for the credential
 ; helper to read + delete it.

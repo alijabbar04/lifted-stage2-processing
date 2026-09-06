@@ -21,8 +21,9 @@
 # ============================================================================
 $ErrorActionPreference = "Stop"
 $Repo      = "alijabbar04/lifted-stage2-processing"
-$Tag       = "v1.3.0"
+$Tag       = "v1.4.0"
 $AppAsset  = "Stage2_Processing.exe"
+$ChecksumAsset = "SHA256SUMS.txt"
 $GuideAsset = "Stage2_Guide_AI_Processing.pdf"
 
 # The app finds a guide by matching a filename that STARTS WITH "stage 2"
@@ -97,10 +98,10 @@ if ((Invoke-Native $gh @("auth","status") -Quiet) -ne 0) {
     Write-Host "`n[2/5] Already signed in to GitHub." -ForegroundColor Cyan
 }
 
-# --- 3. Download the app (~57 MB) ------------------------------------------
-$dl = Join-Path $env:TEMP "Stage2Install"
+# --- 3. Download and verify the app (~75 MB) -------------------------------
+$dl = Join-Path $env:TEMP ("Stage2Install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force $dl | Out-Null
-Write-Host "`n[3/5] Downloading the app (~57 MB, one time)..." -ForegroundColor Cyan
+Write-Host "`n[3/5] Downloading the app (~75 MB, one time)..." -ForegroundColor Cyan
 if ((Invoke-Native $gh @("release","download",$Tag,"--repo",$Repo,
                          "--pattern",$AppAsset,"--dir",$dl,"--clobber")) -ne 0) {
     Write-Host "Download failed. Most likely your GitHub account has not been" -ForegroundColor Red
@@ -108,6 +109,35 @@ if ((Invoke-Native $gh @("release","download",$Tag,"--repo",$Repo,
     Write-Host "invitation, then run install.ps1 again."
     exit 1
 }
+
+if ((Invoke-Native $gh @("release","download",$Tag,"--repo",$Repo,
+                         "--pattern",$ChecksumAsset,"--dir",$dl,
+                         "--clobber")) -ne 0) {
+    Write-Host "Checksum download failed; the app has NOT been installed." -ForegroundColor Red
+    Write-Host "Ask the maintainer to attach $ChecksumAsset to release $Tag."
+    exit 1
+}
+
+$DownloadedApp = Join-Path $dl $AppAsset
+$ChecksumPath = Join-Path $dl $ChecksumAsset
+$ChecksumPattern = '^([0-9A-Fa-f]{64}) \*' + [regex]::Escape($AppAsset) + '$'
+$ChecksumLines = @(Get-Content -LiteralPath $ChecksumPath |
+    Where-Object { $_ -match $ChecksumPattern })
+if ($ChecksumLines.Count -ne 1) {
+    Write-Host "Checksum manifest is invalid; the app has NOT been installed." -ForegroundColor Red
+    exit 1
+}
+$ExpectedHash = ([regex]::Match($ChecksumLines[0], $ChecksumPattern)).Groups[1].Value
+$ActualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $DownloadedApp).Hash
+if ($ActualHash -ine $ExpectedHash) {
+    Write-Host "SECURITY ERROR: downloaded app checksum does not match release $Tag." -ForegroundColor Red
+    Write-Host "Expected: $ExpectedHash"
+    Write-Host "Actual:   $ActualHash"
+    Remove-Item -LiteralPath $DownloadedApp -Force -ErrorAction SilentlyContinue
+    Write-Host "The unverified executable was removed and nothing was installed." -ForegroundColor Red
+    exit 1
+}
+Write-Host "  SHA-256 verified: $ActualHash" -ForegroundColor Green
 
 # The user guide is a separate, small asset. Not fatal if it is missing.
 $guideOk = (Invoke-Native $gh @("release","download",$Tag,"--repo",$Repo,
@@ -120,10 +150,12 @@ New-Item -ItemType Directory -Force $AppDir   | Out-Null
 New-Item -ItemType Directory -Force $GuideDir | Out-Null
 
 $appExe = Join-Path $AppDir "Stage 2 - Processing.exe"
-Copy-Item (Join-Path $dl $AppAsset) $appExe -Force
+Copy-Item -LiteralPath $DownloadedApp -Destination $appExe -Force
 
 if ($guideOk) {
     Copy-Item (Join-Path $dl $GuideAsset) (Join-Path $GuideDir $GuideName) -Force
+    New-Item -ItemType Directory -Force (Join-Path $AppDir "Guides") | Out-Null
+    Copy-Item (Join-Path $dl $GuideAsset) (Join-Path $AppDir "Guides\$GuideName") -Force
 }
 
 # Desktop + Start Menu shortcuts
@@ -167,7 +199,14 @@ foreach ($check in @(
     }
 }
 
-Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
+$ResolvedDownload = [IO.Path]::GetFullPath($dl)
+$ResolvedTemp = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+if ($ResolvedDownload.StartsWith($ResolvedTemp, [StringComparison]::OrdinalIgnoreCase) -and
+    [IO.Path]::GetFileName($ResolvedDownload) -match '^Stage2Install-[0-9a-f]{32}$') {
+    Remove-Item -LiteralPath $ResolvedDownload -Recurse -Force -ErrorAction SilentlyContinue
+} else {
+    throw "Unexpected download directory; cleanup was skipped."
+}
 
 if ($ok) {
     Write-Host "`nInstall complete." -ForegroundColor Green

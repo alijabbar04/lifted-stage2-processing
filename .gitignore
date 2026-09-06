@@ -43,8 +43,16 @@ input/
 output/
 documents/
 Misnamed Files/
+review-workspaces/
+review_records.jsonl
+Master_Filename_Review_Ledger.xlsx
+REVIEW_DECISIONS.json
+REVIEW_CHANGES.jsonl
+runner-status.json
+provider-events.jsonl
 *.pdf
 !docs/USER_GUIDE.pdf
+!tests/fixtures/orientation/*.pdf
 
 # Editor / OS
 *.bak

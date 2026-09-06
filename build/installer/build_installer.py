@@ -202,12 +202,8 @@ def phase_a_build_exes(pyw: Path, ico: Path, skip: bool):
         info("Phase A skipped (--skip-exe): reusing existing dist\\ build.")
         return app_exe, cred_exe
 
-    # ensure PyInstaller
-    try:
-        import PyInstaller  # noqa: F401
-    except Exception:
-        info("PyInstaller not present — installing…")
-        run([sys.executable, "-m", "pip", "install", "pyinstaller"])
+    # Match the public build's pinned freezer and bundled workflow assets.
+    run([sys.executable, "-m", "pip", "install", "pyinstaller==6.22.1"])
 
     common = [sys.executable, "-m", "PyInstaller", "--noconfirm",
               "--distpath", str(dist), "--workpath", str(HERE / "build"),
@@ -215,6 +211,12 @@ def phase_a_build_exes(pyw: Path, ico: Path, skip: bool):
 
     info("Phase A: building the payload exe (Stage2 Processing.exe)…")
     run(common + ["--onefile", "--windowed", "--icon", str(ico),
+                  "--runtime-tmpdir", r"%LOCALAPPDATA%\Lifted\Stage2Runtime",
+                  "--hidden-import", "onnxruntime",
+                  "--add-data", str(REPO / "assets" / "orientation") + ";assets/orientation",
+                  "--add-data", str(REPO / "docs" / "ai-review") + ";docs/ai-review",
+                  "--add-data", str(REPO / "docs" / "USER_GUIDE.pdf") + ";docs",
+                  "--add-data", str(ico) + ";.",
                   "--name", "Stage2 Processing", str(pyw)])
     if not app_exe.exists():
         die(f"PyInstaller did not produce {app_exe}")

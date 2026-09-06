@@ -1,4 +1,4 @@
-"""Long bundles require boundary evidence plus independent classifications."""
+"""Offline diagnostic helper tests; production never invokes this long scan."""
 
 import tempfile
 import unittest
@@ -43,6 +43,10 @@ def core(name, confidence=95):
 
 @unittest.skipUnless(app.HAS_FITZ, "PyMuPDF is not installed")
 class TestLongBundleConfirmation(unittest.TestCase):
+    def test_bundle_starts_is_a_free_signal(self):
+        self.assertTrue(app._bundle_prone({"bundle_starts": [3]}))
+        self.assertFalse(app._bundle_prone({"bundle_starts": []}))
+
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

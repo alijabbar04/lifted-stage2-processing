@@ -115,11 +115,13 @@ import shutil
 import subprocess
 import hashlib
 import logging
+import math
 import platform
 import datetime
 import threading
 import traceback
 import collections
+import functools
 import tempfile
 import urllib.request
 import urllib.error
@@ -127,6 +129,30 @@ import urllib.parse
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
+
+# Keep the source directory importable when this .pyw is loaded directly by
+# the offline harnesses (importlib does not add it to sys.path for us).
+_SOURCE_DIR = Path(__file__).resolve().parent
+if str(_SOURCE_DIR) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_DIR))
+import pipeline_shared as pipeline
+from stage2_compact_ui import CompactDashboard
+from stage2_notifications import NotificationService, normalize_settings
+from local_orientation import (
+    MODEL_NAME as ORIENTATION_MODEL_NAME,
+    MODEL_REVISION as ORIENTATION_MODEL_REVISION,
+    MODEL_SHA256 as ORIENTATION_MODEL_SHA256,
+    OnnxOrientationPredictor,
+    atomic_write_json,
+    orientation_decision,
+    thumbnail_evidence,
+)
+
+
+def bundled_resource(*parts) -> Path:
+    """Resolve a source-tree or PyInstaller-bundled read-only asset."""
+    root = Path(getattr(sys, "_MEIPASS", _SOURCE_DIR.parent))
+    return root.joinpath(*parts)
 
 # ---------- optional libs ----------
 try:
@@ -161,13 +187,13 @@ except Exception:
 # ====================================================================
 # THEME
 # ====================================================================
-BG        = "#0d0f12"
-PANEL     = "#161a20"
-PANEL2    = "#1d232b"
-BORDER    = "#2a323d"
-FG        = "#e8eaed"
-FG_DIM    = "#9aa4b0"
-ACCENT    = "#4da3ff"
+BG        = "#060708"
+PANEL     = "#0e1012"
+PANEL2    = "#16191c"
+BORDER    = "#282c30"
+FG        = "#eff1f3"
+FG_DIM    = "#a2a8af"
+ACCENT    = "#e4e9ee"
 GREEN     = "#1f9d55"
 GREEN_HI  = "#27c468"
 RED       = "#c0392b"
@@ -269,12 +295,13 @@ BATCH_SIZE = 30
 # ====================================================================
 # THIS IS THE SINGLE SOURCE OF TRUTH FOR PER-TOKEN PRICES.
 # Prices are in US dollars per MILLION tokens ("in" = input, "out" = output),
-# taken from Anthropic's public pricing. LAST VERIFIED: 2026-07-06.
+# taken from Anthropic's public pricing. LAST VERIFIED: 2026-09-02.
+# https://platform.claude.com/docs/en/about-claude/pricing
 # If Anthropic changes prices, edit ONLY the numbers here - every cost estimate
 # and the live cost meter read from this block via MODELS_BY_ID.
 #
 # Opus is intentionally separated out. For a high-volume *classification*
-# workflow it is far more expensive (15x the input price of Haiku) and rarely
+# workflow it is far more expensive (5x the input price of Haiku) and rarely
 # more accurate at this task, so it is hidden unless the user explicitly turns
 # on the "advanced models" setting AND confirms an extra warning.
 SAFE_MODELS = {
@@ -282,7 +309,7 @@ SAFE_MODELS = {
     "Sonnet (balanced)":  {"id": "claude-sonnet-4-6", "in": 3.00, "out": 15.00},
 }
 ADVANCED_MODELS = {
-    "Opus   (most able, EXPENSIVE)": {"id": "claude-opus-4-8", "in": 15.00, "out": 75.00},
+    "Opus   (most able, EXPENSIVE)": {"id": "claude-opus-4-8", "in": 5.00, "out": 25.00},
 }
 # MODELS is the full registry (used for pricing lookups). The Settings dialog
 # decides which subset to actually *offer* based on the advanced-models flag.
@@ -295,7 +322,7 @@ FX_RATE = [0.79]   # mutable holder for USD->GBP, updated from config/settings
 # The Message Batches API bills at HALF the standard per-token price (input AND
 # output) in exchange for asynchronous (up to 24h) processing. Applied in ONE
 # place (batch cost estimates + reconciliation) so the discount is never
-# hard-coded elsewhere.  Ref: Anthropic Message Batches pricing, 2026-07-06.
+# hard-coded elsewhere.  Ref: Anthropic Message Batches pricing, 2026-09-02.
 BATCH_DISCOUNT = 0.5
 
 # Anthropic vision token cost for an image is approximately
@@ -314,6 +341,14 @@ EST_IMAGES_PER_DOC_FULL = 1.8
 # Fraction of documents that trigger a (live-priced) second-pass review call
 # (dating / ranking / signed checks). Rough - most folders have few duplicates.
 EST_SECOND_PASS_FRACTION = 0.15
+# Batch v1.3.1 reserves a discounted follow-up for only the genuinely
+# unresolved first-pass results.  The reserve is deliberately shown separately
+# from the primary batch estimate; actual submission contains exactly the
+# unresolved documents and is budget-gated again before it is sent.
+EST_BATCH_FOLLOWUP_FRACTION = 0.10
+# The optional audit re-classifies every final document live and adjudicates
+# only prospective mismatches.  This is an estimate, not a billing assumption.
+EST_AUDIT_ADJUDICATION_FRACTION = 0.15
 
 # --------------------------------------------------------------------
 # SAFETY / COST-CONTROL DEFAULTS
@@ -322,7 +357,7 @@ EST_SECOND_PASS_FRACTION = 0.15
 # --------------------------------------------------------------------
 DEFAULT_MAX_WORKERS   = 100      # stop after this many worker folders in one run
 DEFAULT_MAX_FILES     = 2000     # stop after this many files sent in one run
-DEFAULT_MAX_BUDGET_GBP = 25.0    # stop when estimated spend reaches this (GBP)
+DEFAULT_MAX_BUDGET_GBP = 35.0    # cumulative ceiling across every enabled phase
 DEFAULT_MAX_FILE_MB   = 25.0     # skip any single file larger than this
 CONFIRM_COST_THRESHOLD_GBP = 1.0 # pre-flight estimate above this needs confirmation
 
@@ -1303,7 +1338,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
+APP_BUILD = "2026.09.06-obsidian1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -1500,12 +1536,12 @@ def load_config() -> dict:
            # low-confidence documents get ONE follow-up call to a stronger
            # model (see SECOND_OPINION_MODEL_ID); set false to disable
            "second_opinion": True,
-           # physically rewrite sideways scans upright once identified
-           "auto_rotate": True,
-           # optional local Ollama vision pass for image-only pages; disabled
-           # until the operator activates/setup it in Settings
-           "local_ai_orientation": False,
-           "local_ai_model": "gemma3:4b",
+           # Free, bundled, CPU-only page orientation. v1.3.1 deliberately
+           # starts in audit/shadow mode until a representative local benchmark
+           # has demonstrated that automatic thresholds are safe.
+           "orientation_mode": "audit",  # off | audit | automatic
+           "orientation_confidence": 0.95,
+           "orientation_margin": 0.20,
            # detect files that wrongly contain SEVERAL documents (sometimes
            # other workers') and split them before classification
            "bundle_split": True,
@@ -1548,16 +1584,38 @@ def load_config() -> dict:
     cfg["move_mode"] = bool(cfg.get("move_mode", False))
     cfg["convert_pdf"] = bool(cfg.get("convert_pdf", True))
     cfg["second_opinion"] = bool(cfg.get("second_opinion", True))
-    cfg["auto_rotate"] = bool(cfg.get("auto_rotate", True))
-    cfg["local_ai_orientation"] = bool(
-        cfg.get("local_ai_orientation", False))
-    cfg["local_ai_model"] = str(
-        cfg.get("local_ai_model", "gemma3:4b") or "gemma3:4b").strip()
+    if cfg.get("orientation_mode") not in ("off", "audit", "automatic"):
+        cfg["orientation_mode"] = "audit"
+    try:
+        cfg["orientation_confidence"] = max(
+            0.5, min(0.999, float(cfg.get("orientation_confidence", 0.95))))
+    except Exception:
+        cfg["orientation_confidence"] = 0.95
+    try:
+        cfg["orientation_margin"] = max(
+            0.0, min(0.999, float(cfg.get("orientation_margin", 0.20))))
+    except Exception:
+        cfg["orientation_margin"] = 0.20
     cfg["bundle_split"] = bool(cfg.get("bundle_split", True))
     cfg["cleanup_leftovers"] = bool(cfg.get("cleanup_leftovers", True))
     cfg["post_run_audit"] = bool(cfg.get("post_run_audit", False))
     if cfg.get("run_mode") not in ("live", "batch"):
         cfg["run_mode"] = "live"
+    # v1.3.0 installations could carry a local £2,500,000 ceiling.  That value
+    # defeats the spend guard.  Migrate only that known accidental value,
+    # backing up the non-secret config before writing the safer £35 ceiling.
+    try:
+        if float(cfg.get("max_budget_gbp", 0) or 0) == 2_500_000.0:
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = CONFIG_PATH.with_name(
+                f"config.pre-v1.3.1-budget-backup-{stamp}.json")
+            if CONFIG_PATH.exists():
+                shutil.copy2(CONFIG_PATH, backup)
+            cfg["max_budget_gbp"] = 35.0
+            save_config(cfg)
+            cfg["_budget_safety_reset"] = str(backup)
+    except Exception:
+        traceback.print_exc()
     # numeric limits, clamped to sane minimums
     for k, dflt, lo in (("max_workers", DEFAULT_MAX_WORKERS, 1),
                          ("max_files", DEFAULT_MAX_FILES, 1),
@@ -1573,6 +1631,8 @@ def load_config() -> dict:
     # If a model not allowed by the current advanced flag is selected, drop back.
     if (not cfg["advanced_models"]) and cfg["model"] not in SAFE_MODELS:
         cfg["model"] = DEFAULT_MODEL
+    cfg["notifications"] = normalize_settings(cfg.get("notifications"))
+    cfg["show_document_preview"] = bool(cfg.get("show_document_preview", False))
     return cfg
 
 
@@ -1581,6 +1641,7 @@ def save_config(cfg: dict) -> bool:
         ensure_app_dir()
         # Defensive: never let an api_key field leak into the plaintext file.
         clean = {k: v for k, v in cfg.items() if k != "api_key"}
+        clean["notifications"] = normalize_settings(clean.get("notifications"))
         CONFIG_PATH.write_text(json.dumps(clean, indent=2), encoding="utf-8")
         return True
     except Exception:
@@ -1856,28 +1917,20 @@ class FailedLog:
 # ====================================================================
 class OverrideLog:
     def __init__(self):
-        self.path = OVERRIDE_XLSX
+        self.path = OVERRIDE_XLSX.with_suffix(".csv")
 
     def record(self, worker, original, ai_name, final_name):
-        if not HAS_XLSX:
-            return
         try:
             ensure_app_dir()
-            if self.path.exists():
-                wb = load_workbook(self.path)
-                ws = wb.active
-            else:
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "Overrides"
-                ws.append(["timestamp", "worker", "original_filename",
-                           "AI_suggested_name", "you_changed_to"])
-                from openpyxl.styles import Font
-                for cell in ws[1]:
-                    cell.font = Font(name="Arial", bold=True)
-            ws.append([datetime.datetime.now().isoformat(timespec="seconds"),
-                       worker, original, ai_name, final_name])
-            wb.save(self.path)
+            fields = ["timestamp", "worker", "original_filename", "AI_suggested_name", "you_changed_to"]
+            with pipeline.roster_lock(self.path):
+                exists = self.path.exists() and self.path.stat().st_size > 0
+                with self.path.open("a", newline="", encoding="utf-8-sig") as stream:
+                    writer = csv.writer(stream)
+                    if not exists:
+                        writer.writerow(fields)
+                    writer.writerow([datetime.datetime.now().isoformat(timespec="seconds"),
+                                     worker, original, ai_name, final_name])
         except Exception:
             traceback.print_exc()
 
@@ -2956,6 +3009,9 @@ class ClaudeAPI:
         self.model_id = model_id
         self.in_tokens = 0
         self.out_tokens = 0
+        # Windows uses the operating system's TLS/HTTP stack for paid batch
+        # creation. Select before sending; never fall back after a lost response.
+        self.batch_transport = "winhttp" if os.name == "nt" else "urllib"
 
     # ---- low level ----
     def _check_url(self):
@@ -3709,11 +3765,45 @@ class ClaudeAPI:
 
     def _http(self, method: str, url: str, body: dict = None):
         """Generic Anthropic JSON request with the same bounded transient-retry
-        policy as _post. Returns the parsed JSON dict. Raises APIError /
-        CreditExhausted like _post so callers handle failures uniformly."""
+        policy as _post for safe polling/cancel calls. Batch-creation POSTs are
+        never automatically retried: a lost response is ambiguous, and sending
+        the same body again could create and bill a duplicate batch. Returns the
+        parsed JSON dict. Raises APIError / CreditExhausted like _post."""
         self._check_host(url)
         data = json.dumps(body).encode("utf-8") if body is not None else None
+        batch_creation = (method.upper() == "POST"
+                          and url.rstrip("/") == self.BATCH_URL)
+        if batch_creation:
+            transport = getattr(self, "batch_transport",
+                                "winhttp" if os.name == "nt" else "urllib")
+            if transport == "winhttp":
+                from batch_transport import BatchTransportError, winhttp_post_batch
+                try:
+                    status, raw = winhttp_post_batch(url, {
+                        "content-type": "application/json",
+                        "x-api-key": self.api_key,
+                        "anthropic-version": "2023-06-01"}, data)
+                except BatchTransportError as exc:
+                    raise APIError(0, str(exc)) from None
+                if not 200 <= status < 300:
+                    safe_body = raw.replace(self.api_key, "[redacted]") if self.api_key else raw
+                    label, detail = _sanitize_api_error(status, safe_body[:1000])
+                    if is_credit_error(status, detail):
+                        raise CreditExhausted(detail)
+                    raise APIError(status, label, detail)
+                try:
+                    parsed = json.loads(raw)
+                    if not isinstance(parsed, dict):
+                        raise ValueError("not an object")
+                    return parsed
+                except (ValueError, TypeError):
+                    raise APIError(0, "Windows batch response was not valid JSON; "
+                                   "reconcile the submission before retrying") from None
+            if transport != "urllib":
+                raise APIError(0, "Unknown batch transport; no request sent")
         attempt = 0
+        retry_safe = method.upper() != "POST" or url.rstrip("/").endswith(
+            "/cancel")
         while True:
             req = urllib.request.Request(url, data=data, method=method)
             self._headers(req)
@@ -3731,14 +3821,15 @@ class ClaudeAPI:
                 print(f"[batch API {status}] {method} {url.rsplit('/',2)[-1]}: {detail}")
                 if is_credit_error(status, detail):
                     raise CreditExhausted(detail)
-                if status in (429, 500, 502, 503, 529) and attempt < self.MAX_RETRIES:
+                if (retry_safe and status in (429, 500, 502, 503, 529)
+                        and attempt < self.MAX_RETRIES):
                     import time as _t
                     _t.sleep(self.RETRY_BASE_DELAY * (2 ** attempt))
                     attempt += 1
                     continue
                 raise APIError(status, label, detail)
             except urllib.error.URLError as e:
-                if attempt < self.MAX_RETRIES:
+                if retry_safe and attempt < self.MAX_RETRIES:
                     import time as _t
                     _t.sleep(self.RETRY_BASE_DELAY * (2 ** attempt))
                     attempt += 1
@@ -3769,6 +3860,14 @@ class ClaudeAPI:
     def get_batch(self, batch_id: str) -> dict:
         """GET a batch's current status object."""
         return self._http("GET", f"{self.BATCH_URL}/{urllib.parse.quote(batch_id)}")
+
+    def list_batches(self, after_id: str = "", limit: int = 100) -> dict:
+        """Read one newest-first provider page; never create/retry a batch."""
+        query = {"limit": max(1, min(100, int(limit)))}
+        if after_id:
+            query["after_id"] = after_id
+        return self._http("GET", self.BATCH_URL + "?"
+                          + urllib.parse.urlencode(query))
 
     def cancel_batch(self, batch_id: str) -> dict:
         """Request cancellation of a batch still being processed. Anything
@@ -3808,20 +3907,21 @@ def safe_stem(name: str) -> str:
 def other_name(label: str) -> str:
     """Build a clean 'Other - <descriptor>' name from the AI's short description.
     Keeps a concise descriptive phrase (a few words) and strips junk; falls back
-    to plain 'Other' when there's no usable label.
+    to 'Other - Unknown' when there's no usable label.  An unmatched document
+    must never lose the visible Other prefix.
     e.g. 'Other - reference request email', 'Other - bank address screenshot'."""
     if not label:
-        return "Other"
+        return "Other - Unknown"
     lab = re.sub(ILLEGAL, " ", str(label)).strip()
     lab = re.sub(r"\s+", " ", lab)
     # drop a leading 'other -' if the model echoed it, and any stray dashes
     lab = re.sub(r"^\s*other\s*[-:]\s*", "", lab, flags=re.I).strip(" -")
     if not lab:
-        return "Other"
+        return "Other - Unknown"
     # keep it a concise descriptive phrase: at most the first 6 words / 60 chars
     words = lab.split()
     lab = " ".join(words[:6])[:60].strip()
-    return f"Other - {lab}" if lab else "Other"
+    return f"Other - {lab}" if lab else "Other - Unknown"
 
 
 def unique_path(folder: Path, stem: str, ext: str) -> Path:
@@ -3882,9 +3982,52 @@ def parse_date(s: str):
     return None
 
 
+_ORIENTATION_TEMP_RE = re.compile(
+    r"^\.(?P<stem>.+)\.orientation-[a-z0-9_]{8}\.(?P<suffix>pdf|tmp)$",
+    re.IGNORECASE)
+
+
+def is_orientation_temp_file(path: Path) -> bool:
+    """True only for the exact same-directory orientation temp name."""
+    return bool(_ORIENTATION_TEMP_RE.fullmatch(Path(path).name))
+
+
+def _orientation_temp_source(path: Path):
+    """Return the expected source PDF sibling, or None when it is absent."""
+    path = Path(path)
+    match = _ORIENTATION_TEMP_RE.fullmatch(path.name)
+    if not match:
+        return None
+    source_suffix = (match.group("suffix")
+                     if match.group("suffix").casefold() == "pdf" else "pdf")
+    source = path.with_name(f"{match.group('stem')}.{source_suffix}")
+    return source if source.is_file() else None
+
+
+def cleanup_orientation_temp_files(worker_dir: Path,
+                                   log=lambda _message: None) -> int:
+    """Remove only proven residue from an interrupted atomic PDF rewrite.
+
+    A filename match alone is not enough: the original source PDF must still
+    be beside it. This keeps unrelated hidden PDFs untouched.
+    """
+    removed = 0
+    for path in list(Path(worker_dir).rglob("*")):
+        if not path.is_file() or _orientation_temp_source(path) is None:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+            log(f"    x interrupted orientation temp removed: {path.name}")
+        except Exception as exc:
+            log(f"    ! could not remove orientation temp {path.name}: {exc}")
+    return removed
+
+
 def list_worker_docs(worker_dir: Path):
     """All loose document files directly representing this worker's docs,
     found recursively (so it copes whether or not sub-folders still exist)."""
+    cleanup_orientation_temp_files(worker_dir)
     files = []
     for p in worker_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() in DOC_EXT and not is_program_file(p):
@@ -3919,7 +4062,8 @@ def is_program_file(p: Path) -> bool:
         behind by a previous version, whatever their extension).
     Real compliance documents never start with '_'."""
     n = p.name.lower()
-    return n.startswith("_") or "overwrite_order" in n
+    return (n.startswith("_") or "overwrite_order" in n
+            or is_orientation_temp_file(p))
 
 
 def _real_files_in(d: Path):
@@ -3937,6 +4081,18 @@ def _real_files_in(d: Path):
         # don't delete it blindly
         real.append(d / "<unreadable>")
     return real
+
+
+def batch_worker_ready_to_move(worker_dir: Path, records) -> bool:
+    """True when batch apply may safely relocate a worker folder.
+
+    Batch mode normally proves completion by collecting at least one applied
+    record.  A genuinely empty worker has no record to collect, but live mode
+    still moves it after its no-op processing pass.  Treat that one case as
+    complete as well, while keeping any folder that still contains a real
+    (possibly skipped or failed) file in the source for attention.
+    """
+    return bool(records) or not _real_files_in(worker_dir)
 
 
 def extract_worker_zips(worker_dir: Path, log=lambda m: None) -> int:
@@ -4160,7 +4316,8 @@ def dedup_worker(worker_dir: Path, log=lambda m: None):
     The kept copy is renamed to the clean base label when possible
     (e.g. the surviving 'Passport (2).pdf' becomes 'Passport.pdf')."""
     files = [p for p in worker_dir.iterdir()
-             if p.is_file() and p.suffix.lower() in DOC_EXT]
+             if p.is_file() and p.suffix.lower() in DOC_EXT
+             and not is_program_file(p)]
     # group by (base label, extension)
     groups = {}
     for p in files:
@@ -4197,7 +4354,7 @@ def dedup_worker(worker_dir: Path, log=lambda m: None):
     return deleted
 
 
-def organize_worker(worker_dir: Path, log=lambda m: None):
+def organize_worker(worker_dir: Path, log=lambda m: None, on_move=None):
     """Organise a worker folder after ranking into TWO sub-folders, split by
     whether a document needs Stage 3's individual overwrite-upload flow:
       - 'Overwrite Documents' : every document whose (base) controlled type is
@@ -4234,6 +4391,8 @@ def organize_worker(worker_dir: Path, log=lambda m: None):
             dest = unique_path(odir, p.stem, p.suffix)
             try:
                 shutil.move(str(p), str(dest))
+                if on_move is not None:
+                    on_move(p, dest)
                 moved_overwrite += 1
             except Exception as e:
                 log(f"    ! could not move {p.name} to Overwrite Documents: {e}")
@@ -4251,6 +4410,8 @@ def organize_worker(worker_dir: Path, log=lambda m: None):
                 dest = unique_path(batch_dir, p.stem, p.suffix)
                 try:
                     shutil.move(str(p), str(dest))
+                    if on_move is not None:
+                        on_move(p, dest)
                     moved_bulk += 1
                 except Exception as e:
                     log(f"    ! could not move {p.name} to {batch_dir.name}: {e}")
@@ -4279,7 +4440,9 @@ def _write_hidden_json(path: Path, data: dict):
             ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x80)  # NORMAL
         except Exception:
             pass
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Same-directory temp + os.replace means a crash cannot leave a truncated
+    # batch/manifest/orientation state file behind.
+    atomic_write_json(path, data)
     if platform.system() == "Windows":
         try:
             import ctypes
@@ -4433,6 +4596,135 @@ def clear_live_checkpoint(care_dir: Path):
 
 
 BATCH_STATE_NAME = ".docreview_batch_state.json"
+ORIENTATION_STATE_NAME = ".docreview_orientation_state.json"
+
+
+class OrientationState:
+    """Durable local-only page decisions and authorised rewrite hashes."""
+
+    def __init__(self, care_home_dir: Path):
+        self.path = Path(care_home_dir) / ORIENTATION_STATE_NAME
+        self.data = {"version": 1, "entries": {}, "warnings": []}
+        try:
+            if self.path.exists():
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    self.data.update(loaded)
+                    self.data.setdefault("entries", {})
+                    self.data.setdefault("warnings", [])
+        except Exception:
+            traceback.print_exc()
+
+    @staticmethod
+    def key(path: Path) -> str:
+        try:
+            return str(Path(path).resolve()).casefold()
+        except Exception:
+            return str(path).casefold()
+
+    def entry(self, path: Path) -> dict:
+        return self.data.setdefault("entries", {}).get(self.key(path), {})
+
+    def put(self, path: Path, entry: dict):
+        value = dict(entry or {})
+        value["path"] = str(path)
+        value["updated_ts"] = datetime.datetime.now().isoformat(
+            timespec="seconds")
+        self.data.setdefault("entries", {})[self.key(path)] = value
+        self.save()
+
+    def warning(self, path: Path, reason: str):
+        item = {"path": str(path), "reason": str(reason),
+                "ts": datetime.datetime.now().isoformat(timespec="seconds")}
+        warnings = self.data.setdefault("warnings", [])
+        if not any(w.get("path") == item["path"]
+                   and w.get("reason") == item["reason"] for w in warnings):
+            warnings.append(item)
+            self.save()
+
+    def move_path(self, old_path: Path, new_path: Path):
+        old_key = self.key(old_path)
+        entry = self.data.setdefault("entries", {}).pop(old_key, None)
+        if entry is None:
+            return
+        entry["path"] = str(new_path)
+        entry["updated_ts"] = datetime.datetime.now().isoformat(
+            timespec="seconds")
+        self.data["entries"][self.key(new_path)] = entry
+        self.save()
+
+    def move_tree(self, old_root: Path, new_root: Path):
+        """Update every persisted file path after a completed folder move."""
+        old_root = Path(old_root).resolve()
+        new_root = Path(new_root).resolve()
+        changed = False
+        entries = self.data.setdefault("entries", {})
+        for old_key, entry in list(entries.items()):
+            try:
+                relative = Path(entry.get("path", "")).resolve().relative_to(
+                    old_root)
+            except (OSError, ValueError):
+                continue
+            new_path = new_root / relative
+            entries.pop(old_key, None)
+            entry["path"] = str(new_path)
+            entry["updated_ts"] = datetime.datetime.now().isoformat(
+                timespec="seconds")
+            entries[self.key(new_path)] = entry
+            changed = True
+        for warning in self.data.setdefault("warnings", []):
+            try:
+                relative = Path(warning.get("path", "")).resolve().relative_to(
+                    old_root)
+            except (OSError, ValueError):
+                continue
+            warning["path"] = str(new_root / relative)
+            changed = True
+        if changed:
+            self.save()
+
+    def authorised_hash(self, path: Path, original_hash: str,
+                        current_hash: str) -> bool:
+        """Narrow fallback for a rewrite explicitly persisted before replace."""
+        entry = self.entry(path)
+        return bool(entry
+                    and entry.get("original_hash") == original_hash
+                    and entry.get("current_hash") == current_hash
+                    and entry.get("status") in (
+                        "complete", "complete_recovered", "rewrite_failed"))
+
+    def audit_rows(self) -> list:
+        rows = []
+        for entry in self.data.get("entries", {}).values():
+            for page in entry.get("pages", []) or []:
+                if (page.get("uncertain") or page.get("correction")
+                        or page.get("warning")):
+                    rows.append({
+                        "File": entry.get("path", ""),
+                        "Page": int(page.get("page", 0) or 0) + 1,
+                        "Predicted orientation": page.get(
+                            "predicted_orientation", ""),
+                        "Correction indicated": page.get("correction", ""),
+                        "Top confidence": page.get("confidence", ""),
+                        "Runner-up confidence": page.get(
+                            "runner_up_confidence", ""),
+                        "Confidence margin": page.get("margin", ""),
+                        "Action": ("rotated locally" if page.get("applied")
+                                   else "unchanged"),
+                        "Reason": page.get("reason", ""),
+                    })
+        for warning in self.data.get("warnings", []) or []:
+            rows.append({"File": warning.get("path", ""), "Page": "",
+                         "Predicted orientation": "",
+                         "Correction indicated": "",
+                         "Top confidence": "", "Runner-up confidence": "",
+                         "Confidence margin": "", "Action": "unchanged",
+                         "Reason": "local orientation warning: "
+                                   + str(warning.get("reason", ""))})
+        return rows
+
+    def save(self):
+        _write_hidden_json(self.path, self.data)
 
 class BatchState:
     def __init__(self, care_home_dir: Path):
@@ -4451,23 +4743,45 @@ class BatchState:
             traceback.print_exc()
 
     def exists(self) -> bool:
-        return bool(self.data) and not self.data.get("applied", False) \
-            and bool(self.data.get("batches"))
+        if not self.data or self.data.get("applied", False):
+            return False
+        followup = self.data.get("followup") or {}
+        primary_submit = self.data.get("primary_submission") or {}
+        audit = self.data.get("audit") or {}
+        return bool(self.data.get("batches") or followup.get("batches")
+                    or followup.get("phase")
+                    or primary_submit.get("status") in (
+                        "submission_started", "ambiguous")
+                    or self.data.get("primary_submission_complete") is False
+                    or (self.data.get("processing_complete")
+                        and audit.get("status") not in (
+                            "complete", "skipped", "disabled")))
 
     def init(self, care_home: str, model_id: str, resolution: float,
              settings: dict):
+        settings = dict(settings or {})
         self.data = {
-            "version": 1,
+            "version": 4,
             "care_home": care_home,
             "model_id": model_id,
             "resolution": float(resolution),
-            "settings": dict(settings or {}),
+            "settings": settings,
             "submitted_ts": datetime.datetime.now().isoformat(timespec="seconds"),
             "batches": [],          # [{"id","n","status_at_submit"}]
             "requests": {},         # custom_id -> {path, worker, worker_dir, fhash, pages}
             "est_gbp": 0.0,
             "est_input_tokens": 0,
             "est_output_tokens": 0,
+            "phase": "primary_preparing",
+            "primary_submission": {},
+            # Added in v1.3.1.  Kept separate so a v1.3.0 state file (which has
+            # only batches/requests) remains directly readable.
+            "followup": {},
+            "costs": {},
+            "workers": {},
+            "processing_complete": False,
+            "audit": {"status": ("pending" if settings.get(
+                "post_run_audit") else "disabled")},
             "applied": False,
         }
 
@@ -4478,26 +4792,53 @@ class BatchState:
             "worker_dir": str(worker_dir), "fhash": fhash, "pages": int(pages),
         }
 
-    def add_batch(self, batch_id: str, n: int, status: str):
-        self.data.setdefault("batches", []).append(
-            {"id": batch_id, "n": int(n), "status_at_submit": status})
+    def add_batch(self, batch_id: str, n: int, status: str,
+                  phase: str = "primary", request_ids=None):
+        target = (self.data.setdefault("followup", {}).setdefault("batches", [])
+                  if phase == "followup"
+                  else self.data.setdefault("batches", []))
+        record = {"id": batch_id, "n": int(n),
+                  "status_at_submit": status}
+        if request_ids is not None:
+            record["request_ids"] = [str(item) for item in request_ids]
+        target.append(record)
 
-    def batch_ids(self):
-        return [b.get("id") for b in self.data.get("batches", []) if b.get("id")]
+    def batch_ids(self, phase: str = "primary"):
+        batches = ((self.data.get("followup") or {}).get("batches", [])
+                   if phase == "followup" else self.data.get("batches", []))
+        return [b.get("id") for b in batches if b.get("id")]
 
     def request_for(self, custom_id: str) -> dict:
         return self.data.get("requests", {}).get(custom_id)
 
+    def followup_request_for(self, custom_id: str) -> dict:
+        return ((self.data.get("followup") or {}).get("requests", {})
+                .get(custom_id))
+
     def save(self):
         try:
             _write_hidden_json(self.path, self.data)
+            return True
         except Exception:
             traceback.print_exc()
+            return False
 
     def mark_applied(self):
         self.data["applied"] = True
         self.data["applied_ts"] = datetime.datetime.now().isoformat(timespec="seconds")
         self.save()
+
+    def recovery_snapshot(self) -> Path:
+        """Keep the exact pre-recovery state in a new, never-overwritten file."""
+        if not self.path.is_file():
+            raise RuntimeError("No durable batch state is available to back up")
+        target = self.path.with_name(
+            self.path.name + f".recovery-{time.time_ns()}.bak")
+        with self.path.open("rb") as source, target.open("xb") as backup:
+            shutil.copyfileobj(source, backup)
+            backup.flush()
+            os.fsync(backup.fileno())
+        return target
 
     def delete(self):
         try:
@@ -4505,6 +4846,97 @@ class BatchState:
                 self.path.unlink()
         except Exception:
             traceback.print_exc()
+
+
+class BatchWriterBusy(RuntimeError):
+    """A different process owns the care-home's mutation lock."""
+
+
+class CareHomeWriterLock:
+    """OS-backed nonblocking lock, released even when a process crashes.
+
+    Keep the same lock file permanently: deleting/recreating it can let two
+    processes lock different file objects under one name on some platforms.
+    """
+    NAME = ".docreview_batch_writer.lock"
+
+    def __init__(self, care_home_dir):
+        self.path = Path(care_home_dir).resolve() / self.NAME
+        self.stream = None
+
+    def acquire(self):
+        if self.stream is not None:
+            raise RuntimeError("Writer lock is already acquired")
+        stream = None
+        try:
+            stream = self.path.open("a+b")
+            stream.seek(0, 2)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.stream = stream
+            return self
+        except OSError as exc:
+            if stream is not None:
+                stream.close()
+            raise BatchWriterBusy(
+                "Another Stage 2 operation is using this care-home folder, or "
+                "the folder's writer lock is unavailable. Wait for the current "
+                "operation to finish, then check batch status again.") from exc
+
+    def release(self):
+        stream, self.stream = self.stream, None
+        if stream is None:
+            return
+        try:
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *_args):
+        self.release()
+
+
+def _care_home_writer_operation(method):
+    """Serialize actual writes, while recovery assessment stays read-only."""
+    @functools.wraps(method)
+    def guarded(self, *args, **kwargs):
+        recovery = method.__name__ == "recover_primary_submission"
+        authorized = kwargs.get("allow_resubmit", args[0] if args else False)
+        if recovery and not authorized:
+            return method(self, *args, **kwargs)
+        lock = CareHomeWriterLock(self.dir)
+        try:
+            lock.acquire()
+        except BatchWriterBusy as exc:
+            message = str(exc)
+            self.log(message)
+            self.on_done(self.stats, "batch_busy:" + message)
+            if recovery:
+                return {"status": "blocked", "message": message,
+                        "remaining": 0, "busy": True}
+            return None
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            lock.release()
+    return guarded
 
 
 def has_pending_batch(care_home_dir: Path) -> dict:
@@ -4615,7 +5047,8 @@ def preflight_scan(care_home_dir: Path, max_file_mb: float,
                 try:
                     if not p.is_file() or p.is_symlink():
                         continue
-                    if p.suffix.lower() not in exts or _is_junk(p):
+                    if (p.suffix.lower() not in exts or _is_junk(p)
+                            or is_program_file(p)):
                         continue
                     # size check uses stat() metadata only - does NOT download
                     try:
@@ -4777,6 +5210,61 @@ def estimate_run_cost_gbp(n_files: int, model_id: str, zoom: float,
     }
 
 
+def estimate_pipeline_costs_gbp(n_files: int, primary_model_id: str,
+                                followup_model_id: str, zoom: float,
+                                vocab_block: str = "", *, batch: bool,
+                                include_audit: bool) -> dict:
+    """Return separate, cumulative estimates for every enabled run phase.
+
+    Batch classification and its small unresolved follow-up receive the Message
+    Batches discount.  Dating/ranking/quality finishing calls and the optional
+    accuracy audit remain live-priced.  Keeping these figures separate prevents
+    a cheap headline batch estimate from hiding the rest of the run.
+    """
+    n = max(0, int(n_files))
+    primary = estimate_run_cost_gbp(
+        n, primary_model_id, zoom, adaptive=not batch,
+        vocab_block=vocab_block, batch=batch, include_second_pass=False,
+        cached_prefix=not batch)
+    finishing = estimate_run_cost_gbp(
+        n, primary_model_id, zoom, adaptive=False,
+        vocab_block=vocab_block, batch=False, include_second_pass=True,
+        cached_prefix=True)["second_pass_gbp"]
+
+    followup_n = (max(1, int(math.ceil(n * EST_BATCH_FOLLOWUP_FRACTION)))
+                  if batch and n else 0)
+    followup = estimate_run_cost_gbp(
+        followup_n, followup_model_id or primary_model_id, zoom,
+        adaptive=False, vocab_block=vocab_block, batch=True,
+        include_second_pass=False, cached_prefix=False)["primary_gbp"] \
+        if followup_n else 0.0
+
+    audit = 0.0
+    if include_audit and n:
+        audit_primary = estimate_run_cost_gbp(
+            n, primary_model_id, zoom, adaptive=False,
+            vocab_block=vocab_block, batch=False,
+            include_second_pass=False, cached_prefix=True)["primary_gbp"]
+        adjudication_n = max(
+            1, int(math.ceil(n * EST_AUDIT_ADJUDICATION_FRACTION)))
+        audit_adjudication = estimate_run_cost_gbp(
+            adjudication_n, followup_model_id or primary_model_id, zoom,
+            adaptive=False, vocab_block="", batch=False,
+            include_second_pass=False, cached_prefix=True)["primary_gbp"]
+        audit = audit_primary + audit_adjudication
+
+    return {
+        "primary_gbp": primary["primary_gbp"],
+        "finishing_gbp": finishing,
+        "followup_reserve_gbp": followup,
+        "followup_reserve_files": followup_n,
+        "audit_gbp": audit,
+        "gbp": primary["primary_gbp"] + finishing + followup + audit,
+        "input_tokens": primary["input_tokens"],
+        "output_tokens": primary["output_tokens"],
+    }
+
+
 def tokens_cost_gbp(model_id: str, in_tokens: int, out_tokens: int,
                     batch: bool = False) -> float:
     """£ cost of a known number of input/output tokens for a model, optionally
@@ -4843,6 +5331,60 @@ SECOND_OPINION_MODEL_ID = "claude-sonnet-4-6"
 SECOND_OPINION_MAX_CONF = 40
 
 
+def _atomic_pdf_rotation_rewrite(path: Path, rotations: dict) -> int:
+    """Apply per-page clockwise rotations through a same-directory temporary.
+
+    The original is replaced only after PyMuPDF has closed a complete output
+    file and it has been flushed to disk.  Any render/save/replace failure
+    therefore leaves the original bytes intact.
+    """
+    rotations = {int(index): int(degrees)
+                 for index, degrees in (rotations or {}).items()
+                 if int(degrees or 0) in (90, 180, 270)}
+    if not rotations or path.suffix.lower() not in PDF_EXT or not HAS_FITZ:
+        return 0
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.stem}.orientation-", suffix=".tmp",
+        dir=str(path.parent))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        # fitz.save requires a path that does not already hold a PDF.
+        tmp.unlink()
+        doc = fitz.open(str(path))
+        try:
+            changed = 0
+            for index, degrees in rotations.items():
+                if 0 <= index < len(doc):
+                    page = doc[index]
+                    page.set_rotation((page.rotation + degrees) % 360)
+                    changed += 1
+            if not changed:
+                return 0
+            doc.save(str(tmp))
+        finally:
+            doc.close()
+        with open(tmp, "r+b") as handle:
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                # Some Windows filesystems reject fsync on an otherwise fully
+                # closed/readable temp. Atomic replacement still preserves the
+                # original on failure.
+                pass
+        os.replace(str(tmp), str(path))
+        return changed
+    except Exception:
+        traceback.print_exc()
+        return 0
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def fix_file_rotation(path: Path, deg_clockwise: int) -> bool:
     """Physically rotate a scanned document so it opens upright, saving the
     corrected file in place. `deg_clockwise` is the clockwise rotation needed
@@ -4856,17 +5398,9 @@ def fix_file_rotation(path: Path, deg_clockwise: int) -> bool:
     ext = path.suffix.lower()
     try:
         if ext in PDF_EXT and HAS_FITZ:
-            doc = fitz.open(path)
-            try:
-                for page in doc:
-                    # PDF /Rotate is clockwise-on-display
-                    page.set_rotation((page.rotation + deg_clockwise) % 360)
-                tmp = path.with_suffix(path.suffix + ".rot_tmp")
-                doc.save(tmp)
-            finally:
-                doc.close()
-            tmp.replace(path)
-            return True
+            total = DocRender.page_count(path)
+            return _atomic_pdf_rotation_rewrite(
+                path, {index: deg_clockwise for index in range(total)}) == total
         if ext in IMG_EXT and HAS_PIL:
             im = Image.open(path)
             fmt = im.format
@@ -4875,13 +5409,6 @@ def fix_file_rotation(path: Path, deg_clockwise: int) -> bool:
             return True
     except Exception:
         traceback.print_exc()
-        # never leave a half-written temp file behind
-        try:
-            tmp = path.with_suffix(path.suffix + ".rot_tmp")
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
     return False
 
 
@@ -4948,333 +5475,12 @@ def detect_pdf_text_rotation(path: Path, max_pages: int = 3) -> int:
     return per_page[min(per_page)] if len(vals) == 1 else 0
 
 
-class OllamaOrientationDetector:
-    """Optional, local-only orientation check for image-only PDF pages.
-
-    Each page is checked twice: as stored and with a known 90-degree probe
-    turn.  A decision is accepted only when both high-confidence answers have
-    the mathematically expected relationship.  This costs no API money and no
-    document data leaves the laptop; it talks only to Ollama on 127.0.0.1.
-    """
-    URL = "http://127.0.0.1:11434/api/chat"
-    MIN_CONFIDENCE = 0.82
-    BATCH_SIZE = 6
-    FORMAT = {
-        "type": "object",
-        "properties": {
-            "rotation": {"type": "integer", "enum": [0, 90, 180, 270]},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        },
-        "required": ["rotation", "confidence"],
-    }
-    PROMPT = (
-        "Judge only the physical reading orientation of this scanned document "
-        "page. Return the CLOCKWISE turn needed to make normal text, faces, "
-        "logos and document layout upright: 0, 90, 180 or 270. Do not infer "
-        "orientation from the topic. Use a low confidence if the page is blank, "
-        "ambiguous, mostly handwriting, or has no reliable upright cues."
-    )
-
-    def __init__(self, model: str):
-        self.model = (model or "gemma3:4b").strip()
-
-    def _predict_many(self, images_b64: list):
-        schema = {
-            "type": "object",
-            "properties": {
-                "pages": {
-                    "type": "array",
-                    "minItems": len(images_b64),
-                    "maxItems": len(images_b64),
-                    "items": self.FORMAT,
-                }
-            },
-            "required": ["pages"],
-        }
-        body = {
-            "model": self.model,
-            "messages": [{
-                "role": "user",
-                "content": (self.PROMPT + f" There are {len(images_b64)} "
-                            "page images in order. Return exactly one result "
-                            "for each image in the pages array, same order."),
-                "images": images_b64,
-            }],
-            "stream": False,
-            "format": schema,
-            "options": {"temperature": 0},
-            "keep_alive": "5m",
-        }
-        data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(self.URL, data=data, method="POST")
-        req.add_header("content-type", "application/json")
-        with urllib.request.urlopen(req, timeout=180) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        content = ((payload.get("message") or {}).get("content") or "").strip()
-        parsed = json.loads(content)
-        rows = parsed.get("pages") or []
-        if len(rows) != len(images_b64):
-            raise ValueError("local model returned the wrong number of pages")
-        out = []
-        for row in rows:
-            rotation = int(float(row.get("rotation", -1)))
-            confidence = float(row.get("confidence", 0) or 0)
-            if confidence > 1:
-                confidence /= 100.0
-            if rotation not in (0, 90, 180, 270):
-                raise ValueError("local model returned an invalid rotation")
-            out.append((rotation, max(0.0, min(1.0, confidence))))
-        return out
-
-    @staticmethod
-    def decisions_agree(stored_rotation: int, probe_rotation: int) -> bool:
-        """A 90° clockwise probe needs 90° less corrective rotation."""
-        return probe_rotation == ((stored_rotation - 90) % 360)
-
-    def detect_pdf_pages(self, path: Path, page_idxs, *, log=None) -> dict:
-        """Return {page: 0|90|180|270} only for double-confirmed pages."""
-        decisions = {}
-        unavailable_logged = False
-        rendered = []
-        for idx in page_idxs:
-            try:
-                original, _ = DocRender.render(
-                    path, zoom=1.15, pages=[idx], max_pages=1)
-                probe, _ = DocRender.render(
-                    path, zoom=1.15, pages=[idx], rotate={idx: 90},
-                    max_pages=1)
-                if len(original) != 1 or len(probe) != 1:
-                    continue
-                rendered.append((int(idx), original[0], probe[0]))
-            except Exception as exc:
-                if log and not unavailable_logged:
-                    log("    · local AI orientation unavailable for this run "
-                        f"({str(exc)[:100]}); using the standard checks")
-                    unavailable_logged = True
-                # A local service/model problem must never stop processing.
-                break
-        for offset in range(0, len(rendered), self.BATCH_SIZE):
-            batch = rendered[offset:offset + self.BATCH_SIZE]
-            try:
-                base = self._predict_many([row[1] for row in batch])
-                probe = self._predict_many([row[2] for row in batch])
-                for (idx, _original, _probe), base_row, probe_row in zip(
-                        batch, base, probe):
-                    base_deg, base_conf = base_row
-                    probe_deg, probe_conf = probe_row
-                    if (base_conf >= self.MIN_CONFIDENCE
-                            and probe_conf >= self.MIN_CONFIDENCE
-                            and self.decisions_agree(base_deg, probe_deg)):
-                        decisions[idx] = base_deg
-            except Exception as exc:
-                if log and not unavailable_logged:
-                    log("    · local AI orientation unavailable for this run "
-                        f"({str(exc)[:100]}); using the standard checks")
-                    unavailable_logged = True
-                break
-        return decisions
-
-
-def _system_ram_gb() -> float:
-    """Best-effort physical-memory figure for the local-AI suitability gate."""
-    try:
-        if os.name == "nt":
-            import ctypes
-
-            class MemoryStatus(ctypes.Structure):
-                _fields_ = [("length", ctypes.c_ulong),
-                            ("memory_load", ctypes.c_ulong),
-                            ("total_phys", ctypes.c_ulonglong),
-                            ("avail_phys", ctypes.c_ulonglong),
-                            ("total_page_file", ctypes.c_ulonglong),
-                            ("avail_page_file", ctypes.c_ulonglong),
-                            ("total_virtual", ctypes.c_ulonglong),
-                            ("avail_virtual", ctypes.c_ulonglong),
-                            ("avail_extended_virtual", ctypes.c_ulonglong)]
-
-            status = MemoryStatus()
-            status.length = ctypes.sizeof(status)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(
-                    ctypes.byref(status)):
-                return status.total_phys / (1024 ** 3)
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        return pages * page_size / (1024 ** 3)
-    except Exception:
-        return 0.0
-
-
-def _ollama_executable():
-    found = shutil.which("ollama")
-    if found:
-        return Path(found)
-    candidates = [
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" /
-        "ollama.exe",
-        Path(os.environ.get("ProgramFiles", "")) / "Ollama" / "ollama.exe",
-    ]
-    return next((p for p in candidates if p.is_file()), None)
-
-
-def _ollama_json(path: str, body=None, timeout=8):
-    url = "http://127.0.0.1:11434" + path
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data,
-                                 method="GET" if data is None else "POST")
-    if data is not None:
-        req.add_header("content-type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def _installed_ollama_vision_models() -> list:
-    """Installed Ollama model names whose declared capabilities include vision."""
-    try:
-        tags = _ollama_json("/api/tags").get("models") or []
-    except Exception:
-        return []
-    out = []
-    for row in tags:
-        name = str(row.get("name") or row.get("model") or "").strip()
-        if not name:
-            continue
-        try:
-            shown = _ollama_json("/api/show", {"model": name})
-            caps = {str(v).casefold() for v in shown.get("capabilities") or []}
-            if "vision" in caps:
-                out.append(name)
-        except Exception:
-            continue
-    # Orientation is a small visual task repeated many times. Prefer the 4B
-    # variant; the 12B model was measured taking >120 seconds for one cold page
-    # on a 32 GB mostly-CPU laptop, which is accurate but operationally useless.
-    return sorted(out, key=lambda n: ("gemma3" not in n.casefold(),
-                                      "4b" not in n.casefold(), n))
-
-
-def setup_local_ai(progress=None):
-    """Install/start Ollama if needed and ensure a suitable vision model.
-
-    This is called only by the explicit Settings button. It returns
-    (success, model_name, operator_message) and never raises into the UI.
-    """
-    tell = progress or (lambda _message: None)
-    ram = _system_ram_gb()
-    try:
-        free_gb = shutil.disk_usage(APP_DIR.parent).free / (1024 ** 3)
-    except Exception:
-        free_gb = 0
-    if ram and ram < 12:
-        return False, "", (f"This device has {ram:.0f} GB RAM; local document "
-                           "vision needs at least 12 GB.")
-    if free_gb and free_gb < 8:
-        return False, "", (f"Only {free_gb:.1f} GB is free; keep at least 8 GB "
-                           "free before installing the local model.")
-
-    exe = _ollama_executable()
-    flags = 0x08000000 if os.name == "nt" else 0
-    if exe is None:
-        winget = shutil.which("winget")
-        if not winget:
-            return False, "", ("Ollama is not installed and Windows Package "
-                               "Manager is unavailable. Install Ollama once, "
-                               "then press Set up again.")
-        tell("Installing the local AI runtime…")
-        try:
-            completed = subprocess.run(
-                [winget, "install", "--id", "Ollama.Ollama", "-e",
-                 "--accept-package-agreements", "--accept-source-agreements",
-                 "--silent"], timeout=900, creationflags=flags,
-                capture_output=True, text=True)
-            if completed.returncode != 0:
-                return False, "", "Ollama installation did not complete."
-        except Exception as exc:
-            return False, "", f"Could not install Ollama: {exc}"
-        exe = _ollama_executable()
-        if exe is None:
-            return False, "", "Ollama installed but could not yet be located."
-
-    try:
-        _ollama_json("/api/version", timeout=2)
-    except Exception:
-        tell("Starting the local AI service…")
-        try:
-            subprocess.Popen([str(exe), "serve"], creationflags=flags,
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-        except Exception as exc:
-            return False, "", f"Could not start Ollama: {exc}"
-        for _ in range(20):
-            time.sleep(0.5)
-            try:
-                _ollama_json("/api/version", timeout=2)
-                break
-            except Exception:
-                pass
-        else:
-            return False, "", "Ollama did not become ready."
-
-    model = "gemma3:4b"
-    installed = _installed_ollama_vision_models()
-    fast = next((m for m in installed
-                 if m.casefold().startswith("gemma3:4b")), None)
-    if fast:
-        return True, fast, (f"Ready: {fast} will check image-only page "
-                            "orientation locally.")
-
-    tell(f"Downloading {model} once (about 3–4 GB)…")
-    try:
-        completed = subprocess.run(
-            [str(exe), "pull", model], timeout=3600, creationflags=flags,
-            capture_output=True, text=True)
-        if completed.returncode != 0:
-            return False, "", f"The {model} download did not complete."
-    except Exception as exc:
-        return False, "", f"Could not download {model}: {exc}"
-    installed = _installed_ollama_vision_models()
-    if model not in installed and not any(
-            m.casefold().startswith("gemma3:4b") for m in installed):
-        return False, "", "The model downloaded but its vision capability was not found."
-    chosen = next((m for m in installed
-                   if m.casefold().startswith("gemma3:4b")), model)
-    return True, chosen, f"Ready: {chosen} is installed and configured."
-
-
 def fix_pdf_page_rotations(path: Path, rotations: dict) -> int:
     """Physically rotate INDIVIDUAL pages of a PDF clockwise by the amounts
     in `rotations` ({page_index: 90|180|270}) and save in place. Returns the
     number of pages turned (0 = nothing done / not a PDF / error). Same
     hash-changes caveat as fix_file_rotation."""
-    rotations = {int(i): int(d) for i, d in (rotations or {}).items()
-                 if int(d or 0) in (90, 180, 270)}
-    if not rotations or path.suffix.lower() not in PDF_EXT or not HAS_FITZ:
-        return 0
-    try:
-        doc = fitz.open(path)
-        try:
-            n = 0
-            for idx, deg in rotations.items():
-                if 0 <= idx < len(doc):
-                    page = doc[idx]
-                    page.set_rotation((page.rotation + deg) % 360)
-                    n += 1
-            if not n:
-                return 0
-            tmp = path.with_suffix(path.suffix + ".rot_tmp")
-            doc.save(tmp)
-        finally:
-            doc.close()
-        tmp.replace(path)
-        return n
-    except Exception:
-        traceback.print_exc()
-        try:
-            tmp = path.with_suffix(path.suffix + ".rot_tmp")
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
-        return 0
+    return _atomic_pdf_rotation_rewrite(path, rotations)
 
 
 def _conf_int(result) -> int:
@@ -5555,34 +5761,39 @@ MAX_SEG_PAGES = 7
 # 92-confidence mis-split above), so it does not need to carry more than that.
 SEG_MIN_CONF = 70
 
-# Long files cannot safely use the one-call page map above, because the model
-# only sees a sample.  They get a separate low-resolution boundary scan over
-# EVERY page.  A boundary is still only a proposal: before anything is cut,
-# each proposed child is classified independently and every adjacent pair must
-# be confidently different.  This two-signal design keeps the measured
-# zero-mis-split bias while no longer abandoning large passport/visa/BRP packs.
+# The helpers below remain available to the offline diagnostic harness, but the
+# production path never invokes them automatically.  A long PDF is classified
+# from the ordinary bounded sample and left intact; sampled evidence can only
+# flag it for a human.  This restores the v1.2 cost ceiling.
 LONG_BUNDLE_SCAN_ZOOM = 1.0
 LONG_BUNDLE_SCAN_WINDOW = 10
 LONG_BUNDLE_SCAN_OVERLAP = 2
 LONG_BUNDLE_CONFIRM_CONF = 80
 
-_ID_PAGE_TYPES = {
-    "passport", "brp", "uk driving licence", "non uk driving licence",
-    "visa vignette", "national insurance number", "bank statement",
-    "evisa screenshot", "share code document", "id", "id badge",
-    "proof of address",
-}
-
-
 def _bundle_prone(result: dict) -> bool:
-    """Whether a whole-file answer has the shape of a stacked-ID bundle."""
+    """Whether sampled evidence explicitly describes multiple artefacts.
+
+    This is intentionally generic: ordinary homogeneous document types are not
+    enumerated.  A handbook, contract, statement or any other long single
+    document therefore costs no all-page scan merely because of its category.
+    """
+    result = result if isinstance(result, dict) else {}
+    docs = result.get("documents")
+    if isinstance(docs, list) and len(docs) > 1:
+        return True
+    # The normal classification response already includes this boundary hint;
+    # using it is free and must never trigger the retired all-page scan.
+    starts = result.get("bundle_starts")
+    if isinstance(starts, list) and any(
+            str(value).strip() not in ("", "0", "1") for value in starts):
+        return True
     for key in ("name", "other_label", "guess"):
         value = (result.get(key) or "").strip().lower()
         if not value:
             continue
-        if _norm_type(value) in _ID_PAGE_TYPES:
-            return True
-        if "bundle" in value or "mixed" in value:
+        if any(term in value for term in (
+                "bundle", "mixed documents", "multiple documents",
+                "combined documents", "several documents")):
             return True
     return False
 
@@ -6084,6 +6295,61 @@ def validate_result(kb, result):
 AUTO_REVIEW_MATCH_CONF = 60
 AUTO_REVIEW_LABEL_CONF = 40
 
+_GENERIC_OTHER_LABELS = {
+    "", "unknown", "other", "unidentified", "unclassified", "n/a", "none",
+    "document", "other document", "unknown document", "unidentified document",
+    # File/container formats are not document identifications. Descriptions
+    # that add real subject matter remain meaningful (for example
+    # "customer experience email" or "P60 form").
+    "email", "e-mail", "letter", "form", "scan", "scanned document",
+    "screenshot", "pdf", "pdf document", "image", "photo", "photograph",
+}
+
+
+def meaningful_other_label(result: dict) -> str:
+    """Return a specific primary-batch Other description, or an empty string.
+
+    `other_label` is authoritative, with `guess` and an invented unmatched
+    `name` as fallbacks.
+    Generic abstentions are deliberately unresolved and therefore eligible for
+    the single discounted follow-up batch.
+    """
+    if not isinstance(result, dict):
+        return ""
+    for value in (result.get("other_label"), result.get("guess"),
+                  result.get("name")):
+        label = str(value or "").strip()
+        label = re.sub(r"^\s*other\s*[-:]\s*", "", label,
+                       flags=re.I).strip(" -")
+        if label and label.casefold() not in _GENERIC_OTHER_LABELS:
+            return label
+    return ""
+
+
+def batch_result_needs_followup(kb, result: dict) -> bool:
+    """Whether a first-batch answer is genuinely unresolved.
+
+    Confident canonical matches (including snap-to-controlled matches) and
+    confident descriptive Other labels settle immediately.  Malformed,
+    generic, blank and low-confidence answers get exactly one discounted
+    follow-up request.
+    """
+    if not isinstance(result, dict) or not result:
+        return True
+    # A model claiming match=true while inventing a noncanonical name has not
+    # made a controlled-vocabulary match. Give it the one discounted follow-up
+    # instead of accepting its wording as a descriptive Other.
+    raw_name = str(result.get("name") or "").strip()
+    if bool(result.get("match")) and raw_name \
+            and not kb.canonical_name(raw_name):
+        return True
+    matched, name, _group, _conf, _features, _other = validate_result(kb, result)
+    conf = _conf_int(result)
+    if matched and name and name != "Other":
+        return conf < AUTO_REVIEW_MATCH_CONF
+    return not (conf >= AUTO_REVIEW_LABEL_CONF
+                and bool(meaningful_other_label(result)))
+
 
 def resolve_auto_review(kb, result):
     """Decide the new filename for an automatically re-reviewed
@@ -6102,8 +6368,8 @@ def resolve_auto_review(kb, result):
             return other_name(name), "Other"
         return name, group
     if conf >= AUTO_REVIEW_LABEL_CONF:
-        label = other_label or (result.get("guess") or "").strip()
-        if label and label.strip().lower() not in ("", "unknown", "other"):
+        label = meaningful_other_label(result)
+        if label:
             return other_name(label), "Other"
     return None, None
 
@@ -6211,8 +6477,9 @@ def audit_adjudicate(api, vocab, path, resolution, current_base,
 
 
 def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
-                       resolution, auto_rotate=True, log=lambda m: None,
-                       emit_cost=None, check_stop=lambda: None):
+                       resolution, log=lambda m: None,
+                       emit_cost=None, check_stop=lambda: None,
+                       orientation_rows=None, on_progress=None):
     """Audit every document under `worker_dirs`; write the workbook into
     `out_dir`. Returns (rows, xlsx_path). See the section comment above for
     the method. Flags are conservative: nothing is flagged unless the
@@ -6230,6 +6497,18 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
         f"adjudicated flags")
     rows = []
     n_flag = n_rot = 0
+    def progress(state, completed, path=None, worker="", report=""):
+        if on_progress:
+            try:
+                on_progress({"kind":"audit_progress", "phase":"audit",
+                    "state":state, "completed":completed, "total":len(docs),
+                    "needs_review":sum(r["Review Status"] not in ("Correct", "Custom Name") for r in rows),
+                    "errors":sum(str(r.get("Notes", "")).startswith("error:") for r in rows),
+                    "path":str(path or ""), "worker":worker, "report":str(report or "")})
+            except Exception:
+                # Presentation/notification failures must never alter results.
+                log("  ! Audit progress display could not be refreshed.")
+    progress("started", 0)
     for i, p in enumerate(docs, 1):
         check_stop()
         worker = ""
@@ -6240,6 +6519,7 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
                 break
             except ValueError:
                 continue
+        progress("checking", i - 1, p, worker)
         fname_base = _base_label(base_controlled_name(p.stem))
         row = {c: "" for c in AUDIT_COLUMNS}
         row.update({
@@ -6279,26 +6559,21 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
                 row["Notes"] = (f"custom filename (kept); content reads as "
                                 f"'{pred_base}'")
                 rows.append(row)
+                progress("document_done", i, p, worker)
                 if i % 25 == 0:
                     log(f"  [audit] {i}/{len(docs)} checked "
                         f"({n_flag} flagged so far)")
                 continue
             if not (same or (fn_other and pr_other)):
                 # prospective mismatch -> adjudicate before flagging
+                progress("adjudicating", i - 1, p, worker)
                 adj = audit_adjudicate(adjudicator_api, vocab, p, resolution,
                                        fname_base, pred_base)
                 if emit_cost:
                     emit_cost()
                 notes.append("adjudicated")
-                # physical page-rotation fixes from the adjudicator
-                if auto_rotate and adj["confidence"] >= 60:
-                    fixes = {idx: d for idx, d in
-                             zip(adj["page_idxs"], adj["rotations"])
-                             if d in (90, 180, 270)}
-                    if fixes and fix_pdf_page_rotations(p, fixes):
-                        n_rot += 1
-                        notes.append(f"straightened {len(fixes)} rotated "
-                                     f"page(s)")
+                # Rotation is intentionally NOT applied from this paid audit.
+                # The separate local all-page preflight is the sole authority.
                 v, conf = adj["verdict"], adj["confidence"]
                 if v == "filename_correct" or conf < 60 or v == "unsure":
                     if v == "filename_correct":
@@ -6347,24 +6622,30 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
         row["Notes"] = "; ".join(n for n in [row.get("Notes", "")] + notes
                                  if n)
         rows.append(row)
+        progress("document_done", i, p, worker)
         if i % 25 == 0:
             log(f"  [audit] {i}/{len(docs)} checked "
                 f"({n_flag} flagged so far)")
     # Processing reports live in the dedicated C: reports tree
     # (%LOCALAPPDATA%\Lifted\Reports\Processing Reports\<care home>) — NOT in
     # the care-home data folder (2026-07-22 suite modernisation).
+    progress("writing_report", len(rows), docs[-1] if docs else None)
     rep_dir = processing_reports_dir(Path(out_dir).name)
-    xlsx = unique_path(rep_dir, AUDIT_REPORT_STEM, ".xlsx")
-    _write_audit_workbook(rows, xlsx)
+    xlsx = unique_path(rep_dir, AUDIT_REPORT_STEM, ".csv")
+    _write_audit_workbook(rows, xlsx,
+                          orientation_rows=orientation_rows or [])
     # register it so the ribbon's Reports browser can find it later
     record_processing_report(xlsx, Path(out_dir).name)
+    progress("complete", len(rows), docs[-1] if docs else None, report=xlsx)
     log(f"  [audit] done: {len(rows)} checked, {n_flag} flagged, "
         f"{n_rot} file(s) straightened -> {xlsx.name}")
     return rows, xlsx
 
 
-def _write_audit_workbook(rows, out_path: Path):
+def _write_audit_workbook(rows, out_path: Path, orientation_rows=None):
     """Write the audit rows + a Summary sheet, flagged rows first."""
+    if Path(out_path).suffix.lower() == ".csv":
+        return _write_audit_csv(rows, Path(out_path), orientation_rows)
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
@@ -6418,7 +6699,68 @@ def _write_audit_workbook(rows, out_path: Path):
                                 for r in flagged) / len(flagged), 1)
                       if flagged else 0)):
         sm.append([label, v])
+    orientation_rows = orientation_rows or []
+    if orientation_rows:
+        ow = wb.create_sheet("Orientation")
+        columns = ["File", "Page", "Predicted orientation",
+                   "Correction indicated", "Top confidence",
+                   "Runner-up confidence", "Confidence margin", "Action",
+                   "Reason"]
+        for column, name in enumerate(columns, 1):
+            cell = ow.cell(row=1, column=column, value=name)
+            cell.fill = PatternFill("solid", fgColor="1F3864")
+            cell.font = Font(bold=True, color="FFFFFF", size=10)
+            ow.column_dimensions[get_column_letter(column)].width = \
+                55 if column == 1 else (40 if column == 9 else 18)
+        for row_number, item in enumerate(orientation_rows, 2):
+            for column, name in enumerate(columns, 1):
+                value = item.get(name, "")
+                if name in ("Top confidence", "Runner-up confidence",
+                            "Confidence margin") and isinstance(value, float):
+                    value = round(value, 6)
+                ow.cell(row=row_number, column=column, value=value)
+        ow.freeze_panes = "A2"
+        ow.auto_filter.ref = (
+            f"A1:{get_column_letter(len(columns))}{len(orientation_rows)+1}")
+        sm.append(["Local orientation pages flagged", len(orientation_rows)])
     wb.save(out_path)
+
+
+def _write_audit_csv(rows, out_path, orientation_rows=None):
+    """One table per CSV; linked manifest preserves the old workbook's tabs."""
+    from collections import Counter
+    order = {"Likely Misnamed": 0, "Possibly Misnamed": 1, "Unable To Determine": 2, "Correct": 3}
+    rows = sorted(rows, key=lambda r: (order.get(r.get("Review Status"), 9),
+                                      -int(r.get("Confidence Score") or 0)))
+    pipeline.atomic_csv(out_path, rows, AUDIT_COLUMNS)
+    by = Counter(r.get("Review Status", "") for r in rows)
+    summary_path = out_path.with_name(out_path.stem + " - Summary.csv")
+    flagged = [r for r in rows if r.get("Review Status") not in ("Correct", "Custom Name")]
+    summary = [{"metric": "Total files reviewed", "value": len(rows)}]
+    summary += [{"metric": key, "value": value} for key, value in sorted(by.items())]
+    summary += [{"metric": "Average confidence (flagged rows)", "value":
+                 round(sum(int(r.get("Confidence Score") or 0) for r in flagged) / len(flagged), 1) if flagged else 0},
+                {"metric": "Local orientation pages flagged", "value": len(orientation_rows or [])}]
+    pipeline.atomic_csv(summary_path, summary, ["metric", "value"])
+    tables = [{"table": "Audit", "file": out_path.name, "rows": len(rows)},
+              {"table": "Summary", "file": summary_path.name, "rows": len(summary)}]
+    if orientation_rows:
+        orientation_path = out_path.with_name(out_path.stem + " - Orientation.csv")
+        columns = ["File", "Page", "Predicted orientation", "Correction indicated", "Top confidence",
+                   "Runner-up confidence", "Confidence margin", "Action", "Reason"]
+        pipeline.atomic_csv(orientation_path, orientation_rows, columns)
+        tables.append({"table": "Orientation", "file": orientation_path.name, "rows": len(orientation_rows)})
+    pipeline.atomic_csv(out_path.with_name(out_path.stem + " - Tables.csv"), tables, ["table", "file", "rows"])
+    return out_path
+
+
+def write_orientation_audit(orientation_rows, out_dir: Path):
+    """Write the existing audit workbook format without making API calls."""
+    rep_dir = processing_reports_dir(Path(out_dir).name)
+    xlsx = unique_path(rep_dir, AUDIT_REPORT_STEM, ".csv")
+    _write_audit_workbook([], xlsx, orientation_rows=orientation_rows)
+    record_processing_report(xlsx, Path(out_dir).name)
+    return xlsx
 
 
 # ====================================================================
@@ -6436,7 +6778,25 @@ class LimitReached(StopRequested):
         self.reason = reason
 
 
+class FinishingAmbiguous(StopRequested):
+    """A live finishing POST may have completed before its result was saved."""
+    pass
+
+
+class DurableStateError(StopRequested):
+    """Required batch checkpoint could not be made safely."""
+    pass
+
+
 class Engine:
+    def _record_roster_handover(self, source, destination):
+        try:
+            if not pipeline.find_roster(Path(source).parent):
+                pipeline.refresh_roster(Path(source).parent, stage="stage2")
+            pipeline.record_worker_move(source, destination, "stage2")
+        except Exception as exc:
+            self.log(f"  ! Processing finished, but worker roster needs refresh: {exc}")
+
     """Runs the whole review on a background thread. Communicates with the UI
     via callbacks (all marshalled back onto the Tk thread by the caller)."""
 
@@ -6457,30 +6817,37 @@ class Engine:
                  move_dest: Path = None,
                  review_unknowns=None,
                  escalation_api: "ClaudeAPI" = None,
-                 auto_rotate: bool = True,
-                 local_ai_orientation: bool = False,
-                 local_ai_model: str = "gemma3:4b",
+                 orientation_mode: str = "audit",
+                 orientation_confidence: float = 0.95,
+                 orientation_margin: float = 0.20,
+                 orientation_predictor=None,
                  bundle_split: bool = True,
                  cleanup_leftovers: bool = True,
-                 post_run_audit: bool = False):
+                 post_run_audit: bool = False,
+                 on_activity=None):
         self.dir = care_home_dir
         self.kb = kb
         self.api = api
         # optional stronger-model client for the low-confidence second opinion
         # (None = escalation off, or primary model already this strong)
         self.escalation_api = escalation_api
-        # physically rewrite sideways scans upright once identified
-        self.auto_rotate = bool(auto_rotate)
-        # optional local-only vision pass for pages without a readable text
-        # layer; model setup is explicit in Settings and failure is non-fatal
-        self.local_ai_orientation = bool(local_ai_orientation)
-        self.local_ai_model = str(local_ai_model or "gemma3:4b")
+        self.orientation_mode = (orientation_mode if orientation_mode in
+                                 ("off", "audit", "automatic") else "audit")
+        self.orientation_confidence = max(
+            0.5, min(0.999, float(orientation_confidence)))
+        self.orientation_margin = max(
+            0.0, min(0.999, float(orientation_margin)))
+        self._orientation_predictor = orientation_predictor
+        self._orientation_model_checked = False
+        self.orientation_state = OrientationState(care_home_dir)
         # detect+split files that wrongly contain several documents
         self.bundle_split = bool(bundle_split)
         # delete processing residue (.splitbak/.zip) per worker when done
         self.cleanup_leftovers = bool(cleanup_leftovers)
         # optional second accuracy check over everything once the run ends
         self.post_run_audit = bool(post_run_audit)
+        self.on_activity = on_activity
+        self._audit_progress_snapshot = {}
         self._audit_worker_dirs = []
         self.care_home = care_home_name
         self.log = log
@@ -6515,6 +6882,13 @@ class Engine:
         self.convert_pdf = bool(convert_pdf)  # Stage 2: convert files to PDF first
         self.files_sent = 0                # counts files actually sent to the API
         self._current_worker = ""          # worker being processed (for credit-stop marking)
+        # Actual already-committed Message Batches spend is folded into the
+        # same ceiling as live finishing and audit calls during batch apply.
+        self._committed_batch_cost_gbp = 0.0
+        self._committed_batch_tokens = 0
+        self._persisted_live_cost_gbp = 0.0
+        self._persisted_live_tokens = 0
+        self._batch_state = None
 
         # persistent processed-file cache (skip unchanged files on re-runs)
         self.manifest = ProcessedManifest(care_home_dir)
@@ -6537,6 +6911,8 @@ class Engine:
                       "batch_errored": 0, "batch_expired": 0,
                       "batch_canceled": 0, "batch_missing": 0,
                       "batch_in_tokens": 0, "batch_out_tokens": 0,
+                      "followup_requests": 0,
+                      "followup_in_tokens": 0, "followup_out_tokens": 0,
                       "bundles_split": 0, "possible_bundles": 0}
         # files that look like multi-document bundles but were deliberately
         # NOT split (too long to see in full, or the split gates refused the
@@ -6566,13 +6942,109 @@ class Engine:
 
     # ---- budget / limit guards ----
     def _current_cost_gbp(self) -> float:
-        gbp = tokens_cost_gbp(self.api.model_id,
-                              self.api.in_tokens, self.api.out_tokens)
+        gbp = (getattr(self, "_committed_batch_cost_gbp", 0.0)
+               + getattr(self, "_persisted_live_cost_gbp", 0.0)
+               + tokens_cost_gbp(
+            self.api.model_id, self.api.in_tokens, self.api.out_tokens)
+               )
         if self.escalation_api is not None:
             gbp += tokens_cost_gbp(self.escalation_api.model_id,
                                    self.escalation_api.in_tokens,
                                    self.escalation_api.out_tokens)
         return gbp
+
+    def _session_live_tokens(self):
+        total = self.api.in_tokens + self.api.out_tokens
+        if self.escalation_api is not None:
+            total += (self.escalation_api.in_tokens
+                      + self.escalation_api.out_tokens)
+        return total
+
+    def _persist_batch_live_cost(self):
+        state = getattr(self, "_batch_state", None)
+        if state is None:
+            return
+        session_cost = tokens_cost_gbp(
+            self.api.model_id, self.api.in_tokens, self.api.out_tokens)
+        if self.escalation_api is not None:
+            session_cost += tokens_cost_gbp(
+                self.escalation_api.model_id,
+                self.escalation_api.in_tokens,
+                self.escalation_api.out_tokens)
+        costs = state.data.setdefault("costs", {})
+        costs["live_actual_gbp"] = round(
+            getattr(self, "_persisted_live_cost_gbp", 0.0) + session_cost, 8)
+        costs["live_tokens"] = int(
+            getattr(self, "_persisted_live_tokens", 0)
+            + self._session_live_tokens())
+        costs["updated_ts"] = datetime.datetime.now().isoformat(
+            timespec="seconds")
+        if not state.save():
+            raise DurableStateError(
+                "could not persist cumulative live finishing cost")
+
+    def _finishing_operation(self, worker_dir: Path, operation_id: str,
+                             callback):
+        """Run one chargeable finishing operation at most once across restarts."""
+        state = getattr(self, "_batch_state", None)
+        if state is None:
+            result = callback()
+            self._emit_cost()
+            return result
+        worker_key = str(Path(worker_dir).resolve()).casefold()
+        worker = state.data.setdefault("workers", {}).setdefault(
+            worker_key, {"name": Path(worker_dir).name,
+                         "source_path": str(worker_dir)})
+        operations = worker.setdefault("finishing_operations", {})
+        prior = operations.get(operation_id) or {}
+        if prior.get("status") in ("complete", "failed"):
+            return prior.get("result")
+        if prior.get("status") == "submission_started":
+            raise FinishingAmbiguous(
+                f"finishing operation '{operation_id}' for "
+                f"'{Path(worker_dir).name}' may already have been accepted; "
+                "automatic retry is blocked")
+        attempt_id = hashlib.sha256(
+            f"{time.time_ns()}:{worker_key}:{operation_id}".encode(
+                "utf-8")).hexdigest()[:24]
+        operations[operation_id] = {
+            "status": "submission_started", "attempt_id": attempt_id,
+            "started_ts": datetime.datetime.now().isoformat(
+                timespec="seconds")}
+        worker["finishing_status"] = "in_progress"
+        if not state.save():
+            raise DurableStateError(
+                "finishing marker could not be persisted; no request sent")
+        try:
+            result = callback()
+        except Exception as exc:
+            self._persist_batch_live_cost()
+            operations[operation_id].update({
+                "status": "failed", "result": None,
+                "error": f"{type(exc).__name__}: {exc}",
+                "completed_ts": datetime.datetime.now().isoformat(
+                    timespec="seconds")})
+            state.save()
+            self.on_cost(self._current_cost_gbp(),
+                         getattr(self, "_committed_batch_tokens", 0)
+                         + getattr(self, "_persisted_live_tokens", 0)
+                         + self._session_live_tokens())
+            raise
+        self._persist_batch_live_cost()
+        operations[operation_id].update({
+            "status": "complete", "result": result,
+            "completed_ts": datetime.datetime.now().isoformat(
+                timespec="seconds")})
+        if not state.save():
+            raise FinishingAmbiguous(
+                "finishing response was received but completion could not be "
+                "persisted; automatic retry is blocked")
+        self.on_cost(self._current_cost_gbp(),
+                     getattr(self, "_committed_batch_tokens", 0)
+                     + getattr(self, "_persisted_live_tokens", 0)
+                     + self._session_live_tokens())
+        self._check_budget()
+        return result
 
     def _check_budget(self):
         """Stop the whole run if the live estimated spend reaches the ceiling."""
@@ -6585,113 +7057,253 @@ class Engine:
             raise LimitReached(
                 f"file limit reached ({self.max_files} files sent)")
 
-    # ---- physical rotation fix ----
-    def _maybe_fix_rotation(self, f: Path, result: dict, page_idxs=None):
-        """When auto-rotate is on, rewrite a sideways/upside-down scan so it
-        opens upright. Three independent signals, cheapest first:
-          - the FREE local text-direction check (PDFs with a text layer) -
-            trusted on its own, it only speaks when unambiguous, and catches
-            e.g. upside-down pages whose text the model read without
-            reporting rotation;
-          - the model's PER-PAGE 'rotations' list (one entry per page it
-            saw; `page_idxs` maps entries to real pages), gated on
-            confidence >= 60 - fixes mixed-orientation scans page by page;
-          - the model's single page-1 'rotation', gated the same way -
-            whole-file fallback (also the only option for image files).
-        Returns the file's NEW content hash when it was rewritten - the
-        manifest must use that, since rewriting changes the bytes - else
-        None."""
-        if not self.auto_rotate:
-            return None
-        fixed_n = 0
-        total = DocRender.page_count(f)
-        fixes = {}
-        resolved = set()
+    # ---- local page-orientation preflight ----
+    def _orientation_move_path(self, old_path: Path, new_path: Path):
+        state = getattr(self, "orientation_state", None)
+        if state is not None:
+            state.move_path(old_path, new_path)
 
-        # FREE text direction across every PDF page. Include confident upright
-        # (0°) decisions in `resolved`: they need no rewrite, but prevent a
-        # weaker later signal from turning an already-upright text page.
-        text_decisions = detect_pdf_page_text_rotations(
-            f, include_upright=True)
-        resolved.update(text_decisions)
-        fixes.update({i: d for i, d in text_decisions.items() if d})
+    def _orientation_move_tree(self, old_root: Path, new_root: Path):
+        state = getattr(self, "orientation_state", None)
+        if state is not None:
+            state.move_tree(old_root, new_root)
 
-        # Optional all-page local vision for pages without enough embedded text.
-        # Double-confirmation inside the detector makes this stronger than the
-        # single model report, so its upright and rotated decisions take
-        # precedence. A missing Ollama service simply falls through.
-        if (self.local_ai_orientation and f.suffix.lower() in PDF_EXT
-                and total > 0):
-            unresolved = [i for i in range(total) if i not in resolved]
-            if unresolved:
-                local = OllamaOrientationDetector(
-                    self.local_ai_model).detect_pdf_pages(
-                        f, unresolved, log=self.log)
-                if local:
-                    resolved.update(local)
-                    fixes.update({i: d for i, d in local.items() if d})
-                    self.log(f"    · local AI verified the orientation of "
-                             f"{len(local)} image-only page(s)")
+    def _orientation_signature(self):
+        return (f"{ORIENTATION_MODEL_REVISION}:{ORIENTATION_MODEL_SHA256}:"
+                f"{self.orientation_mode}:{self.orientation_confidence:.4f}:"
+                f"{self.orientation_margin:.4f}")
 
-        # The cloud classifier covers every page it actually saw. Combine its
-        # answers with the text/local decisions instead of the previous
-        # all-or-nothing `if not fixed_n`: that condition meant fixing one text
-        # page accidentally skipped a different image-only rotated page.
-        used_per_page_report = False
-        if _conf_int(result) >= 60:
+    def _orientation_predictor_for_run(self):
+        if self._orientation_predictor is not None:
+            return self._orientation_predictor
+        model_path = bundled_resource("assets", "orientation",
+                                      "inference.onnx")
+        if not self._orientation_model_checked:
+            self._orientation_model_checked = True
+            if not model_path.is_file():
+                raise FileNotFoundError(
+                    f"bundled {ORIENTATION_MODEL_NAME} model is missing")
+            if file_hash(model_path).lower() != ORIENTATION_MODEL_SHA256.lower():
+                raise RuntimeError(
+                    "bundled orientation model checksum does not match the "
+                    "pinned release checksum")
+        self._orientation_predictor = OnnxOrientationPredictor(
+            model_path, batch_size=4)
+        return self._orientation_predictor
+
+    @staticmethod
+    def _consume_rotation_instructions(result: dict):
+        """Consume cloud hints after a parent has already been corrected."""
+        if isinstance(result, dict):
+            result["rotation"] = 0
             rots = result.get("rotations")
-            if (isinstance(rots, list) and page_idxs
-                    and len(rots) == len(page_idxs)):
-                used_per_page_report = True
-                for idx, d in zip(page_idxs, rots):
-                    if idx in resolved:
-                        continue
-                    try:
-                        d = int(float(d or 0))
-                    except Exception:
-                        continue
-                    if d in (0, 90, 180, 270):
-                        resolved.add(idx)
-                        if d:
-                            fixes[idx] = d
+            if isinstance(rots, list):
+                result["rotations"] = [0 for _ in rots]
+            result["rotation_consumed"] = True
 
-            # Whole-file fallback is retained only when no page-specific
-            # source spoke. Applying a page-1 guess across pages already known
-            # to have mixed orientations would undo correct work.
-            if not used_per_page_report and not resolved:
-                rot = _rot_of(result)
-                if rot:
-                    if f.suffix.lower() in PDF_EXT:
-                        fixes.update({i: rot for i in range(total)})
-                    elif fix_file_rotation(f, rot):
-                        fixed_n = total
+    def _inherit_split_orientation(self, parent: Path, parts: list,
+                                   plan: list):
+        """Persist child page state so a restart cannot turn split pages again."""
+        state = getattr(self, "orientation_state", None)
+        if state is None:
+            return
+        parent_entry = state.entry(parent)
+        parent_pages = {int(item.get("page", -1)): item
+                        for item in parent_entry.get("pages", []) or []}
+        if not parent_entry or not parent_pages:
+            return
+        parent_was_corrected = bool(parent_entry.get("changed"))
+        for child, segment in zip(parts, plan):
+            child_pages = []
+            for child_index, parent_index in enumerate(segment.get("pages", [])):
+                inherited = dict(parent_pages.get(parent_index, {}))
+                inherited["page"] = child_index
+                inherited["parent_page"] = parent_index
+                inherited["reason"] = (
+                    "inherited from locally corrected parent"
+                    if parent_was_corrected else
+                    inherited.get("reason", "inherited parent audit"))
+                if parent_was_corrected:
+                    inherited["source_correction"] = inherited.get(
+                        "correction", 0)
+                    inherited["predicted_orientation"] = 0
+                    inherited["correction"] = 0
+                    inherited["rotate"] = 0
+                    inherited["uncertain"] = False
+                    inherited["eligible"] = False
+                    inherited["applied"] = True
+                child_pages.append(inherited)
+            try:
+                child_hash = file_hash(child)
+            except Exception:
+                continue
+            state.put(child, {
+                "status": "complete", "signature": self._orientation_signature(),
+                "mode": self.orientation_mode, "model": ORIENTATION_MODEL_NAME,
+                "model_revision": ORIENTATION_MODEL_REVISION,
+                "model_sha256": ORIENTATION_MODEL_SHA256,
+                "original_hash": child_hash, "current_hash": child_hash,
+                "pages": child_pages, "changed": False,
+                "inherited_from": str(parent),
+            })
 
-        if fixes and f.suffix.lower() in PDF_EXT:
-            same = set(fixes.values())
-            if len(fixes) == total and len(same) == 1:
-                if fix_file_rotation(f, same.pop()):
-                    fixed_n = total
-            else:
-                fixed_n = fix_pdf_page_rotations(f, fixes)
-        elif fixes and f.suffix.lower() in IMG_EXT:
-            # Image files are one page and use the whole-file helper.
-            deg = fixes.get(0)
-            if deg and fix_file_rotation(f, deg):
-                fixed_n = 1
-        if not fixed_n:
-            return None
-        self.stats["rotated_fixed"] = self.stats.get("rotated_fixed", 0) + 1
-        self.log(f"    · {self._redact(f.name)}: {fixed_n} rotated page(s) "
-                 f"saved upright")
+    def _orientation_preflight(self, path: Path) -> dict:
+        """Inspect every PDF page locally in bounded thumbnail batches."""
+        mode = getattr(self, "orientation_mode", "off")
+        if mode == "off" or path.suffix.lower() not in PDF_EXT \
+                or not HAS_FITZ or not HAS_PIL or not path.is_file():
+            return {"changed": False, "hash": "", "pages": []}
+        self._check_stop()
         try:
-            return file_hash(f)
-        except Exception:
-            return None
+            current_hash = file_hash(path)
+        except Exception as exc:
+            return {"changed": False, "hash": "", "pages": [],
+                    "warning": str(exc)}
+
+        state = getattr(self, "orientation_state", None)
+        if state is None:
+            state = OrientationState(self.dir)
+            self.orientation_state = state
+        signature = self._orientation_signature()
+        previous = state.entry(path)
+        # Replacement may have completed just before a crash. The persisted
+        # authorisation plus changed bytes prove the turns were consumed.
+        if (previous.get("status") == "rewrite_authorized"
+                and previous.get("original_hash")
+                and previous.get("original_hash") != current_hash):
+            previous["status"] = "complete_recovered"
+            previous["current_hash"] = current_hash
+            previous["changed"] = True
+            for page in previous.get("pages", []) or []:
+                if page.get("rotate"):
+                    page["applied"] = True
+            state.put(path, previous)
+            return {"changed": True, "hash": current_hash,
+                    "pages": previous.get("pages", []), "recovered": True}
+        if (previous.get("status") in ("complete", "complete_recovered")
+                and previous.get("current_hash") == current_hash
+                and previous.get("signature") == signature):
+            return {"changed": bool(previous.get("changed")),
+                    "hash": current_hash,
+                    "pages": previous.get("pages", []), "cached": True}
+
+        entry = {"status": "inspection_started", "signature": signature,
+                 "mode": mode, "model": ORIENTATION_MODEL_NAME,
+                 "model_revision": ORIENTATION_MODEL_REVISION,
+                 "model_sha256": ORIENTATION_MODEL_SHA256,
+                 "original_hash": current_hash, "current_hash": current_hash,
+                 "pages": [], "changed": False}
+        state.put(path, entry)
+        try:
+            predictor = self._orientation_predictor_for_run()
+            text_corrections = detect_pdf_page_text_rotations(
+                path, include_upright=True)
+            doc = fitz.open(str(path))
+            decisions = []
+            try:
+                for start in range(0, len(doc), 4):
+                    self._check_stop()
+                    images, evidences = [], []
+                    for page_index in range(start, min(start + 4, len(doc))):
+                        self._check_stop()
+                        pix = doc[page_index].get_pixmap(
+                            matrix=fitz.Matrix(1.0, 1.0), alpha=False,
+                            colorspace=fitz.csRGB)
+                        image = Image.frombytes(
+                            "RGB", (pix.width, pix.height), pix.samples)
+                        images.append(image)
+                        evidences.append(thumbnail_evidence(image.copy()))
+                    predictions = predictor.predict(images)
+                    if len(predictions) != len(images):
+                        raise RuntimeError(
+                            "orientation model returned the wrong batch size")
+                    for offset, (prediction, evidence) in enumerate(
+                            zip(predictions, evidences)):
+                        page_index = start + offset
+                        decision = orientation_decision(
+                            prediction, evidence, mode=mode,
+                            confidence_threshold=self.orientation_confidence,
+                            margin_threshold=self.orientation_margin,
+                            text_correction=text_corrections.get(page_index))
+                        decision["page"] = page_index
+                        decision["ink_fraction"] = evidence.get(
+                            "ink_fraction", 0.0)
+                        decisions.append(decision)
+            finally:
+                doc.close()
+        except StopRequested:
+            raise
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            entry.update({"status": "unavailable", "warning": reason})
+            state.put(path, entry)
+            state.warning(path, reason)
+            self.stats["orientation_warnings"] = \
+                self.stats.get("orientation_warnings", 0) + 1
+            self.log(f"    ! local orientation unavailable for "
+                     f"{self._redact(path.name)}: {reason}; pages unchanged")
+            return {"changed": False, "hash": current_hash, "pages": [],
+                    "warning": reason}
+
+        entry["pages"] = decisions
+        fixes = {int(page["page"]): int(page["rotate"])
+                 for page in decisions if page.get("rotate")}
+        if fixes:
+            self._check_stop()
+            entry["status"] = "rewrite_authorized"
+            entry["rotations"] = {str(k): v for k, v in fixes.items()}
+            state.put(path, entry)
+            self._check_stop()
+            changed = fix_pdf_page_rotations(path, fixes)
+            if changed == len(fixes):
+                new_hash = file_hash(path)
+                entry.update({"status": "complete", "current_hash": new_hash,
+                              "changed": True})
+                for page in entry["pages"]:
+                    if page.get("rotate"):
+                        page["applied"] = True
+                # Persist the new hash immediately after atomic replacement.
+                state.put(path, entry)
+                self.stats["rotated_fixed"] = \
+                    self.stats.get("rotated_fixed", 0) + 1
+                self.log(f"    · {self._redact(path.name)}: {changed} page(s) "
+                         "corrected locally and atomically")
+                return {"changed": True, "hash": new_hash,
+                        "pages": entry["pages"]}
+            reason = "atomic orientation rewrite failed; original preserved"
+            entry.update({"status": "rewrite_failed",
+                          "current_hash": file_hash(path), "warning": reason})
+            state.put(path, entry)
+            state.warning(path, reason)
+            self.log(f"    ! {self._redact(path.name)}: {reason}")
+            return {"changed": False, "hash": entry["current_hash"],
+                    "pages": entry["pages"], "warning": reason}
+
+        entry["status"] = "complete"
+        state.put(path, entry)
+        apparent = sum(1 for page in decisions if page.get("correction"))
+        uncertain = sum(1 for page in decisions if page.get("uncertain"))
+        if apparent or uncertain:
+            self.log(f"    · local orientation audit: {apparent} apparently "
+                     f"rotated, {uncertain} uncertain page(s); unchanged")
+        return {"changed": False, "hash": current_hash, "pages": decisions}
+
+    # ---- physical rotation compatibility entry point ----
+    def _maybe_fix_rotation(self, f: Path, result: dict, page_idxs=None):
+        outcome = self._orientation_preflight(f)
+        if outcome.get("changed"):
+            self._consume_rotation_instructions(result)
+            return outcome.get("hash")
+        return None
 
     # ---- cost ----
     def _emit_cost(self):
+        self._persist_batch_live_cost()
         gbp = self._current_cost_gbp()
-        toks = self.api.in_tokens + self.api.out_tokens
+        toks = (getattr(self, "_committed_batch_tokens", 0)
+                + getattr(self, "_persisted_live_tokens", 0)
+                + self.api.in_tokens
+                + self.api.out_tokens)
         if self.escalation_api is not None:
             toks += (self.escalation_api.in_tokens
                      + self.escalation_api.out_tokens)
@@ -6700,42 +7312,153 @@ class Engine:
         self._check_budget()
 
     # ---- optional post-run accuracy audit ----
+    def _activity(self, event):
+        """Emit structured UI/notification facts without changing processing."""
+        if event.get("phase") == "audit":
+            self._audit_progress_snapshot = dict(event)
+        callback = getattr(self, "on_activity", None)
+        if callback:
+            try:
+                callback(dict(event))
+            except Exception:
+                self.log("  ! Activity observer unavailable; processing continues.")
+
+    def _phase(self, phase, label):
+        seen = getattr(self, "_announced_phases", set())
+        if phase not in seen:
+            seen.add(phase)
+            self._announced_phases = seen
+            self._activity({"kind":"phase_started", "phase":phase, "label":label})
+
+    def _phase_progress(self, phase, done, total):
+        self._activity({"kind":"run_progress", "phase":phase, "state":"running",
+                        "completed":done, "total":total})
+
     def _run_post_run_audit(self):
         """When the Settings toggle is on, re-check every processed document
         (run_accuracy_audit: full pages, adjudicated flags) and write
         Filename_Audit_Report.xlsx into the care-home folder (the move
-        destination when move mode is on). Audit-only: nothing is renamed;
-        confidently-rotated pages are straightened. A failure here never
-        breaks the finished run."""
+        destination when move mode is on). This phase is report-only: nothing
+        is renamed or rotated. A failure here never breaks the finished run."""
+        orientation_rows = self.orientation_state.audit_rows()
+        batch_state = getattr(self, "_batch_state", None)
+        audit_state = (batch_state.data.setdefault("audit", {})
+                       if batch_state is not None else {})
+        if audit_state.get("status") == "complete":
+            return
+        out_dir = (self.move_dest if (self.move_mode and self.move_dest)
+                   else self.dir)
         if not self.post_run_audit or not self._audit_worker_dirs:
+            self.stats["audit_status"] = "disabled" if not self.post_run_audit else "skipped"
+            if orientation_rows:
+                xlsx = write_orientation_audit(orientation_rows, out_dir)
+                self.stats["orientation_audit_rows"] = len(orientation_rows)
+                self.log(f"local orientation audit -> {xlsx}")
+            if batch_state is not None:
+                audit_state["status"] = "disabled"
+                audit_state["orientation_rows"] = len(orientation_rows)
+                batch_state.save()
+            return
+        docs = []
+        for worker in self._audit_worker_dirs:
+            worker = Path(worker)
+            if worker.is_dir():
+                docs.extend(p for p in worker.rglob("*")
+                            if p.is_file() and p.suffix.lower() in DOC_EXT
+                            and not is_program_file(p))
+        adjudicator = self.escalation_api or self.api
+        expected = estimate_pipeline_costs_gbp(
+            len(docs), self.api.model_id, adjudicator.model_id,
+            self.resolution, self.kb.vocabulary_block(), batch=False,
+            include_audit=True)["audit_gbp"]
+        remaining = (float("inf") if self.max_budget_gbp <= 0 else
+                     max(0.0, self.max_budget_gbp - self._current_cost_gbp()))
+        self.log(f"\n=== POST-RUN ACCURACY AUDIT ESTIMATE: "
+                 f"~£{expected:.2f}; remaining cumulative budget "
+                 f"{'unlimited' if math.isinf(remaining) else f'£{remaining:.2f}'} ===")
+        if expected > remaining:
+            self.stats["audit_skipped_budget"] = 1
+            self.stats["audit_expected_gbp"] = expected
+            if orientation_rows:
+                xlsx = write_orientation_audit(orientation_rows, out_dir)
+                self.log(f"local orientation audit -> {xlsx}")
+            if batch_state is not None:
+                audit_state.update({"status": "skipped", "reason": "budget",
+                                    "expected_gbp": expected})
+                batch_state.save()
+            self.log("PROCESSING COMPLETE: post-run accuracy audit skipped "
+                     "because the remaining budget cannot cover its separate "
+                     f"~£{expected:.2f} expected cost.")
+            self.stats["audit_status"] = "skipped"
+            self._activity({"phase":"audit", "state":"skipped", "completed":0,
+                            "total":len(docs), "reason":"budget"})
             return
         try:
+            if batch_state is not None:
+                audit_state["status"] = "running"
+                audit_state["started_ts"] = datetime.datetime.now().isoformat(
+                    timespec="seconds")
+                if not batch_state.save():
+                    raise RuntimeError(
+                        "audit start could not be persisted; audit not started")
             self.set_status("Post-run accuracy audit…")
+            self.stats["audit_status"] = "running"
             self.log(f"\n=== POST-RUN ACCURACY AUDIT "
                      f"({len(self._audit_worker_dirs)} worker folder(s)) ===")
-            out_dir = (self.move_dest if (self.move_mode and self.move_dest)
-                       else self.dir)
-            adjudicator = self.escalation_api or self.api
             rows, xlsx = run_accuracy_audit(
                 self.api, adjudicator, self.kb, self._audit_worker_dirs,
-                out_dir, resolution=self.resolution,
-                auto_rotate=self.auto_rotate, log=self.log,
-                emit_cost=self._emit_cost, check_stop=self._check_stop)
+                out_dir, resolution=self.resolution, log=self.log,
+                emit_cost=self._emit_cost, check_stop=self._check_stop,
+                orientation_rows=orientation_rows, on_progress=self._activity)
             flagged = sum(1 for r in rows
                           if r["Review Status"] not in ("Correct",
                                                         "Custom Name"))
             self.stats["audited"] = len(rows)
             self.stats["audit_flagged"] = flagged
+            self.stats["audit_needs_review"] = flagged
+            self.stats["audit_status"] = "complete"
+            self.stats["audit_report"] = str(xlsx)
             self.log(f"audit report -> {xlsx}")
+            self.manifest.save()
+            if batch_state is not None:
+                audit_state.update({
+                    "status": "complete", "report": str(xlsx),
+                    "completed_ts": datetime.datetime.now().isoformat(
+                        timespec="seconds")})
+                batch_state.save()
         except (StopRequested, LimitReached, CreditExhausted):
+            self.stats["audit_status"] = "pending"
+            self._activity(dict(getattr(self, "_audit_progress_snapshot", {}),
+                                phase="audit", state="stopped"))
+            if batch_state is not None:
+                audit_state["status"] = "pending"
+                audit_state["last_stop_ts"] = datetime.datetime.now().isoformat(
+                    timespec="seconds")
+                batch_state.save()
             raise
         except Exception as e:
+            self.stats["audit_status"] = "failed"
+            self._activity(dict(getattr(self, "_audit_progress_snapshot", {}),
+                                phase="audit", state="failed"))
+            if batch_state is not None:
+                audit_state["status"] = "pending"
+                audit_state["last_error"] = str(e)
+                batch_state.save()
             self.log(f"! post-run audit failed: {e} (run itself is complete)")
             traceback.print_exc()
 
     # ---- run ----
+    @_care_home_writer_operation
     def run(self):
         try:
+            pending = BatchState(self.dir)
+            if pending.exists():
+                self.log("LIVE PROCESSING BLOCKED: this folder has a pending "
+                         "or ambiguous primary/follow-up batch. Retrieve, "
+                         "complete or safely resolve it first. No live API "
+                         "request was made.")
+                self.on_done(self.stats, "live_blocked_by_batch")
+                return
             workers = worker_dirs_in(self.dir)
             if not workers:
                 self.log("No worker sub-folders found in that care-home folder.")
@@ -6751,6 +7474,7 @@ class Engine:
             TRACKER.update(workers_total=total)
             for idx, w in enumerate(workers[:total], 1):
                 self._check_stop()
+                self._phase_progress("processing", idx - 1, total)
                 self.set_progress(idx - 1, total)
                 TRACKER.update(workers_done=idx - 1, current_worker=w.name,
                                status=f"Worker {idx}/{total}",
@@ -6778,6 +7502,7 @@ class Engine:
                     if self.move_mode:
                         try:
                             dest = move_worker_folder(w, self.move_dest)
+                            self._orientation_move_tree(w, dest)
                             self.stats["moved"] += 1
                             self.log(f"  moved worker folder -> {dest}")
                             final_dir = Path(dest)
@@ -6787,6 +7512,7 @@ class Engine:
                                      f"{e} (left in source)")
                             traceback.print_exc()
                     self._audit_worker_dirs.append(final_dir)
+                    self._record_roster_handover(w, final_dir)
                 except (StopRequested, LimitReached, CreditExhausted):
                     raise
                 except Exception as e:
@@ -6795,6 +7521,7 @@ class Engine:
                              f"{'(left in source, not moved)' if self.move_mode else ''}")
                     traceback.print_exc()
                 self._emit_cost()
+            self._phase_progress("processing", total, total)
             self.set_progress(total, total)
             # run completed cleanly — the checkpoint is no longer needed and
             # must not trigger a resume offer next launch.
@@ -6846,9 +7573,11 @@ class Engine:
 
     # ---- one worker ----
     def _process_worker(self, worker_dir: Path):
+        cleanup_orientation_temp_files(worker_dir, self.log)
         # 0) CONVERT EVERYTHING TO PDF first (Stage 2). Images, Office docs,
         #    .msg/.eml and .txt become PDFs in place; existing PDFs are kept.
         if self.convert_pdf:
+            self._phase("converting", "PDF conversion")
             self.set_status(f"{worker_dir.name}  -  converting to PDF")
             self.log("  [convert] converting documents to PDF")
             conv = PdfConverter.convert_worker(
@@ -6878,6 +7607,7 @@ class Engine:
 
         for f in files:
             self._check_stop()
+            self._phase("processing", "Document classification")
             self.set_status(f"{worker_dir.name}  -  reviewing {self._redact(f.name)}")
 
             ext = f.suffix.lower()
@@ -6922,8 +7652,25 @@ class Engine:
                 fhash = file_hash(f)
             except Exception:
                 fhash = ""
+            cached_before_orientation = (
+                self.manifest.seen(fhash, self.api.model_id, self.resolution)
+                if fhash and not self.reprocess else None)
+            # Local every-page orientation preflight runs before any paid
+            # rendering/classification. Audit mode only records; automatic
+            # mode atomically rewrites and immediately returns the new hash.
+            orientation = self._orientation_preflight(f)
+            if orientation.get("hash"):
+                fhash = orientation["hash"]
+            if orientation.get("changed") and cached_before_orientation:
+                self.manifest.record(
+                    fhash, self.api.model_id, self.resolution,
+                    cached_before_orientation.get("name") or "Other",
+                    cached_before_orientation.get("group") or "Other")
+                self.manifest.save()
             if fhash and not self.reprocess:
-                cached = self.manifest.seen(fhash, self.api.model_id, self.resolution)
+                cached = (self.manifest.seen(
+                    fhash, self.api.model_id, self.resolution)
+                          or cached_before_orientation)
                 if cached:
                     self.stats["skipped_cached"] += 1
                     self.log(f"    = {self._redact(f.name)}: already processed "
@@ -6934,6 +7681,7 @@ class Engine:
                     new_path = unique_path(worker_dir, safe_stem(cname), f.suffix)
                     try:
                         f.rename(new_path)
+                        self._orientation_move_path(f, new_path)
                         renamed_records.append({"path": new_path, "name": cname,
                                                 "group": cgroup, "original": f.name,
                                                 "imgs": [], "text": ""})
@@ -7080,6 +7828,10 @@ class Engine:
                                                 page_idxs=core_page_idxs)
             if new_hash:
                 fhash = new_hash
+            # Orientation decisions are local-only in v1.3.1. Never let the
+            # paid classifier's incidental fields rotate this parent or its
+            # split children.
+            self._consume_rotation_instructions(result)
 
             # SHARED apply path (live + batch): resolve unknowns (asking the
             # user in live mode), name, rename, log and record for the 2nd pass.
@@ -7207,13 +7959,12 @@ class Engine:
     def _maybe_split_bundle(self, worker_dir: Path, f: Path, result: dict,
                             vocab: str, records: list, *, interactive: bool,
                             default_source: str, unknown_queue, depth: int):
-        """Split a confidently verified multi-document file before filing it.
+        """Split a confidently verified short multi-document file before filing.
 
-        Short files use the classification call's full `documents` page map,
-        so there is no extra boundary call. Long files use an all-page,
-        overlapping low-resolution scan and then independently classify every
-        proposed child in a temporary directory. Either route failing a gate
-        leaves the original whole; a cut is never inferred from a sample.
+        Files with no more than MAX_SEG_PAGES useful pages use the single
+        classification call's full `documents` page map.  Long files retain the
+        v1.2 bounded sample and are never scanned or child-classified
+        automatically; explicit sampled bundle evidence only creates a flag.
 
         Returns the updated vocabulary block when the file WAS split, or None
         when it is a normal single document."""
@@ -7228,33 +7979,12 @@ class Engine:
         inks = page_ink_fractions(f)
         seg_idxs, ghosts, full_view = segmentation_pages(f, total, inks)
         if not full_view:
-            # The ordinary classifier only saw a three-page sample. Scan every
-            # page at low resolution, then classify the proposed children in a
-            # temporary directory before mutating the real file. This replaces
-            # the old "flag every long file and stop" behaviour.
-            label = self._redact(f.name)
-            self.log(f"    · {label}: autonomous long-file bundle scan "
-                     f"({total} pages)")
-            try:
-                starts = detect_long_bundle_starts(
-                    self.api, f, emit_cost=self._emit_cost, log=self.log)
-            except (StopRequested, CreditExhausted):
-                raise
-            except Exception as e:
+            if _bundle_prone(result):
                 self._flag_possible_bundle(
                     worker_dir, f, total,
-                    f"automatic boundary scan failed: {str(e)[:80]}")
-                return None
-            if not starts:
-                return None
-            plan = self._confirm_long_bundle_plan(f, starts, vocab, total)
-            if not plan:
-                self._flag_possible_bundle(
-                    worker_dir, f, total,
-                    "boundary proposal was not independently confirmed")
-                return None
-            self.log("      independent child classifications confirmed: "
-                     + " -> ".join(s["type"] for s in plan))
+                    "sampled evidence suggests a possible bundle; long file "
+                    "left intact")
+            return None
         else:
             plan = plan_segments(self.kb, result, seg_idxs, ghosts, total)
             if not plan:
@@ -7268,35 +7998,8 @@ class Engine:
                 return None
 
         label = self._redact(f.name)
-        # ---- per-page rotation to bake into the parts -------------------
-        # The free text-layer check wins where it speaks (it is exact); the
-        # model's per-page report covers the scans it cannot read. Applying it
-        # to the CHILDREN is what makes split documents open upright - the old
-        # path rotated the parent, which was then archived, and re-classified
-        # each part from scratch to rediscover the same rotation.
-        rot = {}
-        rots = result.get("rotations")
-        if full_view and isinstance(rots, list) and len(rots) == len(seg_idxs):
-            for i, d in zip(seg_idxs, rots):
-                try:
-                    d = int(float(d or 0))
-                except Exception:
-                    continue
-                if d in (90, 180, 270):
-                    rot[i] = d
-        for seg in plan:
-            rot.update(seg.get("rotations") or {})
-        rot.update(detect_pdf_page_text_rotations(f) or {})
-        # A ghost page was never shown to the model, so it has no correction of
-        # its own - but it is the back of the page before it and is stored the
-        # same way up. Give it that page's turn, or a split child ends up half
-        # upright and half sideways.
-        carry = 0
-        for i in range(total):
-            if i in rot:
-                carry = rot[i]
-            elif i in ghosts and carry:
-                rot[i] = carry
+        # The local all-page preflight has already made the only permitted
+        # orientation decision. Splitting copies those parent bytes verbatim.
 
         # ---- write the parts, then archive the original (never deleted) --
         parts = []
@@ -7309,10 +8012,6 @@ class Engine:
                                            f"{f.stem} [doc {i}]", f.suffix)
                     w = fitz.open()
                     w.insert_pdf(src, from_page=a, to_page=b)
-                    for k, src_idx in enumerate(range(a, b + 1)):
-                        deg = rot.get(src_idx)
-                        if deg and k < len(w):
-                            w[k].set_rotation((w[k].rotation + deg) % 360)
                     w.save(str(out_path))
                     w.close()
                     parts.append(out_path)
@@ -7342,6 +8041,10 @@ class Engine:
                      f"left intact.")
             return None
 
+        self._inherit_split_orientation(f, parts, plan)
+        orientation_state = getattr(self, "orientation_state", None)
+        if orientation_state is not None:
+            orientation_state.move_path(f, archived)
         self.stats["bundles_split"] = self.stats.get("bundles_split", 0) + 1
         self.log(f"    SPLIT {label}: contained {len(plan)} documents "
                  + ", ".join(f"p{s['pages'][0] + 1}-{s['pages'][-1] + 1} "
@@ -7427,9 +8130,10 @@ class Engine:
                                        dialog unless Auto-Other is on; may define
                                        a new vocabulary type; may raise
                                        StopRequested if the user stops.
-          interactive=False (batch) : an unmatched doc is auto-filed as
-                                       'Other - Unknown' and, if unknown_queue is
-                                       given, queued for an optional review pass.
+          interactive=False (batch) : a confident specific `other_label`/guess
+                                       becomes 'Other - <description>'; only a
+                                       genuinely unresolved follow-up result is
+                                       filed as 'Other - Unknown'.
 
         The manifest is recorded ONLY here, at the moment a result is applied, so
         a crash before this point never marks a file as done.
@@ -7475,6 +8179,7 @@ class Engine:
                 self.stats["unknown"] += 1
                 if decision == "Other":
                     name, group = "Other", "Other"
+                    other_label = new_name or other_label or guess
                 else:
                     name, group = new_name, "Important"
                 self.log(f"      -> classified as {decision}: \"{name}\"")
@@ -7487,6 +8192,8 @@ class Engine:
                 # prompt). The vocabulary only grows when YOU define an unknown.
                 if not other_label:
                     other_label = guess   # fall back to the AI's guess
+                if not meaningful_other_label({"other_label": other_label}):
+                    other_label = "Unknown"
                 self.stats["unknown"] += 1
                 name, group = "Other", "Other"
                 source = "auto-other"
@@ -7494,18 +8201,30 @@ class Engine:
                          f"-> auto-filed as Other "
                          f"({other_label or 'unlabelled'})")
             else:
-                # ---- BATCH: auto-file as 'Other - Unknown' + queue for review --
+                # ---- BATCH: preserve a confident descriptive Other answer. --
+                # The primary batch's other_label/guess is already a useful
+                # identification.  Do not replace it with Unknown or add it to
+                # the persistent workbook.  Only a generic/low-confidence
+                # follow-up result reaches the unresolved branch.
                 self.stats["unknown"] += 1
                 name, group = "Other", "Other"
-                other_label = "Unknown"
-                source = "batch-auto-other"
-                self.log(f"    ? {f.name}: not matched (conf {conf}) "
-                         f"-> filed as 'Other - Unknown' (queued for review)")
+                specific = meaningful_other_label(result)
+                if _conf_int(result) >= AUTO_REVIEW_LABEL_CONF and specific:
+                    other_label = specific
+                    source = "batch-descriptive-other"
+                    self.log(f"    ? {f.name}: not matched (conf {conf}) "
+                             f"-> filed as '{other_name(other_label)}'")
+                else:
+                    other_label = "Unknown"
+                    source = "batch-auto-other"
+                    self.log(f"    ? {f.name}: not matched (conf {conf}) "
+                             f"-> filed as 'Other - Unknown'")
 
         # OTHER group is named "Other - <descriptor>". A document matched to a
         # CONTROLLED Other-tab name (e.g. 'CoS Summary') uses that name as the
         # descriptor, so recurring Other types get one consistent filename;
-        # otherwise the AI's concise label is used. Falls back to plain "Other".
+        # otherwise the AI's concise label is used. Unresolved values retain the
+        # explicit 'Other - Unknown' prefix.
         if group == "Other":
             if matched and name and name != "Other":
                 name = other_name(name)
@@ -7521,6 +8240,9 @@ class Engine:
             self.log(f"    ! rename failed for {original}: {e}")
             self.stats["errors"] += 1
             return vocab
+        orientation_state = getattr(self, "orientation_state", None)
+        if orientation_state is not None:
+            orientation_state.move_path(f, new_path)
         self.stats["renamed"] += 1
         self.rename_log.record(self.care_home, worker_dir.name, original,
                                new_path.name, group, source)
@@ -7545,6 +8267,24 @@ class Engine:
         return vocab
 
     # ---- shared worker tail: dedupe -> second pass -> organise ----
+    def _records_from_manifest(self, worker_dir: Path):
+        """Rebuild finishing inputs after an interrupted batch-apply restart."""
+        records = []
+        for path in list_worker_docs(worker_dir):
+            try:
+                fhash = file_hash(path)
+            except Exception:
+                continue
+            cached = self.manifest.seen(
+                fhash, self.api.model_id, self.resolution)
+            if not cached:
+                continue
+            records.append({"path": path,
+                            "name": cached.get("name") or path.stem,
+                            "group": cached.get("group") or "Other",
+                            "original": path.name, "imgs": [], "text": ""})
+        return records
+
     def _finish_worker(self, worker_dir: Path, renamed_records: list):
         """Steps 2-4 shared by live and batch modes: remove exact duplicates,
         run the second-pass reviews (dating / ranking / signed checks - these
@@ -7555,6 +8295,7 @@ class Engine:
         #    before the (costly) CoS/contract/RTW analysis runs on them, and
         #    so the survivor is the one that gets any suffix tag.
         self._check_stop()
+        self._phase("deduplicating", "Exact-duplicate review")
         self.log("  [review] scanning for duplicate documents")
         removed = dedup_worker(worker_dir, self.log)
         self.stats["duplicates"] += removed
@@ -7566,13 +8307,17 @@ class Engine:
             self.log("  no duplicates found")
 
         # 3) SECOND PASS - special reviews -------------------------
+        self._phase("ranking", "Dating, signed checks and ranking")
         self._second_pass(worker_dir, renamed_records)
 
         # 4) ORGANISE into two sub-folders: 'Overwrite Documents' (only the
         #    OVERWRITE_TYPES, loose, for Stage 3's individual overwrite flow)
         #    and 'Bulk' (everything else, split into Batch NN folders of up to
         #    30 for bulk upload).
-        org = organize_worker(worker_dir, log=self.log)
+        self._phase("organising", "Organising processed files")
+        org = organize_worker(
+            worker_dir, log=self.log,
+            on_move=self._orientation_move_path)
         self.stats["overwrite"] = self.stats.get("overwrite", 0) + org["overwrite"]
         self.stats["bulk"] = self.stats.get("bulk", 0) + org["bulk"]
         self.log(f"  organised: {org['overwrite']} -> 'Overwrite Documents', "
@@ -7596,16 +8341,23 @@ class Engine:
     # classification request live mode would send for every eligible document,
     # and submit them all as one or more Message Batches. State is written to
     # a hidden file in the care-home folder so the app can be closed.
-    # Phase B (run_batch_apply): poll the batch(es); when ended, download the
-    # results and apply each one through the SAME code path as live mode
-    # (_apply_classification), then run dedupe / second pass (LIVE, standard
-    # price) / organise per worker. The manifest is only updated when a result
-    # is APPLIED, so a crash between download and apply never marks a file done.
+    # Phase B (run_batch_apply): poll the primary batch(es), settle confident
+    # controlled/descriptive-Other answers, and send only genuinely unresolved
+    # documents to one discounted follow-up batch.  Application, live finishing
+    # and worker movement wait until that follow-up ends.  The manifest is only
+    # updated when a result is APPLIED.
     # ================================================================
 
     # keep each submitted batch comfortably inside the API's 256 MB / 100k caps
     BATCH_SUBMIT_MAX_BYTES = 100 * 1024 * 1024   # per-chunk memory/network cap
     BATCH_SUBMIT_MAX_REQUESTS = 10_000
+    FOLLOWUP_CHUNK_TARGET_BYTES = 90 * 1024 * 1024
+    FOLLOWUP_LARGE_MIN_REQUESTS = 25
+    FOLLOWUP_LARGE_RATIO = 0.25
+    PRIMARY_RECOVERY_CHUNK_BYTES = 40 * 1024 * 1024
+    PRIMARY_RECOVERY_TARGET_BYTES = 10 * 1024 * 1024
+    PRIMARY_RECOVERY_GRACE_SECONDS = 15 * 60
+    PRIMARY_RECOVERY_RECHECK_SECONDS = 10
 
     def _batch_skip_file(self, worker_dir: Path, f: Path) -> str:
         """Apply live mode's pre-API skip rules to one file. Returns a reason
@@ -7628,6 +8380,378 @@ class Engine:
             return "content/extension mismatch"
         return ""
 
+    @staticmethod
+    def _primary_time(value):
+        """Provider times are UTC; old local state timestamps have no offset."""
+        if not value:
+            raise RuntimeError("Submission timestamp is missing")
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.timestamp()
+
+    def _primary_provider_evidence(self, state):
+        """Read-only reconciliation. An incomplete/uncertain listing fails closed."""
+        marker = state.data.get("primary_submission") or {}
+        ambiguous = marker.get("status") in ("submission_started", "ambiguous")
+        expected = set(marker.get("request_identities") or []) if ambiguous else set()
+        known = set(state.batch_ids())
+        accepted, matched = set(), []
+        for batch in state.data.get("batches", []):
+            ids = batch.get("request_ids")
+            if ids is None:
+                remote = self.api.get_batch(batch["id"])
+                if remote.get("processing_status") != "ended" or not remote.get("results_url"):
+                    raise RuntimeError("An earlier accepted batch has not finished; check again later")
+                rows = list(self.api.batch_results(remote["results_url"]))
+                ids = [row.get("custom_id") for row in rows]
+                if (len(ids) != int(batch.get("n", -1)) or len(set(ids)) != len(ids)
+                        or any(not cid or cid not in state.data.get("requests", {}) for cid in ids)):
+                    raise RuntimeError("Earlier batch results do not exactly match the saved requests")
+            if (not isinstance(ids, list) or len(ids) != int(batch.get("n", -1))
+                    or len(set(ids)) != len(ids)
+                    or any(not cid or cid not in state.data.get("requests", {}) for cid in ids)):
+                raise RuntimeError("Saved accepted-batch identities are incomplete or invalid")
+            if accepted.intersection(ids):
+                raise RuntimeError("Accepted primary batches overlap; independent review is required")
+            accepted.update(ids)
+        if not ambiguous:
+            return {"accepted_ids": sorted(accepted), "matched_batches": [],
+                    "checked_ts": datetime.datetime.now().isoformat(timespec="seconds")}
+        if not expected or expected.intersection(accepted):
+            raise RuntimeError("The uncertain chunk's request identities are missing or overlap accepted work")
+        started = self._primary_time(marker.get("started_ts"))
+        window_start, window_end = started - 600, started + 600
+        after_id, seen, covered = "", set(), False
+        candidates = []
+        for _page in range(1000):
+            self._check_stop()
+            page = self.api.list_batches(after_id=after_id, limit=100)
+            rows = page.get("data")
+            if not isinstance(rows, list) or not isinstance(page.get("has_more"), bool):
+                raise RuntimeError("Provider batch listing was incomplete or malformed")
+            timestamps = []
+            for row in rows:
+                bid = str(row.get("id") or "")
+                if not bid or bid in seen:
+                    raise RuntimeError("Provider pagination repeated or omitted a batch identity")
+                seen.add(bid)
+                created = self._primary_time(row.get("created_at"))
+                timestamps.append(created)
+                if window_start <= created <= window_end and bid not in known:
+                    candidates.append(row)
+            if timestamps != sorted(timestamps, reverse=True):
+                raise RuntimeError("Provider batch listing was not newest-first")
+            if not page["has_more"] or (timestamps and min(timestamps) < window_start):
+                covered = True
+                break
+            cursor = str(page.get("last_id") or (rows[-1].get("id") if rows else ""))
+            if not cursor or cursor == after_id:
+                raise RuntimeError("Provider batch listing did not provide a usable next page")
+            after_id = cursor
+        if not covered:
+            raise RuntimeError("Provider listing did not cover the original submission window")
+        for candidate in candidates:
+            remote = self.api.get_batch(candidate["id"])
+            if remote.get("processing_status") != "ended" or not remote.get("results_url"):
+                raise RuntimeError("A possible matching provider batch is still running or has no results; wait before recovery")
+            rows = list(self.api.batch_results(remote["results_url"]))
+            ids = [row.get("custom_id") for row in rows]
+            counts = remote.get("request_counts") or {}
+            total = sum(int(counts.get(key, 0) or 0) for key in (
+                "processing", "succeeded", "errored", "canceled", "expired"))
+            if not ids or len(set(ids)) != len(ids) or any(not cid for cid in ids) or total != len(ids):
+                raise RuntimeError("A candidate batch's results are incomplete; no resubmission is safe")
+            if set(ids) == expected:
+                matched.append({"id": remote["id"], "n": len(ids),
+                                "status_at_submit": "ended", "request_ids": ids})
+            elif expected.intersection(ids):
+                raise RuntimeError("A provider batch only partially overlaps the uncertain chunk; independent review is required")
+        if len(matched) > 1:
+            raise RuntimeError("More than one provider batch matches; possible duplicate submission needs review")
+        if matched:
+            accepted.update(expected)
+        return {"accepted_ids": sorted(accepted), "matched_batches": matched,
+                "no_match": not matched, "attempt_started": started,
+                "checked_ts": datetime.datetime.now().isoformat(timespec="seconds")}
+
+    def _primary_recovery_inventory(self, state):
+        """Validate saved fingerprints and reconstruct a legacy tail without prep."""
+        saved = state.data.get("primary_inventory")
+        requests = state.data.get("requests") or {}
+        inventory = {cid: dict(meta) for cid, meta in
+                     (saved if saved is not None else requests).items()}
+        root = self.dir.resolve()
+        paths = {}
+        for cid, meta in inventory.items():
+            path = Path(meta["path"])
+            if (not path.is_file() or path.is_symlink() or root not in path.resolve().parents
+                    or is_cloud_only_placeholder(path) or file_hash(path) != meta.get("fhash")):
+                raise RuntimeError("A saved source document is missing, moved or changed; restore or review it before recovery")
+            key = os.path.normcase(str(path.resolve()))
+            if key in paths:
+                raise RuntimeError("Saved inventory contains duplicate paths")
+            paths[key] = cid
+        if saved is not None:
+            return inventory, 0
+        # v1.3.2 persisted only files rendered before the failed POST. Discover
+        # the remaining original files, preserving existing path-specific IDs.
+        cutoff = self._primary_time((state.data.get("primary_submission") or {}).get("started_ts")
+                                    or state.data.get("submitted_ts")) + 2
+        settings = state.data.get("settings") or {}
+        max_workers = int(settings.get("max_workers", self.max_workers))
+        max_files = int(settings.get("max_files", self.max_files))
+        max_file_mb = float(settings.get("max_file_mb", self.max_file_mb))
+        reprocess = bool(settings.get("reprocess", self.reprocess))
+        workers = worker_dirs_in(self.dir)
+        if max_workers > 0:
+            workers = workers[:max_workers]
+        discovered = []
+        for worker in workers:
+            if self.move_mode and self.move_dest and (self.move_dest / worker.name).exists():
+                if any(meta.get("worker_dir") == str(worker) for meta in requests.values()):
+                    raise RuntimeError("A previously submitted worker now exists in the processed destination; review before recovery")
+                continue
+            # Do NOT call list_worker_docs: it removes orientation temp files.
+            documents = [p for p in worker.rglob("*") if p.is_file()
+                         and p.suffix.lower() in DOC_EXT and not is_program_file(p)]
+            documents.sort(key=lambda p: natural_key(p.name))
+            for path in documents:
+                self._check_stop()
+                key = os.path.normcase(str(path.resolve()))
+                if key in paths:
+                    discovered.append((paths[key], inventory[paths[key]]))
+                else:
+                    if file_too_big(path, max_file_mb) or is_cloud_only_placeholder(path) or not content_matches_ext(path):
+                        continue
+                    if path.is_symlink() or root not in path.resolve().parents:
+                        raise RuntimeError("Legacy recovery found a source link outside the care-home folder")
+                    digest = file_hash(path)
+                    if not reprocess and self.manifest.seen(digest, self.api.model_id, self.resolution):
+                        continue
+                    stat = path.stat()
+                    if max(stat.st_mtime, stat.st_ctime) > cutoff:
+                        raise RuntimeError("New or modified documents exist after the submission; review the legacy inventory before recovery")
+                    index = 0
+                    while f"{digest[:56]}-{index:03d}" in inventory:
+                        index += 1
+                    cid = f"{digest[:56]}-{index:03d}"
+                    meta = {"path": str(path), "worker": worker.name,
+                            "worker_dir": str(worker), "fhash": digest,
+                            "pages": DocRender.page_count(path)}
+                    inventory[cid] = meta
+                    paths[key] = cid
+                    discovered.append((cid, meta))
+                if max_files > 0 and len(discovered) >= max_files:
+                    break
+            if max_files > 0 and len(discovered) >= max_files:
+                break
+        if not set(requests).issubset({cid for cid, _meta in discovered}):
+            raise RuntimeError("Current folder/worker limits exclude previously submitted documents")
+        return dict(discovered), len(discovered) - len(requests)
+
+    def _resume_primary_inventory(self, state, inventory, accepted):
+        """Submit only proven-unsubmitted IDs; every POST has a durable marker."""
+        vocab = state.data.get("primary_vocabulary") or self.kb.vocabulary_block()
+        remaining = [cid for cid in inventory if cid not in accepted]
+        chunk, chunk_ids = [], []
+        envelope_bytes = len(json.dumps({"requests": []}).encode("utf-8"))
+        chunk_bytes = envelope_bytes
+        chunk_no = len(state.data.get("primary_chunks") or [])
+        expected_disk = json.loads(json.dumps(state.data))
+
+        def submit():
+            nonlocal chunk_no, expected_disk, chunk_bytes
+            if not chunk:
+                return
+            self._check_stop()
+            for cid in chunk_ids:
+                meta = inventory[cid]
+                path = Path(meta["path"])
+                if not path.is_file() or file_hash(path) != meta["fhash"]:
+                    raise RuntimeError("Source changed while preparing recovery; no request sent for this chunk")
+            wire_bytes = len(json.dumps({"requests": chunk}).encode("utf-8"))
+            if wire_bytes > self.PRIMARY_RECOVERY_CHUNK_BYTES:
+                raise RuntimeError("One rendered request exceeds the recovery upload limit; reduce that document separately")
+            if BatchState(self.dir).data != expected_disk:
+                raise RuntimeError("Another process changed the batch state while preparing recovery; no request sent for this chunk")
+            chunk_no += 1
+            self.set_status(f"Uploading recovery chunk {chunk_no}: {len(chunk)} document(s), "
+                            f"{wire_bytes / 1048576:.1f} MiB…")
+            marker = {"status": "submission_started", "submission_started": True,
+                      "planned_chunk_id": f"primary-recovery-{chunk_no:04d}",
+                      "request_identities": list(chunk_ids),
+                      "attempt_id": hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:24],
+                      "started_ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                      "wire_bytes": wire_bytes}
+            state.data["primary_submission"] = marker
+            state.data["phase"] = "primary_submission_started"
+            if not state.save():
+                raise RuntimeError("Recovery submission marker could not be saved; no request sent")
+            try:
+                created = self.api.submit_batch(list(chunk))
+                bid = str(created.get("id") or "")
+                if not bid:
+                    raise RuntimeError("Provider returned no batch ID")
+            except Exception:
+                marker["status"] = "ambiguous"
+                state.data["phase"] = "primary_submission_ambiguous"
+                state.save()
+                raise
+            state.add_batch(bid, len(chunk), created.get("processing_status", ""),
+                            request_ids=chunk_ids)
+            marker.update(status="accepted", batch_id=bid)
+            state.data.setdefault("primary_chunks", []).append(dict(marker))
+            state.data["phase"] = "primary_preparing"
+            if not state.save():
+                raise RuntimeError("Accepted recovery batch ID could not be saved; stop and reconcile before retrying")
+            expected_disk = json.loads(json.dumps(state.data))
+            accepted.update(chunk_ids)
+            self.log(f"  > recovered submission {bid} with {len(chunk)} request(s)")
+            chunk.clear()
+            chunk_ids.clear()
+            chunk_bytes = envelope_bytes
+
+        for index, cid in enumerate(remaining, 1):
+            self._check_stop()
+            meta = inventory[cid]
+            path = Path(meta["path"])
+            self.set_status(f"Preparing remaining primary document {index}/{len(remaining)}")
+            self._phase_progress("recovery", index - 1, len(remaining))
+            self.set_progress(index - 1, len(remaining))
+            imgs, text, page_idxs, total_pages, segment_view = self._batch_classification_view(path)
+            if not imgs and not text:
+                raise RuntimeError("A remaining document cannot be rendered; review it before recovery")
+            system, blocks, mt = self.api.classify_payload(vocab, imgs, text,
+                page_idxs=page_idxs, total_pages=total_pages, segment=segment_view)
+            req = self.api.build_batch_request(cid, system, blocks, mt)
+            req_size = len(json.dumps(req).encode("utf-8"))
+            if req_size + envelope_bytes > self.PRIMARY_RECOVERY_CHUNK_BYTES:
+                raise RuntimeError("One rendered request exceeds the 40 MiB recovery upload limit")
+            # Aim for short network writes. A single request may exceed the
+            # target (without lowering document quality), but never the hard cap.
+            if chunk and (chunk_bytes + req_size + 2 > self.PRIMARY_RECOVERY_TARGET_BYTES
+                          or len(chunk) >= self.BATCH_SUBMIT_MAX_REQUESTS):
+                submit()
+            chunk_bytes += req_size + (2 if chunk else 0)
+            chunk.append(req)
+            chunk_ids.append(cid)
+        submit()
+        if BatchState(self.dir).data != expected_disk:
+            raise RuntimeError("Batch state changed before marking primary submission complete")
+        state.data["primary_submission_complete"] = True
+        state.data["phase"] = "primary_pending"
+        if not state.save():
+            raise RuntimeError("Primary completion could not be saved; resume recovery before applying")
+
+    @_care_home_writer_operation
+    def recover_primary_submission(self, allow_resubmit=False):
+        """Assess read-only, or explicitly authorize snapshot + reconciled resume.
+
+        False returns status/message/remaining without file writes or callbacks.
+        True calls on_done on every outcome, never applies results automatically.
+        """
+        try:
+            state = BatchState(self.dir)
+            if not state.exists() or state.data.get("applied") or state.data.get("followup"):
+                raise RuntimeError("This is not an interrupted primary submission")
+            self.api = self._api_for_model(state.data.get("model_id") or self.api.model_id)
+            self.resolution = float(state.data.get("resolution", self.resolution))
+            settings = state.data.get("settings") or {}
+            for name in ("bundle_split", "adaptive_pages", "post_run_audit"):
+                if name in settings:
+                    setattr(self, name, bool(settings[name]))
+            budgets = [value for value in (self.max_budget_gbp,
+                       float(settings.get("max_budget_gbp", 0) or 0)) if value > 0]
+            budget = min(budgets) if budgets else 0
+            inventory, tail_count = self._primary_recovery_inventory(state)
+            evidence = self._primary_provider_evidence(state)
+            accepted = set(evidence["accepted_ids"])
+            if not accepted.issubset(inventory):
+                raise RuntimeError("Accepted provider results contain IDs outside the source inventory")
+            remaining = len(set(inventory) - accepted)
+            vocab = state.data.get("primary_vocabulary") or self.kb.vocabulary_block()
+            estimate = estimate_pipeline_costs_gbp(len(inventory), self.api.model_id,
+                state.data.get("followup_model_id") or self.api.model_id,
+                self.resolution, vocab, batch=True, include_audit=self.post_run_audit)
+            if budget and estimate["gbp"] > budget:
+                raise RuntimeError(f"Full recovered pipeline estimate £{estimate['gbp']:.2f} exceeds the £{budget:.2f} budget")
+            if evidence.get("no_match") and time.time() - evidence["attempt_started"] < self.PRIMARY_RECOVERY_GRACE_SECONDS:
+                raise RuntimeError("The uncertain upload is too recent; wait at least 15 minutes before checking recovery")
+            report = {"status": "needs_authorization", "remaining": remaining,
+                      "accepted": len(accepted), "legacy_tail": tail_count,
+                      "estimated_remaining_gbp": round(estimate["primary_gbp"] * remaining / max(1, len(inventory)), 4),
+                      "message": f"Verified {len(accepted)} accepted request(s); {remaining} remain. "
+                                 f"Reconstructed {tail_count} legacy tail document(s) without changing files. "
+                                 "Recovery backs up the state and submits only the verified remaining IDs."}
+            if not allow_resubmit:
+                return report
+            if evidence.get("no_match"):
+                self.set_status("Rechecking provider before authorized recovery…")
+                time.sleep(self.PRIMARY_RECOVERY_RECHECK_SECONDS)
+                self._check_stop()
+                evidence = self._primary_provider_evidence(state)
+                accepted = set(evidence["accepted_ids"])
+            # Revalidate every source after the provider check and before state mutation.
+            verified_inventory, _tail_count = self._primary_recovery_inventory(state)
+            if verified_inventory != inventory:
+                raise RuntimeError("Source inventory changed during recovery checks; nothing submitted")
+            if BatchState(self.dir).data != state.data:
+                raise RuntimeError("Another process changed the batch state; close that operation before recovery")
+            backup = state.recovery_snapshot()
+            state.data.setdefault("recovery_history", []).append({
+                "snapshot": str(backup), "evidence": evidence,
+                "authorized_ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                "legacy_tail_count": tail_count})
+            for batch in evidence["matched_batches"]:
+                state.data.setdefault("batches", []).append(batch)
+            state.data["primary_inventory"] = inventory
+            state.data["requests"] = {cid: dict(meta) for cid, meta in inventory.items()}
+            state.data["primary_vocabulary"] = vocab
+            state.data["primary_submission_complete"] = False
+            state.data["primary_submission"] = {"status": "reconciled"}
+            state.data["phase"] = "primary_preparing"
+            state.data["est_gbp"] = round(estimate["gbp"], 4)
+            if not state.save():
+                raise RuntimeError("Reconciled state could not be saved; no remaining requests submitted")
+            self._resume_primary_inventory(state, inventory, accepted)
+            self.on_done(self.stats, f"batch_submitted:{len(inventory)}|{len(state.batch_ids())}|"
+                         f"{estimate['primary_gbp']:.2f}|{estimate['gbp']:.2f}")
+            report.update(status="submitted", message="Primary submission recovered; use Check batch status to apply when ready.",
+                          remaining=0, snapshot=str(backup))
+            return report
+        except Exception as exc:
+            message = str(exc)
+            self.log(f"Primary recovery blocked: {message}")
+            if allow_resubmit:
+                self.on_done(self.stats, "batch_recovery_blocked:" + message)
+            return {"status": "blocked", "message": message, "remaining": 0}
+
+    def _batch_classification_view(self, path: Path):
+        """Render the same bounded classification view used by live mode.
+
+        A short PDF that can be shown in full keeps the one-request documents
+        map used for safe bundle splitting.  A long/non-full-view PDF keeps the
+        ordinary first-two-plus-last sample and never enters the long scanner.
+        Returns (images, text, page_indices, total_pages, segment_view).
+        """
+        total = DocRender.page_count(path)
+        page_idxs = _audit_pages_for(path)
+        segment_view = False
+        pages = "all"
+        max_pages = None
+        if (getattr(self, "bundle_split", True)
+                and path.suffix.lower() in PDF_EXT
+                and total > 1):
+            seg_idxs, _ghosts, full_view = segmentation_pages(path, total)
+            if full_view:
+                page_idxs = seg_idxs
+                segment_view = True
+                pages = seg_idxs
+                max_pages = MAX_SEG_PAGES
+        imgs, text = DocRender.render(
+            path, zoom=self.resolution, pages=pages, max_pages=max_pages)
+        return imgs, text, page_idxs, total, segment_view
+
+    @_care_home_writer_operation
     def run_batch_submit(self):
         """Phase A: collect & submit. Runs on the background thread like run().
         Finishes by calling on_done(stats, 'batch_submitted:<n>|<m>|<est£>') or
@@ -7655,6 +8779,7 @@ class Engine:
             # ---- local prep: convert to PDF + flatten (no API) ----
             for idx, w in enumerate(workers, 1):
                 self._check_stop()
+                self._phase_progress("preparing", idx - 1, total)
                 self.set_progress(idx - 1, total)
                 # move mode: a worker already in the destination is done
                 if self.move_mode and (self.move_dest / w.name).exists():
@@ -7690,8 +8815,24 @@ class Engine:
                         self.stats["errors"] += 1
                         self.log(f"    ! could not hash {self._redact(f.name)}: {e}")
                         continue
-                    if fhash and not self.reprocess and \
-                            self.manifest.seen(fhash, self.api.model_id, self.resolution):
+                    cached_before_orientation = (
+                        self.manifest.seen(
+                            fhash, self.api.model_id, self.resolution)
+                        if fhash and not self.reprocess else None)
+                    orientation = self._orientation_preflight(f)
+                    if orientation.get("hash"):
+                        fhash = orientation["hash"]
+                    if orientation.get("changed") \
+                            and cached_before_orientation:
+                        self.manifest.record(
+                            fhash, self.api.model_id, self.resolution,
+                            cached_before_orientation.get("name") or "Other",
+                            cached_before_orientation.get("group") or "Other")
+                        self.manifest.save()
+                    if fhash and not self.reprocess and (
+                            self.manifest.seen(
+                                fhash, self.api.model_id, self.resolution)
+                            or cached_before_orientation):
                         self.stats["skipped_cached"] += 1
                         self.log(f"    = {self._redact(f.name)}: already processed "
                                  f"(cached - will be applied without the API)")
@@ -7712,11 +8853,11 @@ class Engine:
 
             # ---- BUDGET GATE (submit time - a batch cannot be stopped later) --
             vocab = self.kb.vocabulary_block()
-            est = estimate_run_cost_gbp(
-                len(eligible), self.api.model_id, self.resolution,
-                adaptive=False,   # batch sends full pages; no live triage
-                vocab_block=vocab, batch=True, include_second_pass=False,
-                cached_prefix=False)
+            followup_api = self.escalation_api or self.api
+            est = estimate_pipeline_costs_gbp(
+                len(eligible), self.api.model_id, followup_api.model_id,
+                self.resolution, vocab, batch=True,
+                include_audit=self.post_run_audit)
             if self.max_budget_gbp > 0 and est["gbp"] > self.max_budget_gbp:
                 over = est["gbp"] - self.max_budget_gbp
                 self.log(f"\n*** NOT SUBMITTED: estimated batch cost "
@@ -7730,14 +8871,42 @@ class Engine:
             # ---- initialise durable state BEFORE anything is submitted ----
             state.init(self.care_home, self.api.model_id, self.resolution,
                        {"adaptive_pages": self.adaptive_pages,
-                        "convert_pdf": self.convert_pdf})
+                         "convert_pdf": self.convert_pdf,
+                         "post_run_audit": self.post_run_audit,
+                         "orientation_mode": self.orientation_mode,
+                         "bundle_split": self.bundle_split,
+                         "max_workers": self.max_workers,
+                         "max_files": self.max_files,
+                         "max_file_mb": self.max_file_mb,
+                         "max_budget_gbp": self.max_budget_gbp,
+                         "reprocess": self.reprocess,
+                         "move_mode": self.move_mode,
+                         "move_dest": str(self.move_dest) if self.move_dest else ""})
+            inventory_counts = {}
+            inventory = {}
+            for worker, path, digest, pages in eligible:
+                suffix = inventory_counts.get(digest, 0)
+                inventory_counts[digest] = suffix + 1
+                custom_id = f"{digest[:56]}-{suffix:03d}"
+                inventory[custom_id] = {
+                    "path": str(path), "worker": worker.name,
+                    "worker_dir": str(worker), "fhash": digest, "pages": int(pages)}
+            state.data["primary_inventory"] = inventory
+            state.data["primary_vocabulary"] = vocab
+            state.data["primary_submission_complete"] = False
+            state.data["primary_chunks"] = []
             state.data["est_gbp"] = round(est["gbp"], 4)
+            state.data["est_primary_gbp"] = round(est["primary_gbp"], 4)
+            state.data["est_finishing_gbp"] = round(est["finishing_gbp"], 4)
+            state.data["est_followup_reserve_gbp"] = round(
+                est["followup_reserve_gbp"], 4)
+            state.data["est_audit_gbp"] = round(est["audit_gbp"], 4)
+            state.data["followup_model_id"] = followup_api.model_id
             state.data["est_input_tokens"] = est["input_tokens"]
             state.data["est_output_tokens"] = est["output_tokens"]
             # the state file is the only durable record of what was submitted:
             # refuse to submit anything if it cannot be written
-            state.save()
-            if not state.path.exists():
+            if not state.save() or not state.path.exists():
                 self.log("*** NOT SUBMITTED: could not write the batch state "
                          f"file ({state.path}). Check the folder is writable "
                          "and not read-only/cloud-locked. ***")
@@ -7749,27 +8918,78 @@ class Engine:
             chunk, chunk_bytes = [], 0
             hash_counts = {}
             n_built = 0
+            chunk_number = 0
 
             def _submit_chunk():
+                nonlocal chunk_number
                 if not chunk:
                     return
+                wire_bytes = len(json.dumps({"requests": chunk}).encode("utf-8"))
+                if wire_bytes > self.BATCH_SUBMIT_MAX_BYTES:
+                    raise RuntimeError("Rendered primary chunk exceeds the 100 MiB upload guard; "
+                                       "recover with smaller chunks before applying")
                 self.set_status(f"Submitting a batch of {len(chunk)} request(s)…")
-                created = self.api.submit_batch(chunk)
-                bid = created.get("id", "")
+                chunk_number += 1
+                chunk_id = f"primary-{chunk_number:04d}"
+                identities = [str(req.get("custom_id") or "")
+                              for req in chunk]
+                attempt_id = hashlib.sha256(
+                    (f"{time.time_ns()}:{os.getpid()}:{chunk_id}:"
+                     + "|".join(identities)).encode("utf-8")).hexdigest()[:24]
+                state.data["primary_submission"] = {
+                    "status": "submission_started",
+                    "submission_started": True,
+                    "planned_chunk_id": chunk_id,
+                    "request_identities": identities,
+                    "attempt_id": attempt_id,
+                    "started_ts": datetime.datetime.now().isoformat(
+                        timespec="seconds"),
+                }
+                state.data["phase"] = "primary_submission_started"
+                if not state.save():
+                    raise RuntimeError(
+                        "primary submission marker could not be persisted; "
+                        "no request sent")
+                try:
+                    created = self.api.submit_batch(chunk)
+                    bid = str(created.get("id") or "").strip()
+                    if not bid:
+                        raise APIError(
+                            0, "primary batch submission returned no batch id")
+                except Exception:
+                    marker = state.data["primary_submission"]
+                    marker["status"] = "ambiguous"
+                    marker["ambiguous_ts"] = datetime.datetime.now().isoformat(
+                        timespec="seconds")
+                    state.data["phase"] = "primary_submission_ambiguous"
+                    state.save()
+                    raise
                 state.add_batch(bid, len(chunk),
-                                created.get("processing_status", ""))
-                state.save()
+                                created.get("processing_status", ""),
+                                request_ids=identities)
+                state.data["primary_submission"].update({
+                    "status": "accepted", "batch_id": bid,
+                    "accepted_ts": datetime.datetime.now().isoformat(
+                        timespec="seconds")})
+                state.data["phase"] = "primary_pending"
+                state.data["primary_chunks"].append(dict(state.data["primary_submission"]))
+                if not state.save():
+                    raise RuntimeError(
+                        "primary batch id could not be persisted; automatic "
+                        "resubmission is blocked by the durable started marker")
                 self.log(f"  > submitted batch {bid} with {len(chunk)} request(s)")
                 self.stats["batches"] += 1
                 chunk.clear()
 
             for i, (w, f, fhash, pages) in enumerate(eligible, 1):
                 self._check_stop()
+                self._phase_progress("batch", n_built, len(eligible))
                 self.set_status(f"Rendering {i}/{len(eligible)}: "
                                 f"{self._redact(f.name)}")
                 if not f.exists():
                     continue
-                imgs, text = DocRender.render(f, zoom=self.resolution, pages="all")
+                imgs, text, page_idxs, total_pages, segment_view = \
+                    self._batch_classification_view(f)
                 self.set_preview(imgs[0] if imgs else None, f.name)
                 if not imgs and not text:
                     self.log(f"    - {self._redact(f.name)}: cannot render - "
@@ -7778,15 +8998,13 @@ class Engine:
                                            "skipped: unrenderable", "")
                     continue
                 system, blocks, mt = self.api.classify_payload(
-                    vocab, imgs, text, page_idxs=_audit_pages_for(f),
-                    total_pages=DocRender.page_count(f))
+                    vocab, imgs, text, page_idxs=page_idxs,
+                    total_pages=total_pages, segment=segment_view)
                 # custom_id: stable, unique, derived from the content hash
                 # (sha-256 hex truncated + a per-hash counter for exact copies).
-                n = hash_counts.get(fhash, 0)
-                hash_counts[fhash] = n + 1
-                cid = f"{fhash[:56]}-{n:03d}"
+                cid = next(cid for cid, meta in inventory.items()
+                           if meta["path"] == str(f))
                 req = self.api.build_batch_request(cid, system, blocks, mt)
-                state.add_request(cid, f, w, fhash, pages)
                 # rough serialized size (b64 data dominates)
                 req_bytes = sum(len(b.get("source", {}).get("data", ""))
                                 for b in blocks if b.get("type") == "image")
@@ -7796,23 +9014,32 @@ class Engine:
                               or len(chunk) >= self.BATCH_SUBMIT_MAX_REQUESTS):
                     _submit_chunk()
                     chunk_bytes = 0
+                state.add_request(cid, f, w, fhash, pages)
                 chunk.append(req)
                 chunk_bytes += req_bytes
                 n_built += 1
             _submit_chunk()
 
+            state.data["phase"] = "primary_pending"
+            state.data["primary_submission_complete"] = True
             state.save()
             self.stats["batch_requests"] = n_built
+            self._phase_progress("batch", n_built, len(eligible))
             self.set_progress(total, total)
             n_batches = len(state.batch_ids())
             self.log(f"\n=== BATCH SUBMITTED: {n_built} document(s) in "
-                     f"{n_batches} batch(es). Estimated cost ~£{est['gbp']:.2f} "
-                     f"(50% batch discount applied). ===")
+                     f"{n_batches} batch(es) ===")
+            self.log(f"  primary batch classification : ~£{est['primary_gbp']:.2f}")
+            self.log(f"  required live finishing      : ~£{est['finishing_gbp']:.2f}")
+            self.log(f"  optional follow-up reserve   : ~£{est['followup_reserve_gbp']:.2f}")
+            self.log(f"  optional accuracy audit      : ~£{est['audit_gbp']:.2f}")
+            self.log(f"  cumulative enabled estimate  : ~£{est['gbp']:.2f}")
             self.log("You can close this app now. Results are usually ready "
                      "within an hour (up to 24h). Re-open the folder and press "
                      "'Check batch status' to fetch and apply them.")
             self.on_done(self.stats,
-                         f"batch_submitted:{n_built}|{n_batches}|{est['gbp']:.2f}")
+                         f"batch_submitted:{n_built}|{n_batches}|"
+                         f"{est['primary_gbp']:.2f}|{est['gbp']:.2f}")
         except CreditExhausted as e:
             self.log(f"\n*** STOPPED: API credit exhausted during submission. "
                      f"{e.detail} ***")
@@ -7834,14 +9061,474 @@ class Engine:
             self.on_done(self.stats, str(e))
 
     # ---- Phase B ----
-    def poll_batches(self, state: "BatchState"):
+    def _api_for_model(self, model_id: str):
+        for candidate in (self.api, self.escalation_api):
+            if candidate is not None and candidate.model_id == model_id:
+                return candidate
+        # The model is persisted in batch state, so a Settings change between
+        # submit and resume cannot silently change the paid follow-up model.
+        return ClaudeAPI(self.api.api_key, model_id)
+
+    def poll_batches(self, state: "BatchState", phase: str = "primary"):
         """Fetch current status for every batch in the state file. Returns a
         list of the raw batch objects (id, processing_status, request_counts,
         results_url...)."""
+        api = (self._api_for_model(
+            (state.data.get("followup") or {}).get("model_id")
+            or state.data.get("followup_model_id") or self.api.model_id)
+            if phase == "followup" else self.api)
         out = []
-        for bid in state.batch_ids():
-            out.append(self.api.get_batch(bid))
+        for bid in state.batch_ids(phase):
+            out.append(api.get_batch(bid))
         return out
+
+    @staticmethod
+    def _batch_counts(batches: list) -> dict:
+        counts = {"processing": 0, "succeeded": 0, "errored": 0,
+                  "canceled": 0, "expired": 0}
+        for batch in batches:
+            rc = batch.get("request_counts", {}) or {}
+            for key in counts:
+                counts[key] += int(rc.get(key, 0) or 0)
+        return counts
+
+    def _download_batch_results(self, api, batches: list) -> dict:
+        results = {}
+        for batch in batches:
+            url = batch.get("results_url")
+            if not url:
+                continue
+            for line in api.batch_results(url):
+                cid = line.get("custom_id")
+                if cid:
+                    results[cid] = line.get("result", {}) or {}
+        return results
+
+    @staticmethod
+    def _parse_batch_result(api, result: dict) -> dict:
+        if (result or {}).get("type") != "succeeded":
+            return {}
+        msg = result.get("message", {}) or {}
+        raw = "\n".join(blk.get("text", "")
+                         for blk in msg.get("content", [])
+                         if blk.get("type") == "text").strip()
+        parsed = api._json_from(raw)
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _batch_usage(results: dict) -> tuple:
+        in_tokens = out_tokens = 0
+        for result in results.values():
+            if (result or {}).get("type") != "succeeded":
+                continue
+            usage = ((result.get("message") or {}).get("usage") or {})
+            in_tokens += int(usage.get("input_tokens", 0) or 0)
+            out_tokens += int(usage.get("output_tokens", 0) or 0)
+        return in_tokens, out_tokens
+
+    def _find_batch_file(self, meta: dict):
+        """Locate a submitted document without trusting its old path alone."""
+        expected = str(meta.get("fhash") or "")
+        candidates = []
+        old = Path(meta.get("path") or "")
+        if old.is_file():
+            candidates.append(old)
+        root = Path(meta.get("worker_dir") or "")
+        if root.is_dir():
+            candidates.extend(p for p in root.rglob("*")
+                              if p.is_file() and p.suffix.lower() in DOC_EXT
+                              and not is_program_file(p) and p not in candidates)
+        for path in candidates:
+            try:
+                actual = file_hash(path)
+                if not expected or actual == expected:
+                    return path
+                # Narrow crash-recovery exception: the exact old request path
+                # may carry bytes from a locally authorised atomic orientation
+                # rewrite. Both old and new hashes must match its durable state.
+                orientation_state = getattr(self, "orientation_state", None)
+                if (path == old and orientation_state is not None
+                        and orientation_state.authorised_hash(
+                            path, expected, actual)):
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def approve_followup_warning(self):
+        state = BatchState(self.dir)
+        followup = state.data.get("followup") or {}
+        if followup.get("phase") == "prepared":
+            followup["large_warning_acknowledged"] = True
+            state.data["followup"] = followup
+            state.save()
+
+    @staticmethod
+    def _serialized_request_bytes(request: dict) -> int:
+        return len(json.dumps(request, ensure_ascii=False).encode("utf-8"))
+
+    def _partition_followup_request_ids(self, sized_requests: list):
+        """Return guarded request-id chunks without holding their payloads.
+
+        The 90 MB target leaves headroom below the hard 100 MB transport guard.
+        A single request above the hard guard is returned separately so nothing
+        is submitted before the operator receives an actionable explanation.
+        """
+        chunks, current = [], []
+        current_bytes = 2  # surrounding JSON list brackets
+        oversized = []
+        for custom_id, request_bytes in sized_requests:
+            request_bytes = int(request_bytes)
+            if request_bytes + 2 > self.BATCH_SUBMIT_MAX_BYTES:
+                oversized.append((custom_id, request_bytes))
+                continue
+            addition = request_bytes + (2 if current else 0)
+            if current and (current_bytes + addition
+                            > self.FOLLOWUP_CHUNK_TARGET_BYTES
+                            or len(current) >= self.BATCH_SUBMIT_MAX_REQUESTS):
+                chunks.append(current)
+                current = []
+                current_bytes = 2
+                addition = request_bytes
+            current.append(custom_id)
+            current_bytes += addition
+        if current:
+            chunks.append(current)
+        return chunks, oversized
+
+    def _build_followup_request(self, followup_api, vocab: str,
+                                custom_id: str, meta: dict):
+        path = self._find_batch_file(meta)
+        if path is None:
+            self.log(f"  ! follow-up source missing for {custom_id}; "
+                     "the primary result will be retained")
+            return None
+        imgs, text, page_idxs, total_pages, segment_view = \
+            self._batch_classification_view(path)
+        if not imgs and not text:
+            self.log(f"  ! follow-up source unrenderable: "
+                     f"{self._redact(path.name)}; the primary result will be retained")
+            return None
+        system, blocks, max_tokens = followup_api.classify_payload(
+            vocab, imgs, text, page_idxs=page_idxs,
+            total_pages=total_pages, segment=segment_view)
+        request = followup_api.build_batch_request(
+            custom_id, system, blocks, max_tokens)
+        return request, estimate_request_input_tokens(system, blocks)
+
+    def _submit_followup_batch(self, state: "BatchState", unresolved: list,
+                               vocab: str, primary_actual_gbp: float) -> bool:
+        """Persist and submit one discounted request per unresolved document.
+
+        Oversized follow-up work is partitioned into guarded chunks. Each POST
+        has its own durable started/accepted marker and accepted request IDs, so
+        a clean restart can continue with the next chunk while an ambiguous POST
+        still fails closed instead of risking duplicate billing.
+        """
+        followup = state.data.get("followup") or {}
+        phase = followup.get("phase")
+        submission = followup.get("submission") or {}
+        if phase == "pending":
+            return True
+        if phase == "ended":
+            return False
+        if (phase in ("submission_started", "ambiguous")
+                or submission.get("status") in
+                ("submission_started", "ambiguous")):
+            self.log("*** FOLLOW-UP NOT RESUBMITTED: a previous submission may "
+                     "have reached Anthropic but its batch id was not saved. "
+                     "Automatic retry is blocked to prevent duplicate billing. ***")
+            self.on_done(self.stats, "batch_followup_ambiguous")
+            return True
+
+        followup_api = self._api_for_model(
+            followup.get("model_id") or state.data.get("followup_model_id")
+            or (self.escalation_api or self.api).model_id)
+        if "est_finishing_gbp" not in state.data:
+            # v1.3.0 state compatibility: reconstruct the newly-separated
+            # remaining phases before applying the cumulative budget gate.
+            phases = estimate_pipeline_costs_gbp(
+                len(state.data.get("requests", {})),
+                state.data.get("model_id") or self.api.model_id,
+                followup_api.model_id, self.resolution, vocab, batch=True,
+                include_audit=bool(getattr(self, "post_run_audit", False)))
+            state.data["est_finishing_gbp"] = round(
+                phases["finishing_gbp"], 4)
+            state.data["est_audit_gbp"] = round(phases["audit_gbp"], 4)
+            state.save()
+        if not followup:
+            requests = {}
+            for index, primary_cid in enumerate(unresolved):
+                meta = state.request_for(primary_cid) or {}
+                fhash = str(meta.get("fhash") or "")
+                custom_id = f"fu-{fhash[:55]}-{index:03d}"[:64]
+                requests[custom_id] = {
+                    "primary_custom_id": primary_cid,
+                    "path": meta.get("path", ""),
+                    "worker": meta.get("worker", ""),
+                    "worker_dir": meta.get("worker_dir", ""),
+                    "fhash": fhash,
+                    "pages": int(meta.get("pages", 0) or 0),
+                }
+            rough = estimate_run_cost_gbp(
+                len(requests), followup_api.model_id, self.resolution,
+                adaptive=False, vocab_block=vocab, batch=True,
+                include_second_pass=False, cached_prefix=False)
+            primary_n = max(1, len(state.data.get("requests", {})))
+            followup = {
+                "phase": "prepared", "model_id": followup_api.model_id,
+                "prepared_ts": datetime.datetime.now().isoformat(
+                    timespec="seconds"),
+                "requests": requests, "batches": [],
+                "est_gbp": round(rough["primary_gbp"], 4),
+                "large": (len(requests) >= self.FOLLOWUP_LARGE_MIN_REQUESTS
+                          and len(requests) / primary_n
+                          >= self.FOLLOWUP_LARGE_RATIO),
+            }
+            state.data["version"] = max(4, int(state.data.get("version", 1)))
+            state.data["phase"] = "followup_prepared"
+            state.data["followup"] = followup
+            state.save()
+
+        if followup.get("large") and not followup.get(
+                "large_warning_acknowledged"):
+            self.log("*** WARNING: unexpectedly large follow-up batch: "
+                     f"{len(followup.get('requests', {}))} request(s), expected "
+                     f"~£{float(followup.get('est_gbp', 0)):.2f}. "
+                     "Explicit confirmation is required before submission. ***")
+            self.on_done(
+                self.stats,
+                "batch_followup_warning:"
+                f"{len(followup.get('requests', {}))}|"
+                f"{float(followup.get('est_gbp', 0)):.2f}|"
+                f"{followup_api.model_id}")
+            return True
+
+        finishing = float(state.data.get("est_finishing_gbp", 0) or 0)
+        audit = float(state.data.get("est_audit_gbp", 0) or 0)
+        expected_total = (primary_actual_gbp
+                          + float(followup.get("est_gbp", 0) or 0)
+                          + finishing + audit)
+        if self.max_budget_gbp > 0 and expected_total > self.max_budget_gbp:
+            self.log("*** FOLLOW-UP NOT SUBMITTED: cumulative expected cost "
+                     f"£{expected_total:.2f} exceeds the £{self.max_budget_gbp:.2f} "
+                     "budget. State is retained; raise the limit and use Check "
+                     "batch status to continue. ***")
+            self.on_done(self.stats,
+                         f"batch_followup_over_budget:{expected_total:.2f}|"
+                         f"{self.max_budget_gbp:.2f}")
+            return True
+
+        submitted_ids = set(str(item) for item in
+                            followup.get("submitted_request_ids", []))
+        for batch in followup.get("batches", []):
+            submitted_ids.update(str(item) for item in
+                                 batch.get("request_ids", []))
+
+        # First pass: establish the complete chunk plan and exact cost before
+        # any POST. Payloads are discarded between documents, keeping memory
+        # bounded; the planned request IDs and hashes are the durable contract.
+        chunk_plan = followup.get("chunk_plan") or []
+        if not chunk_plan:
+            sized_requests = []
+            actual_requests = {}
+            input_tokens = 0
+            for custom_id, meta in list(
+                    followup.get("requests", {}).items()):
+                built_item = self._build_followup_request(
+                    followup_api, vocab, custom_id, meta)
+                if built_item is None:
+                    continue
+                request, request_tokens = built_item
+                sized_requests.append((
+                    custom_id, self._serialized_request_bytes(request)))
+                input_tokens += request_tokens
+                actual_requests[custom_id] = meta
+
+            chunk_plan, oversized = self._partition_followup_request_ids(
+                sized_requests)
+            if oversized:
+                custom_id, size = oversized[0]
+                followup["oversized_request"] = {
+                    "custom_id": custom_id, "bytes": size}
+                state.data["followup"] = followup
+                state.save()
+                self.log("*** FOLLOW-UP NOT SUBMITTED: one document creates a "
+                         f"{size / 1048576:.1f} MB request, above the 100 MB "
+                         "per-batch guard. No request was sent; lower the "
+                         "resolution or prepare that file separately. ***")
+                self.on_done(
+                    self.stats,
+                    f"batch_followup_too_large:{size / 1048576:.1f}")
+                return True
+            if not chunk_plan:
+                followup["phase"] = ("pending" if submitted_ids else "ended")
+                followup["requests"] = {
+                    cid: meta for cid, meta in actual_requests.items()
+                    if cid in submitted_ids}
+                state.data["phase"] = ("followup_pending" if submitted_ids
+                                       else "followup_ended")
+                state.data["followup"] = followup
+                state.save()
+                return bool(submitted_ids)
+
+            exact_est = tokens_cost_gbp(
+                followup_api.model_id, input_tokens,
+                len(actual_requests) * EST_OUTPUT_TOKENS_PER_DOC, batch=True)
+            expected_total = primary_actual_gbp + exact_est + finishing + audit
+            followup.update({
+                "phase": "submission_prepared",
+                "requests": actual_requests,
+                "chunk_plan": chunk_plan,
+                "planned_chunks": len(chunk_plan),
+                "planned_request_count": len(actual_requests),
+                "planned_input_tokens": input_tokens,
+                "est_gbp": round(exact_est, 4),
+            })
+            state.data["version"] = max(
+                4, int(state.data.get("version", 1)))
+            state.data["phase"] = "followup_submission_prepared"
+            state.data["followup"] = followup
+            if not state.save():
+                raise RuntimeError(
+                    "follow-up chunk plan could not be persisted; no request sent")
+            if self.max_budget_gbp > 0 and expected_total > self.max_budget_gbp:
+                self.log("*** FOLLOW-UP NOT SUBMITTED after exact planning: "
+                         f"cumulative expected cost £{expected_total:.2f} exceeds "
+                         f"the £{self.max_budget_gbp:.2f} budget. ***")
+                self.on_done(
+                    self.stats,
+                    f"batch_followup_over_budget:{expected_total:.2f}|"
+                    f"{self.max_budget_gbp:.2f}")
+                return True
+        else:
+            exact_est = float(followup.get("est_gbp", 0) or 0)
+            expected_total = primary_actual_gbp + exact_est + finishing + audit
+
+        total_planned = sum(len(chunk) for chunk in chunk_plan)
+        self.log(f"Submitting {total_planned} unresolved document(s) to the "
+                 f"discounted {followup_api.model_id} follow-up in "
+                 f"{len(chunk_plan)} guarded batch chunk(s); expected follow-up "
+                 f"cost ~£{exact_est:.2f}, cumulative enabled estimate "
+                 f"~£{expected_total:.2f}.")
+
+        for chunk_index, planned_ids in enumerate(chunk_plan, 1):
+            remaining_ids = [str(cid) for cid in planned_ids
+                             if str(cid) not in submitted_ids]
+            if not remaining_ids:
+                continue
+            built = []
+            actual_ids = []
+            for custom_id in remaining_ids:
+                meta = followup.get("requests", {}).get(custom_id) or {}
+                built_item = self._build_followup_request(
+                    followup_api, vocab, custom_id, meta)
+                if built_item is None:
+                    followup.get("requests", {}).pop(custom_id, None)
+                    continue
+                request, _request_tokens = built_item
+                built.append(request)
+                actual_ids.append(custom_id)
+            if not built:
+                continue
+            payload_bytes = len(json.dumps(
+                built, ensure_ascii=False).encode("utf-8"))
+            if (len(built) > self.BATCH_SUBMIT_MAX_REQUESTS
+                    or payload_bytes > self.BATCH_SUBMIT_MAX_BYTES):
+                followup["oversized_chunk"] = {
+                    "chunk": chunk_index, "bytes": payload_bytes,
+                    "request_ids": actual_ids}
+                state.data["followup"] = followup
+                state.save()
+                self.log("*** FOLLOW-UP CHUNK NOT SUBMITTED: rendered payload "
+                         f"{chunk_index}/{len(chunk_plan)} is "
+                         f"{payload_bytes / 1048576:.1f} MB, above the 100 MB "
+                         "hard guard. Earlier accepted chunks are retained; "
+                         "nothing was sent for this chunk. ***")
+                self.on_done(
+                    self.stats,
+                    f"batch_followup_too_large:{payload_bytes / 1048576:.1f}")
+                return True
+
+            attempt_id = hashlib.sha256(
+                (f"{time.time_ns()}:{os.getpid()}:followup-{chunk_index}:"
+                 + "|".join(actual_ids)).encode("utf-8")).hexdigest()[:24]
+            followup["phase"] = "submitting"
+            followup["submission"] = {
+                "status": "submission_started",
+                "planned_chunk": chunk_index,
+                "request_ids": actual_ids,
+                "attempt_id": attempt_id,
+                "started_ts": datetime.datetime.now().isoformat(
+                    timespec="seconds"),
+            }
+            state.data["phase"] = "followup_submitting"
+            state.data["followup"] = followup
+            if not state.save():
+                raise RuntimeError(
+                    "follow-up submission marker could not be persisted; "
+                    "no request sent")
+            try:
+                created = followup_api.submit_batch(built)
+                batch_id = str(created.get("id") or "").strip()
+                if not batch_id:
+                    raise APIError(
+                        0, "follow-up batch submission returned no batch id")
+            except Exception:
+                followup["phase"] = "ambiguous"
+                followup["submission"]["status"] = "ambiguous"
+                followup["submission"]["ambiguous_ts"] = \
+                    datetime.datetime.now().isoformat(timespec="seconds")
+                state.data["phase"] = "followup_submission_ambiguous"
+                state.data["followup"] = followup
+                state.save()
+                raise
+
+            state.add_batch(
+                batch_id, len(built), created.get("processing_status", ""),
+                phase="followup", request_ids=actual_ids)
+            submitted_ids.update(actual_ids)
+            followup = state.data["followup"]
+            followup["submitted_request_ids"] = sorted(submitted_ids)
+            followup["submission"].update({
+                "status": "accepted", "batch_id": batch_id,
+                "accepted_ts": datetime.datetime.now().isoformat(
+                    timespec="seconds")})
+            followup["phase"] = "submitting"
+            state.data["phase"] = "followup_submitting"
+            if not state.save():
+                raise RuntimeError(
+                    "follow-up batch id could not be persisted; automatic retry "
+                    "is blocked by the durable started marker")
+            self.log(f"  > submitted follow-up chunk "
+                     f"{chunk_index}/{len(chunk_plan)} as {batch_id} with "
+                     f"{len(built)} request(s) "
+                     f"({payload_bytes / 1048576:.1f} MB)")
+
+        if not submitted_ids:
+            followup["phase"] = "ended"
+            state.data["phase"] = "followup_ended"
+            state.data["followup"] = followup
+            state.save()
+            return False
+        followup["phase"] = "pending"
+        followup["submitted_ts"] = datetime.datetime.now().isoformat(
+            timespec="seconds")
+        followup["submitted_request_ids"] = sorted(submitted_ids)
+        state.data["phase"] = "followup_pending"
+        state.data["followup"] = followup
+        if not state.save():
+            raise RuntimeError(
+                "follow-up completion marker could not be persisted; accepted "
+                "batch ids remain protected by per-chunk markers")
+        self.stats["followup_requests"] = len(submitted_ids)
+        self.stats["followup_batches"] = len(followup.get("batches", []))
+        self.on_done(
+            self.stats,
+            f"batch_followup_submitted:{len(submitted_ids)}|"
+            f"{exact_est:.2f}|{followup_api.model_id}|"
+            f"{len(followup.get('batches', []))}")
+        return True
 
     def _rescue_batch_result(self, f: Path, parsed: dict, vocab: str) -> dict:
         """Batch results are produced asynchronously, so the live-mode rescue
@@ -7963,6 +9650,7 @@ class Engine:
                     f.rename(new_path)
                 else:
                     shutil.move(str(f), str(new_path))
+                self._orientation_move_path(f, new_path)
             except Exception as e:
                 self.log(f"    ! rename failed for {f.name}: {e}")
                 self.stats["errors"] += 1
@@ -7977,13 +9665,15 @@ class Engine:
             self.log(f"    + double-check: {self._redact(f.name)} -> "
                      f"{self._redact(new_path.name)}")
 
+    @_care_home_writer_operation
     def run_batch_apply(self):
-        """Phase B: poll & apply. If any batch is still processing, reports the
-        counts and returns. When all have ended, downloads the results JSONL,
-        applies every result through _apply_classification (the SAME path live
-        mode uses), auto-reviews this run's unknowns, runs dedupe + LIVE second
-        pass + organise per worker, then double-checks any leftover
-        'Other - Unknown' files, and deletes the state file."""
+        """Poll/apply the primary and, when required, discounted follow-up.
+
+        Primary results are first divided into settled canonical/descriptive
+        answers and genuinely unresolved answers.  Only the latter are sent in
+        one persisted Message Batches follow-up.  No worker is finalised or
+        moved until that follow-up has ended.
+        """
         try:
             state = BatchState(self.dir)
             if not state.exists():
@@ -7991,18 +9681,74 @@ class Engine:
                 self.on_done(self.stats, "batch_none_pending")
                 return
 
-            # ---- poll ----
+            self._batch_state = state
+            saved_costs = state.data.get("costs") or {}
+            self._committed_batch_cost_gbp = (
+                float(saved_costs.get("primary_actual_gbp", 0) or 0)
+                + float(saved_costs.get("followup_actual_gbp", 0) or 0))
+            self._persisted_live_cost_gbp = float(
+                saved_costs.get("live_actual_gbp", 0) or 0)
+            self._persisted_live_tokens = int(
+                saved_costs.get("live_tokens", 0) or 0)
+
+            followup = state.data.get("followup") or {}
+            primary_submit = state.data.get("primary_submission") or {}
+            if primary_submit.get("status") in (
+                    "submission_started", "ambiguous"):
+                self.log("*** PRIMARY BATCH SUBMISSION STATE IS AMBIGUOUS. "
+                         "The planned chunk and attempt are retained; automatic "
+                         "resubmission and live processing are blocked to "
+                         "prevent duplicate billing. ***")
+                self.on_done(self.stats, "batch_primary_ambiguous")
+                return
+            if state.data.get("primary_submission_complete") is False:
+                self.log("*** PRIMARY SUBMISSION IS INCOMPLETE. Recover the remaining "
+                         "inventory before applying results or moving workers. ***")
+                self.on_done(self.stats, "batch_primary_incomplete")
+                return
+            followup_submission = followup.get("submission") or {}
+            if (followup.get("phase") in ("submission_started", "ambiguous")
+                    or followup_submission.get("status") in
+                    ("submission_started", "ambiguous")):
+                self.log("*** FOLLOW-UP SUBMISSION STATE IS AMBIGUOUS. "
+                         "Automatic resubmission is blocked to prevent duplicate "
+                         "billing. ***")
+                self.on_done(self.stats, "batch_followup_ambiguous")
+                return
+
+            # Classification, finishing and movement were durably completed
+            # before the optional audit began. A restart resumes only audit.
+            if state.data.get("processing_complete"):
+                self._audit_worker_dirs = []
+                for worker in (state.data.get("workers") or {}).values():
+                    final_path = Path(worker.get("final_path")
+                                      or worker.get("source_path") or "")
+                    if final_path.is_dir():
+                        self._audit_worker_dirs.append(final_path)
+                self.log("Batch processing is already complete; resuming only "
+                         "the separate post-run audit phase.")
+                self._run_post_run_audit()
+                audit_status = (state.data.get("audit") or {}).get("status")
+                if audit_status in ("complete", "skipped", "disabled"):
+                    state.mark_applied()
+                    state.delete()
+                    self.on_done(self.stats, "batch_audit_complete")
+                return
+
+            # ---- poll the currently active phase ----
             self.set_status("Checking batch status…")
-            batches = self.poll_batches(state)
+            followup_incomplete = followup.get("phase") in (
+                "prepared", "submission_prepared", "submitting")
+            active_phase = ("followup"
+                            if state.batch_ids("followup")
+                            and not followup_incomplete else "primary")
+            batches = self.poll_batches(state, active_phase)
             pending = [b for b in batches
                        if b.get("processing_status") != "ended"]
-            counts = {"processing": 0, "succeeded": 0, "errored": 0,
-                      "canceled": 0, "expired": 0}
-            for b in batches:
-                rc = b.get("request_counts", {}) or {}
-                for k in counts:
-                    counts[k] += rc.get(k, 0)
-            self.log(f"Batch status: {len(batches) - len(pending)}/{len(batches)} "
+            counts = self._batch_counts(batches)
+            counts["phase"] = active_phase
+            self.log(f"{active_phase.title()} batch status: "
+                     f"{len(batches) - len(pending)}/{len(batches)} "
                      f"ended - {counts['succeeded']} succeeded, "
                      f"{counts['errored']} errored, {counts['processing']} still "
                      f"processing, {counts['canceled']} canceled, "
@@ -8012,41 +9758,183 @@ class Engine:
                              "batch_pending:" + json.dumps(counts))
                 return
 
-            # ---- download all results, keyed by custom_id ----
+            if active_phase == "followup":
+                followup["phase"] = "ended"
+                state.data["phase"] = "followup_ended"
+                state.data["followup"] = followup
+                if not state.save():
+                    raise RuntimeError(
+                        "follow-up completion phase could not be persisted")
+
+            # ---- download primary results (v1.3.0 state compatible) ----
             self.set_status("Downloading batch results…")
-            results = {}
-            for b in batches:
-                url = b.get("results_url")
-                if not url:
-                    continue
-                for line in self.api.batch_results(url):
-                    cid = line.get("custom_id")
-                    if cid:
-                        results[cid] = line.get("result", {}) or {}
-            self.log(f"Downloaded {len(results)} result(s).")
+            primary_batches = (batches if active_phase == "primary"
+                               else self.poll_batches(state, "primary"))
+            results = self._download_batch_results(self.api, primary_batches)
+            self.log(f"Downloaded {len(results)} primary result(s).")
+
+            vocab = self.kb.vocabulary_block()
+            parsed_primary = {
+                cid: self._parse_batch_result(self.api, result)
+                for cid, result in results.items()
+            }
+            unresolved = []
+            for cid in state.data.get("requests", {}):
+                result = results.get(cid, {})
+                parsed = parsed_primary.get(cid, {})
+                if ((result or {}).get("type") != "succeeded"
+                        or batch_result_needs_followup(self.kb, parsed)):
+                    unresolved.append(cid)
+
+            primary_in, primary_out = self._batch_usage(results)
+            primary_cost = tokens_cost_gbp(
+                state.data.get("model_id") or self.api.model_id,
+                primary_in, primary_out, batch=True)
+            state.data.setdefault("costs", {})["primary_actual_gbp"] = round(
+                primary_cost, 6)
+
+            # No first-pass result is applied yet when follow-up is required;
+            # this keeps restart/resume simple and prevents worker movement.
+            if unresolved:
+                if self._submit_followup_batch(
+                        state, unresolved, vocab, primary_cost):
+                    return
+
+            followup_results = {}
+            followup_api = None
+            followup = state.data.get("followup") or {}
+            if state.batch_ids("followup"):
+                followup_api = self._api_for_model(
+                    followup.get("model_id") or self.api.model_id)
+                followup_batches = (batches if active_phase == "followup"
+                                    else self.poll_batches(state, "followup"))
+                if any(b.get("processing_status") != "ended"
+                       for b in followup_batches):
+                    counts = self._batch_counts(followup_batches)
+                    counts["phase"] = "followup"
+                    self.on_done(self.stats,
+                                 "batch_pending:" + json.dumps(counts))
+                    return
+                followup_results = self._download_batch_results(
+                    followup_api, followup_batches)
+                self.log(f"Downloaded {len(followup_results)} follow-up "
+                         "result(s).")
+
+            followup_by_primary = {}
+            followup_raw_by_primary = {}
+            for followup_cid, meta in followup.get("requests", {}).items():
+                raw_result = followup_results.get(followup_cid, {})
+                primary_cid = meta.get("primary_custom_id")
+                outcome = {"status": "failed", "parsed": {}}
+                if raw_result.get("type") == "succeeded":
+                    try:
+                        parsed = (self._parse_batch_result(
+                            followup_api, raw_result)
+                            if followup_api is not None else {})
+                    except Exception:
+                        parsed = {}
+                    if parsed:
+                        # A completed generic answer has consumed the one
+                        # discounted opinion and remains explicitly unresolved.
+                        status = ("generic" if batch_result_needs_followup(
+                            self.kb, parsed) else "meaningful")
+                        outcome = {"status": status, "parsed": parsed}
+                    else:
+                        outcome = {"status": "no_result", "parsed": {}}
+                elif not raw_result:
+                    outcome = {"status": "no_result", "parsed": {}}
+                followup_by_primary[primary_cid] = outcome
+                followup_raw_by_primary[primary_cid] = raw_result
+
+            followup_in, followup_out = self._batch_usage(followup_results)
+            followup_cost = (tokens_cost_gbp(
+                followup.get("model_id") or self.api.model_id,
+                followup_in, followup_out, batch=True)
+                if followup_results else 0.0)
+            state.data.setdefault("costs", {})["followup_actual_gbp"] = round(
+                followup_cost, 6)
+            state.save()
+            self._committed_batch_cost_gbp = primary_cost + followup_cost
+            self._committed_batch_tokens = (primary_in + primary_out
+                                            + followup_in + followup_out)
+            self.stats["batch_in_tokens"] = primary_in + followup_in
+            self.stats["batch_out_tokens"] = primary_out + followup_out
+            self.stats["followup_in_tokens"] = followup_in
+            self.stats["followup_out_tokens"] = followup_out
+            self.on_cost(self._current_cost_gbp(),
+                         self._committed_batch_tokens)
 
             # reverse index: content hash -> [custom_ids] (for moved files)
             by_hash = {}
             for cid, meta in state.data.get("requests", {}).items():
                 by_hash.setdefault(meta.get("fhash", ""), []).append(cid)
 
-            vocab = self.kb.vocabulary_block()
             matched_cids = set()
-            self._review_unknowns_answer = None   # asked once, lazily
-            unknown_queue = []
+
+            # Recover the narrow crash window after shutil.move succeeded but
+            # before the worker completion record was saved.
+            for worker in state.data.setdefault("workers", {}).values():
+                target = Path(worker.get("movement_target") or "")
+                source = Path(worker.get("source_path") or "")
+                if (worker.get("movement_status") == "started"
+                        and str(target) and target.is_dir()
+                        and not source.is_dir()):
+                    self._orientation_move_tree(source, target)
+                    worker.update({"movement_status": "complete",
+                                   "final_path": str(target),
+                                   "completed": True,
+                                   "completed_ts": datetime.datetime.now()
+                                   .isoformat(timespec="seconds")})
+                    state.save()
+                if worker.get("completed"):
+                    source_key = str(worker.get("source_path") or "").casefold()
+                    for cid, meta in state.data.get("requests", {}).items():
+                        if str(meta.get("worker_dir") or "").casefold() == \
+                                source_key:
+                            matched_cids.add(cid)
+                    final_path = Path(worker.get("final_path")
+                                      or worker.get("source_path") or "")
+                    if final_path.is_dir():
+                        self._audit_worker_dirs.append(final_path)
 
             workers = worker_dirs_in(self.dir)
             total = len(workers)
             for idx, w in enumerate(workers, 1):
                 self._check_stop()
+                self._phase_progress("processing", idx - 1, total)
                 self.set_progress(idx - 1, total)
                 self.log(f"\n=== Applying results {idx}/{total}: {w.name} ===")
                 self.set_status(f"Applying {idx}/{total}: {w.name}")
                 self._current_worker = w.name
+                worker_key = str(w.resolve()).casefold()
+                worker_state = state.data.setdefault("workers", {}).setdefault(
+                    worker_key, {"name": w.name, "source_path": str(w),
+                                 "classification_status": "pending",
+                                 "finishing_status": "pending",
+                                 "movement_status": "pending",
+                                 "completed": False})
+                if worker_state.get("completed"):
+                    for cid, meta in state.data.get("requests", {}).items():
+                        if str(meta.get("worker_dir", "")).casefold() == \
+                                str(w).casefold():
+                            matched_cids.add(cid)
+                    final_path = Path(worker_state.get("final_path") or w)
+                    if final_path.is_dir():
+                        self._audit_worker_dirs.append(final_path)
+                    self.log("  finishing already completed on an earlier "
+                             "apply pass - skipped without API calls")
+                    continue
                 try:
-                    records = []
-                    worker_unknowns = []
-                    for f in list_worker_docs(w):
+                    classification_done = (
+                        worker_state.get("classification_status") == "complete")
+                    records = (self._records_from_manifest(w)
+                               if classification_done else [])
+                    files_to_apply = ([] if classification_done
+                                      else list_worker_docs(w))
+                    worker_state["classification_status"] = (
+                        "complete" if classification_done else "in_progress")
+                    state.save()
+                    for f in files_to_apply:
                         self._check_stop()
                         if is_cloud_only_placeholder(f) or \
                                 file_too_big(f, self.max_file_mb):
@@ -8088,9 +9976,13 @@ class Engine:
                                                      self.api.model_id,
                                                      self.resolution,
                                                      cname, cgroup)
-                            new_path = unique_path(w, safe_stem(cname), f.suffix)
+                            desired_stem = safe_stem(cname)
+                            new_path = (f if f.stem == desired_stem else
+                                        unique_path(w, desired_stem, f.suffix))
                             try:
-                                f.rename(new_path)
+                                if new_path != f:
+                                    f.rename(new_path)
+                                    self._orientation_move_path(f, new_path)
                                 records.append({"path": new_path, "name": cname,
                                                 "group": cgroup,
                                                 "original": f.name,
@@ -8107,37 +9999,51 @@ class Engine:
                         matched_cids.add(cid)
                         res = results[cid]
                         rtype = res.get("type")
-                        if rtype == "succeeded":
+                        primary_parsed = parsed_primary.get(cid, {})
+                        followup_outcome = followup_by_primary.get(cid)
+                        followup_completed = bool(
+                            followup_outcome
+                            and followup_outcome.get("status") in
+                            ("meaningful", "generic"))
+                        primary_usable = bool(
+                            rtype == "succeeded" and primary_parsed)
+                        parsed = ((followup_outcome or {}).get("parsed")
+                                  if followup_completed else primary_parsed)
+                        if followup_completed or primary_usable:
                             msg = res.get("message", {}) or {}
                             usage = msg.get("usage", {}) or {}
                             if _api_usage:
                                 _api_usage.record_usage(
                                     self.api.model_id, usage, batch=True)
-                            self.stats["batch_in_tokens"] += usage.get(
-                                "input_tokens", 0)
-                            self.stats["batch_out_tokens"] += usage.get(
-                                "output_tokens", 0)
-                            raw = "\n".join(
-                                blk.get("text", "")
-                                for blk in msg.get("content", [])
-                                if blk.get("type") == "text").strip()
-                            parsed = self.api._json_from(raw)
+                                if followup_completed:
+                                    followup_usage = (((followup_raw_by_primary
+                                        .get(cid) or {}).get("message") or {})
+                                        .get("usage") or {})
+                                    _api_usage.record_usage(
+                                        followup.get("model_id")
+                                        or self.api.model_id,
+                                        followup_usage, batch=True)
                             self.stats["batch_succeeded"] += 1
-                            parsed = self._rescue_batch_result(f, parsed,
-                                                               vocab)
-                            # batch requests are built with pages='all', so
-                            # the reply's per-page rotations map to the same
-                            # sampled indices the audit uses
+                            source = ("batch-followup" if followup_completed
+                                      else ("batch-AI-fallback"
+                                            if followup_outcome else "batch-AI"))
+                            # Both batch phases use the normal bounded
+                            # pages='all' policy (first two + last for long PDFs).
                             new_hash = self._maybe_fix_rotation(
                                 f, parsed, page_idxs=_audit_pages_for(f))
                             if new_hash:
                                 fhash = new_hash
+                            self._consume_rotation_instructions(parsed)
                             vocab = self._apply_classification(
                                 w, f, parsed, fhash, vocab, records,
                                 interactive=False,
                                 used_imgs=[], used_text="",
-                                default_source="batch-AI",
-                                unknown_queue=worker_unknowns)
+                                default_source=source,
+                                unknown_queue=None)
+                            # Apply-time checkpoint: a restart sees the manifest
+                            # immediately and cannot apply the same paid result
+                            # to the same content twice.
+                            self.manifest.save()
                         elif rtype == "errored":
                             self.stats["batch_errored"] += 1
                             self.stats["errors"] += 1
@@ -8154,45 +10060,92 @@ class Engine:
                                      f"request {rtype} - left unchanged")
                             self.failed_log.record(self.care_home, w.name, f,
                                                    f"batch: {rtype}", "")
-                        self._emit_cost()
-
-                    # ---- automatic individual review of this run's unknowns --
-                    # (runs BEFORE _finish_worker so a resolved document is
-                    # deduped/dated/organised under its real type; no dialog)
-                    if worker_unknowns:
-                        unknown_queue.extend(worker_unknowns)
-                        self._auto_review_unknowns(
-                            w, worker_unknowns, records, vocab)
-
                     # save what has been applied so far (crash-safe resume)
                     self.manifest.save()
+                    worker_state["classification_status"] = "complete"
+                    worker_state["classification_completed_ts"] = \
+                        datetime.datetime.now().isoformat(timespec="seconds")
+                    worker_state["applied_records"] = [
+                        {"path": str(record.get("path", "")),
+                         "name": record.get("name", ""),
+                         "group": record.get("group", "")}
+                        for record in records]
+                    if not state.save():
+                        raise DurableStateError(
+                            "worker classification completion could not be "
+                            "persisted; finishing was not started")
 
                     # ---- shared tail: dedupe -> LIVE second pass -> organise --
-                    if records:
-                        self._finish_worker(w, records)
-                    # ---- final double-check: any file STILL named
-                    # 'Other - Unknown' under this worker (incl. Bulk batches
-                    # from earlier runs) gets one individual live re-check,
-                    # exactly like the standalone Re-check Unknowns tool
-                    self._recheck_leftover_unknowns(
-                        w, vocab,
-                        exclude_hashes={i.get("fhash") for i in worker_unknowns
-                                        if i.get("fhash")})
+                    if worker_state.get("finishing_status") != "complete":
+                        worker_state["finishing_status"] = "in_progress"
+                        worker_state["finishing_started_ts"] = \
+                            datetime.datetime.now().isoformat(
+                                timespec="seconds")
+                        if not state.save():
+                            raise DurableStateError(
+                                "worker finishing start could not be persisted")
+                        if records:
+                            self._finish_worker(w, records)
+                        worker_state["finishing_status"] = "complete"
+                        worker_state["finishing_completed_ts"] = \
+                            datetime.datetime.now().isoformat(
+                                timespec="seconds")
+                        self._persist_batch_live_cost()
+                        if not state.save():
+                            raise FinishingAmbiguous(
+                                "worker finishing completed but its durable "
+                                "completion marker could not be written")
                     self.stats["workers"] += 1
                     final_dir = w
                     # move mode: relocate the fully-processed worker (as live)
-                    if self.move_mode and records:
+                    if self.move_mode and batch_worker_ready_to_move(w, records):
+                        if not records:
+                            self.log("  no documents found; moving empty worker "
+                                     "folder unchanged")
                         try:
-                            dest = move_worker_folder(w, self.move_dest)
+                            dest = unique_dir(self.move_dest, w.name)
+                            worker_state["movement_status"] = "started"
+                            worker_state["movement_target"] = str(dest)
+                            if not state.save():
+                                raise DurableStateError(
+                                    "worker move marker could not be persisted; "
+                                    "folder was not moved")
+                            self.move_dest.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(w), str(dest))
+                            final_dir = Path(dest)
+                            try:
+                                self._orientation_move_tree(w, dest)
+                            except Exception as exc:
+                                raise DurableStateError(
+                                    "worker folder moved, but orientation paths "
+                                    "could not be checkpointed; restart will "
+                                    "recover the persisted move marker") from exc
                             self.stats["moved"] += 1
                             self.log(f"  moved worker folder -> {dest}")
-                            final_dir = Path(dest)
+                        except DurableStateError:
+                            raise
                         except Exception as e:
+                            worker_state["movement_status"] = "failed"
+                            worker_state["movement_error"] = str(e)
                             self.stats["errors"] += 1
                             self.log(f"  ! could not move {w.name} to "
                                      f"destination: {e} (left in source)")
                             traceback.print_exc()
+                    if not self.move_mode:
+                        worker_state["movement_status"] = "disabled"
+                    elif final_dir != w:
+                        worker_state["movement_status"] = "complete"
+                    elif worker_state.get("movement_status") == "pending":
+                        worker_state["movement_status"] = "not_ready"
+                    worker_state["final_path"] = str(final_dir)
+                    worker_state["completed"] = True
+                    worker_state["completed_ts"] = \
+                        datetime.datetime.now().isoformat(timespec="seconds")
+                    if not state.save():
+                        raise DurableStateError(
+                            "worker completion could not be persisted")
                     self._audit_worker_dirs.append(final_dir)
+                    self._record_roster_handover(w, final_dir)
                 except (StopRequested, LimitReached, CreditExhausted):
                     raise
                 except Exception as e:
@@ -8210,23 +10163,62 @@ class Engine:
                     self.log(f"  ! result for '{meta.get('path','?')}' could not "
                              f"be matched to any file (moved/deleted) - skipped")
 
+            incomplete_workers = [
+                worker for worker in state.data.get("workers", {}).values()
+                if not worker.get("completed")]
+            if incomplete_workers:
+                state.data["phase"] = "processing_incomplete"
+                state.save()
+                self.log("Batch apply remains incomplete for: "
+                         + ", ".join(worker.get("name", "?")
+                                     for worker in incomplete_workers)
+                         + ". Use Check batch status to resume; completed "
+                           "finishing operations will be skipped.")
+                self.on_done(self.stats, "batch_apply_incomplete")
+                return
+
+            self._phase_progress("processing", total, total)
             self.set_progress(total, total)
             self.manifest.save()
+            # This is the durable boundary between paid classification/
+            # finishing/movement and the optional audit. It is persisted before
+            # the audit starts, so a stop/crash can never repeat finishing.
+            state.data["processing_complete"] = True
+            state.data["processing_completed_ts"] = \
+                datetime.datetime.now().isoformat(timespec="seconds")
+            state.data["phase"] = "processing_complete"
+            if not state.save():
+                raise RuntimeError(
+                    "processing completion could not be persisted; audit was "
+                    "not started")
+            unique_audit_dirs = []
+            seen_audit_dirs = set()
+            for path in self._audit_worker_dirs:
+                key = str(Path(path).resolve()).casefold()
+                if key not in seen_audit_dirs:
+                    seen_audit_dirs.add(key)
+                    unique_audit_dirs.append(Path(path))
+            self._audit_worker_dirs = unique_audit_dirs
             self._run_post_run_audit()
-            # everything applied: retire the state file
-            state.mark_applied()
-            state.delete()
-            actual_batch_gbp = tokens_cost_gbp(
-                self.api.model_id, self.stats["batch_in_tokens"],
-                self.stats["batch_out_tokens"], batch=True)
+            audit_status = (state.data.get("audit") or {}).get("status")
+            if audit_status in ("complete", "skipped", "disabled"):
+                state.mark_applied()
+                state.delete()
+            else:
+                self.on_done(self.stats, "batch_processing_complete_audit_pending")
+                return
+            actual_batch_gbp = self._committed_batch_cost_gbp
             self.log(f"\n=== BATCH APPLIED: {self.stats['batch_succeeded']} "
                      f"succeeded, {self.stats['batch_errored']} errored, "
                      f"{self.stats['batch_expired']} expired, "
                      f"{self.stats['batch_canceled']} canceled, "
                      f"{self.stats['batch_missing']} unmatched ===")
-            self.log(f"Batch cost (actual usage @ 50%): ~£{actual_batch_gbp:.2f}  "
-                     f"(estimated at submit: £{state.data.get('est_gbp', 0):.2f}); "
-                     f"second-pass (live): ~£{self._current_cost_gbp():.2f}")
+            live_cost = max(0.0, self._current_cost_gbp() - actual_batch_gbp)
+            self.log(f"Batch cost (primary + follow-up actual @ 50%): "
+                     f"~£{actual_batch_gbp:.2f}  (cumulative estimate at submit: "
+                     f"£{state.data.get('est_gbp', 0):.2f}); live finishing/audit: "
+                     f"~£{live_cost:.2f}; cumulative actual: "
+                     f"~£{self._current_cost_gbp():.2f}")
             self.on_done(self.stats,
                          f"batch_applied:{actual_batch_gbp:.4f}|"
                          f"{state.data.get('est_gbp', 0)}")
@@ -8247,6 +10239,17 @@ class Engine:
             self.log(f"\n*** STOPPED: {e.reason} (batch state kept; run "
                      f"'Check batch status' again to continue) ***")
             self.on_done(self.stats, f"limit:{e.reason}")
+        except FinishingAmbiguous as e:
+            self.manifest.save()
+            self.log(f"\n*** FINISHING BLOCKED: {e}. The durable state is "
+                     "kept and the operation will not be automatically "
+                     "repeated. ***")
+            self.on_done(self.stats, "batch_finishing_ambiguous")
+        except DurableStateError as e:
+            self.manifest.save()
+            self.log(f"\n*** BATCH CHECKPOINT FAILED: {e}. Processing stopped "
+                     "before the next filesystem or paid operation. ***")
+            self.on_done(self.stats, "batch_state_write_failed")
         except StopRequested:
             self.manifest.save()
             self.log("\n*** STOPPED by user (batch state kept; run 'Check batch "
@@ -8305,6 +10308,7 @@ class Engine:
             new_path = unique_path(worker_dir, safe_stem(name), p.suffix)
             try:
                 p.rename(new_path)
+                self._orientation_move_path(p, new_path)
             except Exception as e:
                 self.log(f"    ! rename failed for {p.name}: {e}")
                 self.stats["errors"] += 1
@@ -8350,18 +10354,19 @@ class Engine:
                 self._review_unknowns_answer = False
                 break
             decision, new_name, desc = answer
-            self.kb.add(new_name, desc,
-                        "Other" if decision == "Other" else "Relevant")
-            vocab = self.kb.vocabulary_block()
             if decision == "Other":
                 name, group = "Other", "Other"
+                # One-off Other descriptions are filenames, not persistent
+                # controlled-vocabulary entries.
+                name = other_name(new_name or "Unknown")
             else:
+                self.kb.add(new_name, desc, "Relevant")
+                vocab = self.kb.vocabulary_block()
                 name, group = new_name, "Important"
-            if group == "Other":
-                name = other_name(new_name if new_name != "Other" else "")
             new_path = unique_path(worker_dir, safe_stem(name), p.suffix)
             try:
                 p.rename(new_path)
+                self._orientation_move_path(p, new_path)
             except Exception as e:
                 self.log(f"    ! rename failed for {p.name}: {e}")
                 self.stats["errors"] += 1
@@ -8388,14 +10393,18 @@ class Engine:
         so those partial results can still be applied."""
         state = BatchState(self.dir)
         out = []
-        for bid in state.batch_ids():
-            try:
-                r = self.api.cancel_batch(bid)
-                out.append((bid, r.get("processing_status", "canceling")))
-                self.log(f"  cancel requested for batch {bid}")
-            except Exception as e:
-                out.append((bid, f"cancel failed: {e}"))
-                self.log(f"  ! cancel failed for {bid}: {e}")
+        for phase in ("primary", "followup"):
+            api = (self._api_for_model(
+                (state.data.get("followup") or {}).get("model_id")
+                or self.api.model_id) if phase == "followup" else self.api)
+            for bid in state.batch_ids(phase):
+                try:
+                    r = api.cancel_batch(bid)
+                    out.append((bid, r.get("processing_status", "canceling")))
+                    self.log(f"  cancel requested for {phase} batch {bid}")
+                except Exception as e:
+                    out.append((bid, f"cancel failed: {e}"))
+                    self.log(f"  ! cancel failed for {bid}: {e}")
         return out
 
     def _quick_match(self, path: Path, page1_text: str):
@@ -8437,7 +10446,8 @@ class Engine:
         Carries the cached page images/text forward so the second pass need not
         re-render or re-download."""
         existing = [p for p in worker_dir.iterdir()
-                    if p.is_file() and p.suffix.lower() in DOC_EXT]
+                    if p.is_file() and p.suffix.lower() in DOC_EXT
+                    and not is_program_file(p)]
         by_label = {}
         for p in existing:
             by_label.setdefault((_base_label(p.stem), p.suffix.lower()), []).append(p)
@@ -8493,24 +10503,34 @@ class Engine:
         def current(rec):
             return rec["path"] if rec["path"].exists() else None
 
+        def finishing_key(kind, path):
+            try:
+                identity = file_hash(path)
+            except Exception:
+                identity = str(path).casefold()
+            return f"{kind}:{identity}"
+
         # ---- date helpers for the two dated types ----
         def cos_date_for(r, p):
             imgs, text = self._pages_for_review(r, p)
             try:
-                return parse_date(self.api.cos_issue_date(imgs, text))
+                raw = self._finishing_operation(
+                    worker_dir, finishing_key("cos-date", p),
+                    lambda: self.api.cos_issue_date(imgs, text))
+                return parse_date(raw)
             except (StopRequested, LimitReached, CreditExhausted):
                 raise
             except Exception as e:
                 self.stats["errors"] += 1
                 self.log(f"      ! {self._redact(p.name)}: CoS date unreadable ({e})")
                 return None
-            finally:
-                self._emit_cost()
 
         def sc_date_for(r, p):
             imgs, text = self._pages_for_review(r, p)
             try:
-                d = self.api.share_code_check(imgs, text)
+                d = self._finishing_operation(
+                    worker_dir, finishing_key("share-code-date", p),
+                    lambda: self.api.share_code_check(imgs, text)) or {}
                 return parse_date(d.get("check_date", ""))
             except (StopRequested, LimitReached, CreditExhausted):
                 raise
@@ -8519,13 +10539,15 @@ class Engine:
                 self.log(f"      ! {self._redact(p.name)}: Share Code date "
                          f"unreadable ({e})")
                 return None
-            finally:
-                self._emit_cost()
 
         def quality_for(r, p, doc_type):
             imgs, text = self._pages_for_review(r, p)
             try:
-                q = self.api.doc_quality(imgs, text, doc_type)
+                q = self._finishing_operation(
+                    worker_dir, finishing_key(f"quality:{doc_type}", p),
+                    lambda: self.api.doc_quality(imgs, text, doc_type))
+                if not isinstance(q, dict):
+                    raise ValueError("quality result unavailable")
             except (StopRequested, LimitReached, CreditExhausted):
                 raise
             except Exception as e:
@@ -8533,8 +10555,6 @@ class Engine:
                 self.log(f"      ! {self._redact(p.name)}: quality unreadable ({e})")
                 q = {"score": 0, "legible": False, "complete": False,
                      "date": "", "note": "score failed"}
-            finally:
-                self._emit_cost()
             return q
 
         # ---- group records by their (base) controlled name ----
@@ -8600,11 +10620,14 @@ class Engine:
                 if base_name == "Employment Contract":
                     imgs, text = self._pages_for_review(r, p)
                     try:
-                        signed_bonus = 1 if self.api.contract_signed(imgs, text) else 0
+                        signed = self._finishing_operation(
+                            worker_dir, finishing_key("contract-signed", p),
+                            lambda: self.api.contract_signed(imgs, text))
+                        signed_bonus = 1 if signed else 0
+                    except (StopRequested, LimitReached, CreditExhausted):
+                        raise
                     except Exception:
                         signed_bonus = 0
-                    finally:
-                        self._emit_cost()
                 scored.append({
                     "r": r, "p": p, "q": q,
                     "sort_key": (date_rank, signed_bonus, q["score"],
@@ -8640,6 +10663,7 @@ class Engine:
                 tmp = unique_path(worker_dir, f"__rank_tmp_{i}", p_now.suffix)
                 try:
                     p_now.rename(tmp)
+                    self._orientation_move_path(p_now, tmp)
                     r["path"] = tmp
                 except Exception:
                     pass   # keep its current name; phase 2 renames from there
@@ -8677,6 +10701,7 @@ class Engine:
         new_path = unique_path(worker_dir, safe_stem(new_name), path.suffix)
         try:
             path.rename(new_path)
+            self._orientation_move_path(path, new_path)
             rec["path"] = new_path
             rec["name"] = new_name
             self.rename_log.record(self.care_home, worker_dir.name,
@@ -8716,6 +10741,9 @@ def guide_dirs():
 
 def find_guide_pdf(prefix="stage 2"):
     """First guide PDF matching `prefix` across all candidate folders."""
+    bundled = bundled_resource("docs", "USER_GUIDE.pdf")
+    if prefix == "stage 2" and bundled.is_file():
+        return bundled
     for d in guide_dirs():
         try:
             if not d.is_dir():
@@ -8752,6 +10780,8 @@ def open_stage_guide(parent):
     win = tk.Toplevel(parent)
     win.title("Stage 2 — User guide")
     win.configure(bg=BG)
+    App._set_icon(win)
+    win.after(0, lambda: style_titlebar_black(win))
     win.geometry("980x760")
     win.minsize(700, 520)
     try:
@@ -8833,7 +10863,7 @@ def open_stage_guide(parent):
     wrap.pack(fill="both", expand=True)
     vs.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
-    canvas.bind_all(
+    win.bind(
         "<MouseWheel>",
         lambda e: (zoom(1.1 if e.delta > 0 else 1 / 1.1) if e.state & 0x0004
                    else canvas.yview_scroll(-1 * int(e.delta / 100), "units")))
@@ -8866,8 +10896,14 @@ def style_titlebar_black(win):
         win.update_idletasks()
         # the decorated top-level (the frame that actually owns the caption)
         # is the PARENT of the Tk client HWND
-        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        user32 = ctypes.windll.user32
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
         dwm = ctypes.windll.dwmapi
+        dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD,
+                                              ctypes.c_void_p, wintypes.DWORD]
+        dwm.DwmSetWindowAttribute.restype = ctypes.c_long
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
         DWMWA_CAPTION_COLOR = 35   # Win11 22000+ ; COLORREF 0x00BBGGRR
         DWMWA_TEXT_COLOR = 36      # Win11 22000+
@@ -8880,6 +10916,10 @@ def style_titlebar_black(win):
         white = ctypes.c_uint(0x00FFFFFF)   # white caption text
         dwm.DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR,
                                   ctypes.byref(white), ctypes.sizeof(white))
+        # No translucent/Mica caption: the approved Obsidian ribbon is black.
+        backdrop_none = ctypes.c_int(1)
+        dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop_none),
+                                  ctypes.sizeof(backdrop_none))
     except Exception:
         pass
 
@@ -8913,13 +10953,18 @@ class SettingsDialog(tk.Toplevel):
         canvas.configure(yscrollcommand=vsb.set)
         canvas.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-        canvas.bind_all("<MouseWheel>",
+        self.bind("<MouseWheel>",
                         lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
 
         b = self.body
         pad = {"padx": 16, "pady": 6}
-        tk.Label(b, text="Settings", bg=BG, fg=FG, font=UI_H).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 8))
+        settings_head = tk.Frame(b, bg=BG)
+        settings_head.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 8))
+        tk.Label(settings_head, text="Settings", bg=BG, fg=FG, font=UI_H).pack(side="left")
+        notifications_btn = tk.Button(settings_head, text="Notifications…",
+            command=lambda:master._open_notification_settings())
+        style_button(notifications_btn, PANEL2, BORDER)
+        notifications_btn.pack(side="right", padx=(12, 0))
 
         # ---------------- API KEY (stored securely) ----------------
         tk.Label(b, text="API key & security", bg=BG, fg=ACCENT, font=UI_B).grid(
@@ -9062,34 +11107,47 @@ class SettingsDialog(tk.Toplevel):
             row=21, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 0))
 
         # ---------------- OPTIONAL LOCAL AI ----------------
-        tk.Label(b, text="Local AI (private, optional)", bg=BG, fg=ACCENT,
+        tk.Label(b, text="Local page orientation (private, no API)", bg=BG, fg=ACCENT,
                  font=UI_B).grid(row=22, column=0, columnspan=2, sticky="w",
                                  padx=16, pady=(12, 2))
-        self.local_ai_var = tk.BooleanVar(
-            value=bool(cfg.get("local_ai_orientation", False)))
-        self.local_ai_model_var = tk.StringVar(
-            value=str(cfg.get("local_ai_model", "gemma3:4b")))
-        tk.Checkbutton(
-            b, text="Use local AI to double-check every image-only PDF page "
-                    "and save sideways/upside-down pages upright",
-            variable=self.local_ai_var, bg=BG, fg=FG, selectcolor=PANEL2,
-            activebackground=BG, activeforeground=FG, font=UI,
-            wraplength=400, justify="left", anchor="w").grid(
-                row=23, column=0, columnspan=2, sticky="w", padx=16,
-                pady=(2, 0))
+        self.orientation_mode_var = tk.StringVar(
+            value=cfg.get("orientation_mode", "audit"))
+        orientation_frame = tk.Frame(b, bg=BG)
+        orientation_frame.grid(row=23, column=0, columnspan=2, sticky="w",
+                               padx=16, pady=(2, 0))
+        for label, value in (
+                ("Off", "off"),
+                ("Audit only / shadow mode (default)", "audit"),
+                ("Automatic high-confidence correction", "automatic")):
+            tk.Radiobutton(
+                orientation_frame, text=label,
+                variable=self.orientation_mode_var, value=value,
+                bg=BG, fg=FG, selectcolor=PANEL2, activebackground=BG,
+                activeforeground=FG, font=UI, anchor="w").pack(anchor="w")
         local_row = tk.Frame(b, bg=BG)
         local_row.grid(row=24, column=0, columnspan=2, sticky="w", padx=34,
                        pady=(2, 2))
         self.local_ai_setup_btn = tk.Button(
-            local_row, text="Set up local AI", command=self._setup_local_ai)
+            local_row, text="Bundled CPU ONNX model", state="disabled")
         style_button(self.local_ai_setup_btn, PANEL2, BORDER)
         self.local_ai_setup_btn.pack(side="left")
-        initial_local = (f"Configured: {self.local_ai_model_var.get()}"
-                         if self.local_ai_var.get()
-                         else "Off — setup is one click and stays on this laptop")
+        self.orientation_conf_var = tk.StringVar(
+            value=str(cfg.get("orientation_confidence", 0.95)))
+        self.orientation_margin_var = tk.StringVar(
+            value=str(cfg.get("orientation_margin", 0.20)))
+        tk.Label(local_row, text="confidence", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(10, 3))
+        tk.Entry(local_row, textvariable=self.orientation_conf_var, width=5,
+                 bg=PANEL2, fg=FG, insertbackground=FG,
+                 relief="flat", font=MONO).pack(side="left")
+        tk.Label(local_row, text="margin", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(8, 3))
+        tk.Entry(local_row, textvariable=self.orientation_margin_var, width=5,
+                 bg=PANEL2, fg=FG, insertbackground=FG,
+                 relief="flat", font=MONO).pack(side="left")
         self.local_ai_status = tk.Label(
-            local_row, text=initial_local, bg=BG,
-            fg=GREEN_HI if self.local_ai_var.get() else FG_DIM,
+            local_row, text="  every PDF page, small CPU batches", bg=BG,
+            fg=FG_DIM,
             font=("Segoe UI", 8), wraplength=315, justify="left")
         self.local_ai_status.pack(side="left", padx=(10, 0))
 
@@ -9138,8 +11196,8 @@ class SettingsDialog(tk.Toplevel):
         tk.Checkbutton(b, text="Accuracy audit after processing: re-check "
                               "every renamed document with the AI (full "
                               "pages, second-model confirmed) and write "
-                              "Filename_Audit_Report.xlsx into the care-home "
-                              "folder. Audit only - nothing is renamed. "
+                              "Filename_Audit_Report.csv in Reports > Audit "
+                              "reports. Audit only - nothing is renamed. "
                               "Costs roughly as much as classifying the "
                               "folder a second time.",
                        variable=self.audit_var, bg=BG, fg=FG,
@@ -9198,38 +11256,6 @@ class SettingsDialog(tk.Toplevel):
     def _toggle_show(self):
         self.key_entry.configure(show="" if self.show_var.get() else "*")
 
-    def _setup_local_ai(self):
-        """One-click suitability check, runtime/model install and activation."""
-        self.local_ai_setup_btn.configure(state="disabled")
-        self.local_ai_status.configure(text="Checking this device…", fg=AMBER)
-
-        def progress(message):
-            try:
-                self.after(0, lambda m=message:
-                           self.local_ai_status.configure(text=m, fg=AMBER))
-            except Exception:
-                pass
-
-        def worker():
-            ok, model, message = setup_local_ai(progress)
-
-            def finish():
-                if not self.winfo_exists():
-                    return
-                self.local_ai_setup_btn.configure(state="normal")
-                self.local_ai_status.configure(
-                    text=message, fg=GREEN_HI if ok else RED_HI)
-                if ok:
-                    self.local_ai_model_var.set(model)
-                    self.local_ai_var.set(True)
-
-            try:
-                self.after(0, finish)
-            except Exception:
-                pass
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def _save(self):
         # FX
         try:
@@ -9256,7 +11282,17 @@ class SettingsDialog(tk.Toplevel):
         maxb = _num(self.maxb_var, "Max spend", 0.0)
         maxmb = _num(self.maxmb_var, "Max file size", 0.1)
         secpf = _num(self.secpf_var, "Seconds per file", 0.1)
-        if None in (maxw, maxf, maxb, maxmb, secpf):
+        orientation_conf = _num(
+            self.orientation_conf_var, "Orientation confidence", 0.5)
+        orientation_margin = _num(
+            self.orientation_margin_var, "Orientation confidence margin", 0.0)
+        if None in (maxw, maxf, maxb, maxmb, secpf,
+                    orientation_conf, orientation_margin):
+            return
+        if orientation_conf > 0.999 or orientation_margin > 0.999:
+            messagebox.showerror(
+                "Settings", "Orientation confidence and margin must be "
+                "decimal values below 1.0.", parent=self)
             return
 
         chosen_model = self.model_var.get()
@@ -9286,9 +11322,9 @@ class SettingsDialog(tk.Toplevel):
         self.cfg["adaptive_pages"] = bool(self.adapt_var.get())
         self.cfg["skip_when_clear"] = bool(self.skip_var.get())
         self.cfg["auto_other"] = bool(self.auto_other_var.get())
-        self.cfg["local_ai_orientation"] = bool(self.local_ai_var.get())
-        self.cfg["local_ai_model"] = self.local_ai_model_var.get().strip() \
-            or "gemma3:4b"
+        self.cfg["orientation_mode"] = self.orientation_mode_var.get()
+        self.cfg["orientation_confidence"] = orientation_conf
+        self.cfg["orientation_margin"] = orientation_margin
         self.cfg["redact_logs"] = bool(self.redact_var.get())
         self.cfg["move_mode"] = bool(self.move_var.get())
         self.cfg["convert_pdf"] = bool(self.convert_var.get())
@@ -9420,6 +11456,31 @@ def archive_processing_report(path, care_home="") -> Path:
                  (care_home or src.parent.name or "Unknown")).strip() or "Unknown"
     dest_dir = ARCHIVED_PROCESSING_REPORTS / sub
     dest_dir.mkdir(parents=True, exist_ok=True)
+    manifest = src.with_name(src.stem + " - Tables.csv")
+    if src.suffix.lower() == ".csv" and manifest.exists():
+        # Keep linked CSV tables together without renaming their references.
+        group = dest_dir / src.stem
+        n = 1
+        while group.exists():
+            n += 1
+            group = dest_dir / f"{src.stem} (archived {n})"
+        companions = [src, manifest]
+        for suffix in (" - Summary.csv", " - Orientation.csv"):
+            candidate = src.with_name(src.stem + suffix)
+            if candidate.exists():
+                companions.append(candidate)
+        group.mkdir()
+        moved = []
+        try:
+            for member in companions:
+                target = group / member.name
+                shutil.move(str(member), str(target))
+                moved.append((member, target))
+        except Exception:
+            for original, target in reversed(moved):
+                shutil.move(str(target), str(original))
+            raise
+        return group / src.name
     dest = dest_dir / src.name
     n = 1
     while dest.exists():
@@ -9661,7 +11722,11 @@ class ReportsDialog(tk.Toplevel):
                 for sub in PROCESSING_REPORTS_ROOT.iterdir():
                     if not sub.is_dir():
                         continue
-                    for p in sub.glob("*.xlsx"):
+                    for p in sub.iterdir():
+                        if p.suffix.lower() not in {".xlsx", ".csv"}:
+                            continue
+                        if p.stem.endswith((" - Summary", " - Orientation", " - Tables")):
+                            continue
                         key = str(p.resolve()).lower()
                         if key in seen or p.name.startswith("~$"):
                             continue
@@ -10541,7 +12606,7 @@ class App(tk.Tk):
         FX_RATE[0] = self.cfg.get("fx", 0.79)
         self.kb = KnowledgeBase()
 
-        self.title(f"Stage 2 — Processing  v{APP_VERSION}  (Doc Review AI)")
+        self.title(f"Stage 2 — Processing  v{APP_VERSION} | {APP_BUILD}")
         self.configure(bg=BG)
         ui = 1.0
         if _api_usage is not None:
@@ -10564,12 +12629,29 @@ class App(tk.Tk):
         self._console = None      # lazily created DevConsole window
         self._scanning = False    # True while a pre-flight scan is running
         self._scan_cancel = None  # threading.Event set when scan is cancelled
+        self._latest_audit_report = ""
+        self._latest_audit_completed = False
+        self._notification_run_id = ""
+        self._last_notification_worker = 0
+        self._last_notification_phase = ""
+        self._notification_workers_total = 0
+        self._last_cost_gbp = 0.0
+        self._closing = False
+        self.notification_service = NotificationService(self.cfg.get("notifications"))
 
         # thread-safe bridge for blocking unknown-dialog
         self._unknown_event = threading.Event()
         self._unknown_result = None
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._close_app)
+        self.after(1000, self._poll_notifications)
+        if self.cfg.get("_budget_safety_reset"):
+            backup = self.cfg.pop("_budget_safety_reset")
+            self.after(0, lambda: messagebox.showwarning(
+                "Spend limit corrected",
+                "The unsafe £2,500,000 local spend limit was backed up and "
+                "reset to £35 for v1.3.1.\n\nBackup:\n" + backup))
         self._refresh_env_banner()
         # paint the Windows title bar (the OS caption strip with the
         # minimise/close buttons) black to match the app
@@ -10630,173 +12712,107 @@ class App(tk.Tk):
 
     # ---------------- UI ----------------
     def _build_ui(self):
-        # top bar (black ribbon)
-        top = tk.Frame(self, bg=RIBBON, height=64)
-        top.pack(side="top", fill="x")
-        top.pack_propagate(False)
+        self.dashboard = CompactDashboard(self, globals())
 
-        tk.Label(top, text="Stage 2 — Processing", bg=RIBBON, fg=RIBBON_FG,
-                 font=("Segoe UI", 16, "bold")).pack(side="left", padx=18)
+    def _open_ai_workflow(self, role):
+        from stage2_workflow_ui import open_ai_workflow
+        open_ai_workflow(self, globals(), role)
 
-        # small, discoverable hint for the developer console shortcut
-        hint = tk.Label(top, text="Console: Ctrl+Shift+I", bg=RIBBON, fg=FG_DIM,
-                        font=("Segoe UI", 8), cursor="hand2")
-        hint.pack(side="left", padx=(0, 12))
-        hint.bind("<Button-1>", self._toggle_console)
+    def _open_notification_settings(self):
+        from stage2_workflow_ui import open_notification_settings
+        open_notification_settings(self, globals())
 
-        cog = tk.Button(top, text="⚙  Settings", command=self._open_settings)
-        style_button(cog, "#1d232b", BORDER)
-        cog.pack(side="right", padx=12)
+    def _close_app(self):
+        if self.dashboard.is_busy():
+            if not messagebox.askyesno("Stop and close?",
+                    "A Stage 2 operation is running. Stop safely after the current "
+                    "request, then close?\n\nAn interrupted accuracy audit must be "
+                    "run again; this is not pause/resume.", parent=self):
+                return
+            self._closing = True
+            if self._scan_cancel is not None:
+                self._scan_cancel.set()
+            if self.engine is not None:
+                self.engine.stop()
+            self._unknown_result = None
+            self._unknown_event.set()
+            self.after(500, self._close_when_idle)
+            return
+        self.notification_service.close()
+        self.destroy()
 
-        guide_btn = tk.Button(top, text="\U0001F4D6  Guide",
-                              command=lambda: open_stage_guide(self))
-        style_button(guide_btn, "#1d232b", BORDER)
-        guide_btn.pack(side="right", padx=(4, 0))
+    def _close_when_idle(self):
+        if self.dashboard.is_busy():
+            self.after(500, self._close_when_idle)
+        else:
+            self.notification_service.close()
+            self.destroy()
 
-        tools_btn = tk.Button(top, text="\U0001F9F0  Tools",
-                              command=self._open_tools)
-        style_button(tools_btn, "#1d232b", BORDER)
-        tools_btn.pack(side="right", padx=(4, 0))
+    def _notify(self, event, **data):
+        self.notification_service.emit(event, run_id=self._notification_run_id or "stage2", **data)
 
-        api_btn = tk.Button(top, text="\U0001F4CA  API Usage",
-                            command=self._open_api_analytics)
-        style_button(api_btn, "#1d232b", BORDER)
-        api_btn.pack(side="right", padx=(4, 0))
+    def _poll_notifications(self):
+        for status in self.notification_service.drain_statuses():
+            CONSOLE.add(str(status), "info")
+        if self.dashboard.progress.phase == "audit" and self.dashboard.is_busy():
+            progress = self.dashboard.progress
+            self._notify("long_wait", phase="audit", wait_seconds=progress.wait_seconds(),
+                         completed=progress.completed, total=progress.total)
+        self.after(1000, self._poll_notifications)
 
-        reports_btn = tk.Button(top, text="\U0001F4D1  Reports",
-                                command=self._open_reports)
-        style_button(reports_btn, "#1d232b", BORDER)
-        reports_btn.pack(side="right", padx=(4, 0))
+    def on_activity(self, event):
+        self.after(0, self._activity_main, dict(event))
 
-        jobs_btn = tk.Button(top, text="\U0001F4C8  Jobs",
-                             command=self._open_jobs)
-        style_button(jobs_btn, "#1d232b", BORDER)
-        jobs_btn.pack(side="right", padx=(4, 0))
+    def _activity_main(self, event):
+        self.dashboard.activity_event(event)
+        if event.get("phase") != "audit":
+            if event.get("kind") == "phase_started":
+                self._notify("phase_started", phase=event.get("phase", "processing"))
+            return
+        state = event.get("state")
+        data = {"phase":"audit", "completed":event.get("completed", 0),
+                "total":event.get("total", 0), "needs_review":event.get("needs_review", 0),
+                "errors":event.get("errors", 0)}
+        if state == "started":
+            self._latest_audit_completed = False
+            self._notify("audit_started", **data)
+        elif state == "document_done":
+            self._notify("progress", **data)
+        elif state == "complete":
+            self._latest_audit_report = event.get("report", "")
+            self._latest_audit_completed = bool(self._latest_audit_report and Path(self._latest_audit_report).is_file())
+            self._notify("audit_complete", **data)
+        elif state == "skipped":
+            self._notify("audit_skipped", reason=event.get("reason", "general"), **data)
+        elif state in ("failed", "stopped"):
+            self._latest_audit_completed = False
+            self._notify("error" if state == "failed" else "stopped", **data)
 
-        self.pick_btn = tk.Button(top, text="\U0001F4C1  Choose care-home folder",
-                                  command=self._pick_folder)
-        style_button(self.pick_btn, ACCENT, "#6fb6ff")
-        self.pick_btn.pack(side="right", padx=4)
-
-        # env banner
-        self.banner = tk.Label(self, text="", bg=BG, fg=AMBER, font=("Segoe UI", 9),
-                               anchor="w", justify="left")
-        self.banner.pack(side="top", fill="x", padx=18, pady=(6, 0))
-
-        # body: left preview | right log + controls
-        body = tk.Frame(self, bg=BG)
-        body.pack(side="top", fill="both", expand=True, padx=12, pady=10)
-
-        # left - preview
-        left = tk.Frame(body, bg=PANEL, width=440)
-        left.pack(side="left", fill="y")
-        left.pack_propagate(False)
-        tk.Label(left, text="Current document", bg=PANEL, fg=FG_DIM,
-                 font=UI_B).pack(anchor="w", padx=14, pady=(12, 4))
-        self.preview_name = tk.Label(left, text="—", bg=PANEL, fg=FG, font=UI,
-                                     wraplength=410, justify="left")
-        self.preview_name.pack(anchor="w", padx=14)
-        self.preview_canvas = tk.Label(left, bg=PANEL2, text="(no document)",
-                                       fg=FG_DIM)
-        self.preview_canvas.pack(fill="both", expand=True, padx=14, pady=14)
-        self._preview_ref = None
-
-        # right - controls + info + log
-        right = tk.Frame(body, bg=BG)
-        right.pack(side="left", fill="both", expand=True, padx=(12, 0))
-
-        # selected folder
-        self.folder_lbl = tk.Label(right, text="No folder selected.", bg=BG,
-                                   fg=FG, font=UI, anchor="w", justify="left",
-                                   wraplength=620)
-        self.folder_lbl.pack(anchor="w", fill="x")
-
-        # control buttons
-        ctl = tk.Frame(right, bg=BG)
-        ctl.pack(anchor="w", fill="x", pady=(10, 6))
-        self.start_btn = tk.Button(ctl, text="\u25B6  Start processing",
-                                   command=self._start, state="disabled")
-        style_button(self.start_btn, GREEN, GREEN_HI)
-        self.start_btn.pack(side="left", padx=(0, 8))
-        self.stop_btn = tk.Button(ctl, text="\u25A0  Stop", command=self._stop,
-                                  state="disabled")
-        style_button(self.stop_btn, RED, RED_HI)
-        self.stop_btn.pack(side="left", padx=(0, 8))
-        self.flatten_btn = tk.Button(ctl, text="\U0001F5C2  Flatten folders only",
-                                     command=self._flatten_only)
-        style_button(self.flatten_btn, PANEL2, BORDER)
-        self.flatten_btn.pack(side="left")
-        self.batch_btn = tk.Button(ctl, text="⏳  Check batch status",
-                                   command=self._batch_check_status,
-                                   state="disabled")
-        style_button(self.batch_btn, AMBER, AMBER_HI)
-        self.batch_btn.pack(side="left", padx=(8, 0))
-
-        # progress
-        self.progress = ttk.Progressbar(right, mode="determinate", length=200)
-        self.progress.pack(anchor="w", fill="x", pady=(4, 2))
-        self.status_lbl = tk.Label(right, text="Idle.", bg=BG, fg=FG_DIM,
-                                   font=UI, anchor="w")
-        self.status_lbl.pack(anchor="w", fill="x")
-
-        # session info panel
-        info = tk.Frame(right, bg=PANEL)
-        info.pack(anchor="w", fill="x", pady=(8, 8))
-        tk.Label(info, text="Session information", bg=PANEL, fg=FG_DIM,
-                 font=UI_B).grid(row=0, column=0, columnspan=4, sticky="w",
-                                 padx=12, pady=(8, 4))
-        self.info_vars = {}
-        fields = [("Workers done", "workers"), ("Converted to PDF", "converted"),
-                  ("Renamed", "renamed"),
-                  ("Unknowns defined", "unknown"),
-                  ("Ranked (2+ copies)", "ranked"),
-                  ("Overwrite filed", "overwrite"), ("Bulk filed", "bulk"),
-                  ("CoS dated", "cos"), ("Contracts signed", "contracts"),
-                  ("DBS best", "dbs"),
-                  ("ECS latest", "ecs"), ("BRP latest", "brp"),
-                  ("eVisa latest", "evisa"), ("NI Number best", "ni"),
-                  ("Share Code dated", "sharecode"),
-                  ("Duplicates removed", "duplicates"),
-                  ("Convert failed", "convert_failed"),
-                  ("Cached (skipped)", "skipped_cached"),
-                  ("Oversized skipped", "skipped_oversized"),
-                  ("Page-1 only", "page1_only"), ("API skipped", "skipped_api"),
-                  ("Errors", "errors")]
-        n_field_rows = (len(fields) + 3) // 4   # 4 columns per row
-        for i, (label, key) in enumerate(fields):
-            r, c = divmod(i, 4)
-            cell = tk.Frame(info, bg=PANEL)
-            cell.grid(row=1 + r, column=c, sticky="w", padx=12, pady=2)
-            tk.Label(cell, text=label, bg=PANEL, fg=FG_DIM,
-                     font=("Segoe UI", 8)).pack(anchor="w")
-            v = tk.StringVar(value="0")
-            self.info_vars[key] = v
-            tk.Label(cell, textvariable=v, bg=PANEL, fg=FG,
-                     font=("Segoe UI", 13, "bold")).pack(anchor="w")
-
-        cost_cell = tk.Frame(info, bg=PANEL)
-        cost_cell.grid(row=1 + n_field_rows, column=0, columnspan=4, sticky="w",
-                       padx=12, pady=(4, 10))
-        tk.Label(cost_cell, text="Estimated API cost (whole session)", bg=PANEL,
-                 fg=FG_DIM, font=("Segoe UI", 8)).pack(anchor="w")
-        self.cost_var = tk.StringVar(value="£0.0000")
-        tk.Label(cost_cell, textvariable=self.cost_var, bg=PANEL, fg=GREEN_HI,
-                 font=("Segoe UI", 18, "bold")).pack(side="left")
-        self.token_var = tk.StringVar(value="0 tokens")
-        tk.Label(cost_cell, textvariable=self.token_var, bg=PANEL, fg=FG_DIM,
-                 font=UI).pack(side="left", padx=(12, 0))
-
-        # log
-        tk.Label(right, text="Activity log", bg=BG, fg=FG_DIM, font=UI_B).pack(
-            anchor="w", pady=(2, 2))
-        logframe = tk.Frame(right, bg=BG)
-        logframe.pack(fill="both", expand=True)
-        self.log_text = tk.Text(logframe, bg="#0a0c0f", fg=FG, font=MONO,
-                                relief="flat", wrap="word", state="disabled")
-        self.log_text.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(logframe, command=self.log_text.yview)
-        sb.pack(side="right", fill="y")
-        self.log_text.configure(yscrollcommand=sb.set)
+    def _notify_done(self, stats, status):
+        kind, _, payload = str(status or "").partition(":")
+        if kind in ("batch_submitted", "batch_followup_submitted"):
+            values = payload.split("|")
+            try:
+                documents = int(values[0])
+                batches = int(values[1] if kind == "batch_submitted" else values[3])
+            except (ValueError, IndexError):
+                documents, batches = 0, 0
+            self._notify("batch_submitted" if kind == "batch_submitted" else "followup_submitted",
+                         phase="batch", documents=documents, batches=batches)
+        elif kind == "batch_pending":
+            self._notify("phase_started", phase="batch")
+        elif kind in ("batch_primary_ambiguous", "batch_primary_incomplete", "batch_followup_ambiguous"):
+            self._notify("blocked", reason="batch_ambiguous")
+        elif kind in ("limit", "credit", "batch_over_budget", "batch_followup_over_budget"):
+            self._notify("blocked", reason="budget")
+        elif kind == "stopped":
+            self._notify("stopped", phase="audit" if stats.get("audit_status") == "pending" else "processing")
+        elif not kind or kind in ("batch_applied", "batch_audit_complete"):
+            self._notify("run_complete", workers=stats.get("workers", 0),
+                         needs_review=stats.get("audit_needs_review", stats.get("audit_flagged", 0)),
+                         cost_gbp=self._last_cost_gbp, audit_status=stats.get("audit_status", "unknown"))
+        elif kind not in ("batch_none", "batch_empty"):
+            self._notify("blocked", reason="general")
 
     # ---------------- env / settings ----------------
     def _refresh_env_banner(self):
@@ -10831,8 +12847,10 @@ class App(tk.Tk):
         tools = list(getattr(_api_usage, "STAGE2_TOOL_APPS",
                              ("PDF Splitter", "PDF Rotator",
                               "AI Document Splitter", "Re-check Unknowns")))
-        _api_usage.open_analytics_window(self, "Stage 2 Processing",
-                                         tool_apps=tools)
+        analytics = _api_usage.open_analytics_window(self, "Stage 2 Processing",
+                                                     tool_apps=tools)
+        if analytics and getattr(analytics, "win", None):
+            analytics.win.after(0, lambda:style_titlebar_black(analytics.win))
 
     def _open_jobs(self):
         """Open (or focus) the Processing-jobs dashboard."""
@@ -10844,7 +12862,12 @@ class App(tk.Tk):
         self._jobs_win = JobsDialog(self)
 
     def _open_reports(self):
-        """Open (or focus) the Processing-reports browser."""
+        """Choose audit output or the reviewers' cumulative correction records."""
+        from stage2_workflow_ui import open_reports_menu
+        open_reports_menu(self, globals())
+
+    def _open_audit_reports(self):
+        """Preserve the existing history/archive browser behind the chooser."""
         if getattr(self, "_reports_win", None) is not None \
                 and self._reports_win.winfo_exists():
             self._reports_win.refresh()
@@ -10869,10 +12892,80 @@ class App(tk.Tk):
     def _on_settings_saved(self, cfg):
         self.cfg = cfg
         FX_RATE[0] = cfg.get("fx", 0.79)
+        self.notification_service.configure(cfg.get("notifications"))
         self._refresh_env_banner()
 
     # ---------------- folder ----------------
+    @staticmethod
+    def _primary_recovery_needed(pending):
+        if not pending or pending.get("processing_complete"):
+            return False
+        marker = pending.get("primary_submission") or {}
+        if marker.get("status") in ("submission_started", "ambiguous"):
+            return True
+        if pending.get("primary_submission_complete") is False:
+            return True
+        if (pending.get("followup") or {}).get("phase"):
+            return False
+        batches = pending.get("batches") or []
+        return bool(pending.get("requests")) and sum(
+            int(batch.get("n", 0) or 0) for batch in batches
+        ) < len(pending["requests"])
+
+    def _refresh_folder_state(self):
+        """Re-read saved state after operations; the header is not a snapshot."""
+        if not self.care_home_dir:
+            self.folder_lbl.configure(text="No folder selected.")
+            return {}, {}
+        pending = has_pending_batch(self.care_home_dir)
+        checkpoint = read_live_checkpoint(self.care_home_dir)
+        label = (f"Care home:  {self.care_home_dir.name}\n"
+                 f"Path:  {self.care_home_dir}\n"
+                 f"{len(worker_dirs_in(self.care_home_dir))} worker sub-folder(s) found.")
+        if self.cfg.get("move_mode") and self.move_dest:
+            label += f"\nMove mode: processed workers → {self.move_dest}"
+        if pending:
+            if pending.get("processing_complete"):
+                audit_status = (pending.get("audit") or {}).get("status", "pending")
+                label += (f"\nPROCESSING COMPLETE — accuracy audit {audit_status}. "
+                          "Use Check batch status to continue.")
+            elif self._primary_recovery_needed(pending):
+                label += ("\nPRIMARY SUBMISSION NEEDS RECOVERY: saved request "
+                          "and batch IDs are retained. Use Check batch status "
+                          "to verify what Anthropic accepted.")
+            else:
+                followup = pending.get("followup") or {}
+                active = followup if followup.get("phase") else pending
+                phase = "FOLLOW-UP" if active is followup else "PRIMARY"
+                label += (f"\nPENDING {phase} BATCH: "
+                          f"{len(active.get('requests', {}))} document(s) in "
+                          f"{len(active.get('batches', []))} batch(es). "
+                          "Use Check batch status to continue.")
+        elif checkpoint and not checkpoint.get("finished"):
+            label += (f"\nUNFINISHED RUN: worker "
+                      f"{checkpoint.get('workers_done', 0) + 1}/"
+                      f"{checkpoint.get('workers_total', '?')}. "
+                      "Press Start to resume completed-file skipping.")
+        self.folder_lbl.configure(text=label)
+        return pending, checkpoint
+
+    def _refresh_run_controls(self, *, busy=False, pending=None):
+        if pending is None:
+            pending = (has_pending_batch(self.care_home_dir)
+                       if self.care_home_dir else {})
+        busy = busy or getattr(self, "_recovery_busy", False)
+        self.pick_btn.configure(state="disabled" if busy else "normal")
+        self.start_btn.configure(state=("normal" if self.care_home_dir
+            and not busy and not pending else "disabled"))
+        self.flatten_btn.configure(state=("disabled" if busy or pending
+                                          else "normal"))
+        self.batch_btn.configure(state=("normal" if pending and not busy
+                                        else "disabled"))
+        self.stop_btn.configure(state="normal" if busy else "disabled")
+
     def _pick_folder(self):
+        if self._batch_busy_guard():
+            return
         start = str(desktop_path())
         title = ("Choose the SOURCE care-home folder"
                  if self.cfg.get("move_mode") else "Choose the care-home folder")
@@ -10911,36 +13004,8 @@ class App(tk.Tk):
                 return
             self.move_dest = dest
 
-        workers = [x for x in self.care_home_dir.iterdir() if x.is_dir()]
-        label = (f"Care home:  {self.care_home_dir.name}\n"
-                 f"Path:  {self.care_home_dir}\n"
-                 f"{len(workers)} worker sub-folder(s) found.")
-        if self.cfg.get("move_mode") and self.move_dest:
-            label += f"\nMove mode: processed workers → {self.move_dest}"
-
-        # ---- Overnight Batch: detect a pending submission for this folder ----
-        pend = has_pending_batch(self.care_home_dir)
-        if pend:
-            n_req = len(pend.get("requests", {}))
-            n_b = len(pend.get("batches", []))
-            label += (f"\n⏳ PENDING BATCH: {n_req} document(s) in {n_b} "
-                      f"batch(es), submitted {pend.get('submitted_ts', '?')} "
-                      f"(est. £{pend.get('est_gbp', 0):.2f}).")
-            self.batch_btn.configure(state="normal")
-        else:
-            self.batch_btn.configure(state="disabled")
-
-        # ---- Crash recovery: an unfinished LIVE run leaves a checkpoint ----
-        ckpt = read_live_checkpoint(self.care_home_dir)
-        if ckpt and not ckpt.get("finished"):
-            label += (f"\n▶ UNFINISHED RUN: stopped at worker "
-                      f"{ckpt.get('workers_done', 0) + 1}/"
-                      f"{ckpt.get('workers_total', '?')} "
-                      f"('{ckpt.get('current_worker', '?')}', "
-                      f"{ckpt.get('ts', '?')}). Press Start to resume — "
-                      f"completed documents are skipped automatically.")
-        self.folder_lbl.configure(text=label)
-        self.start_btn.configure(state="normal")
+        pend, ckpt = self._refresh_folder_state()
+        self._refresh_run_controls(pending=pend)
 
         if ckpt and not ckpt.get("finished") and not pend:
             if messagebox.askyesno(
@@ -10957,7 +13022,17 @@ class App(tk.Tk):
                     f"the normal scan/confirm step first."):
                 self.after(100, self._start)
 
-        if pend:
+        if pend and self._primary_recovery_needed(pend):
+            self.set_status("Primary submission needs recovery — use Check batch status.")
+            if messagebox.askyesno(
+                    "Primary batch submission needs recovery",
+                    "This folder has an interrupted or uncertain primary "
+                    "submission. The saved request list is retained.\n\n"
+                    "Check Anthropic's batch records now? This check will not "
+                    "submit documents. You will see the recovery plan before "
+                    "any remaining requests are submitted."):
+                self._batch_check_status()
+        elif pend:
             choice = messagebox.askyesnocancel(
                 "Pending overnight batch found",
                 f"This folder has a batch submitted on "
@@ -10988,11 +13063,18 @@ class App(tk.Tk):
         self.log_text.configure(state="disabled")
 
     def set_status(self, msg):
-        self.after(0, lambda: self.status_lbl.configure(text=msg))
+        def upd():
+            self.status_lbl.configure(text=msg)
+            self.dashboard.status_changed(msg)
+        self.after(0, upd)
 
     def set_progress(self, done, total):
         def upd():
+            if self.dashboard.progress.phase == "audit" or self.dashboard.structured_progress:
+                self.dashboard.refresh_progress()
+                return
             self.progress.configure(maximum=max(total, 1), value=done)
+            self.dashboard.worker_progress(done, total)
         self.after(0, upd)
 
     def set_preview(self, b64img, name):
@@ -11004,7 +13086,7 @@ class App(tk.Tk):
             try:
                 from io import BytesIO
                 im = Image.open(BytesIO(base64.b64decode(b64img)))
-                im.thumbnail((400, 520))
+                im.thumbnail((265, 400))
                 self._preview_ref = ImageTk.PhotoImage(im)
                 self.preview_canvas.configure(image=self._preview_ref, text="")
                 return
@@ -11015,13 +13097,15 @@ class App(tk.Tk):
 
     def on_cost(self, gbp, tokens):
         def upd():
-            self.cost_var.set(f"£{gbp:.4f}")
+            self._last_cost_gbp = float(gbp)
+            self.cost_var.set(f"£{gbp:.2f}")
             self.token_var.set(f"{tokens:,} tokens")
         self.after(0, upd)
 
     def _update_stats(self, stats):
         for k, v in self.info_vars.items():
             v.set(str(stats.get(k, 0)))
+        self.dashboard.update_stats(stats)
 
     # ---------------- unknown dialog bridge ----------------
     def ask_unknown(self, filename, guess, features, b64img):
@@ -11073,6 +13157,18 @@ class App(tk.Tk):
             if (model_id != SECOND_OPINION_MODEL_ID
                     and prim.get("in", 99.0) < strong.get("in", 0.0)):
                 escalation_api = ClaudeAPI(api_key, SECOND_OPINION_MODEL_ID)
+        self.dashboard.reset()
+        self._latest_audit_completed = False
+        pending = has_pending_batch(self.care_home_dir) if self.care_home_dir else {}
+        stamp = pending.get("submitted_ts") or datetime.datetime.now().isoformat(timespec="seconds")
+        self._notification_run_id = hashlib.sha256((str(self.care_home_dir) + stamp).encode()).hexdigest()[:16]
+        self._notification_workers_total = len(worker_dirs_in(self.care_home_dir))
+        self._last_notification_worker = 0
+        self._last_notification_phase = ""
+        if pending:
+            self._notify("phase_started", phase="batch")
+        else:
+            self._notify("run_started", workers=len(worker_dirs_in(self.care_home_dir)))
         return Engine(
             self.care_home_dir, self.kb, api, self.care_home_dir.name,
             log=self.log, set_status=self.set_status,
@@ -11095,21 +13191,24 @@ class App(tk.Tk):
             move_dest=self.move_dest,
             review_unknowns=self.review_unknowns,
             escalation_api=escalation_api,
-            auto_rotate=bool(self.cfg.get("auto_rotate", True)),
-            local_ai_orientation=bool(
-                self.cfg.get("local_ai_orientation", False)),
-            local_ai_model=str(
-                self.cfg.get("local_ai_model", "gemma3:4b")),
+            orientation_mode=str(
+                self.cfg.get("orientation_mode", "audit")),
+            orientation_confidence=float(
+                self.cfg.get("orientation_confidence", 0.95)),
+            orientation_margin=float(
+                self.cfg.get("orientation_margin", 0.20)),
             bundle_split=bool(self.cfg.get("bundle_split", True)),
             cleanup_leftovers=bool(self.cfg.get("cleanup_leftovers", True)),
-            post_run_audit=bool(self.cfg.get("post_run_audit", False)))
+            post_run_audit=bool(self.cfg.get("post_run_audit", False)),
+            on_activity=self.on_activity)
 
     def _batch_busy_guard(self) -> bool:
         """True (and warns) if a run/scan is already in progress."""
         if (self.worker_thread and self.worker_thread.is_alive()) \
-                or getattr(self, "_scanning", False):
+                or getattr(self, "_scanning", False) \
+                or getattr(self, "_recovery_busy", False):
             messagebox.showwarning(
-                "Busy", "Another run or scan is already in progress.")
+                "Busy", "Another run, scan or recovery check is already in progress.")
             return True
         return False
 
@@ -11121,7 +13220,8 @@ class App(tk.Tk):
         if not has_pending_batch(self.care_home_dir):
             messagebox.showinfo("Batch status",
                                 "No pending batch for this folder.")
-            self.batch_btn.configure(state="disabled")
+            self._refresh_folder_state()
+            self._refresh_run_controls(pending={})
             return
         api_key = get_api_key()
         if not api_key:
@@ -11133,6 +13233,10 @@ class App(tk.Tk):
         # the batch was submitted with a specific model; honour it
         pend = has_pending_batch(self.care_home_dir)
         model_id = pend.get("model_id") or model_id
+        if self._primary_recovery_needed(pend):
+            self.engine = self._make_engine(api_key, model_id)
+            self._check_primary_recovery()
+            return
         self.start_btn.configure(state="disabled")
         self.pick_btn.configure(state="disabled")
         self.flatten_btn.configure(state="disabled")
@@ -11143,6 +13247,71 @@ class App(tk.Tk):
         self.log(f"\nChecking batch status for: {self.care_home_dir}")
         self.worker_thread = threading.Thread(
             target=self.engine.run_batch_apply, daemon=True)
+        self.worker_thread.start()
+        self._poll_stats()
+
+    def _check_primary_recovery(self):
+        """Read-only reconciliation first; submission needs the shown plan."""
+        if self._batch_busy_guard():
+            return
+        self._recovery_busy = True
+        self._refresh_run_controls(busy=True)
+        self.stop_btn.configure(state="disabled")
+        self.set_status("Checking saved primary requests against Anthropic batches…")
+        engine = self.engine
+
+        def check():
+            try:
+                result = engine.recover_primary_submission(allow_resubmit=False)
+            except Exception as exc:
+                result = {"status": "blocked", "message": str(exc)}
+            self.after(0, self._primary_recovery_checked, engine, result)
+
+        self.worker_thread = threading.Thread(target=check, daemon=True)
+        self.worker_thread.start()
+
+    def _primary_recovery_checked(self, engine, result):
+        # A callback can reach Tk before the thread that queued it returns.
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.after(25, self._primary_recovery_checked, engine, result)
+            return
+        self._recovery_busy = False
+        pending, _ = self._refresh_folder_state()
+        self._refresh_run_controls(pending=pending)
+        message = str(result.get("message") or "Recovery could not be verified.")
+        if result.get("status") not in ("ready", "needs_authorization", "matched"):
+            self.set_status("Primary recovery needs attention.")
+            messagebox.showwarning(
+                "Primary batch recovery blocked",
+                message + "\n\nThe saved state is retained. No remaining "
+                "requests were submitted. Resolve the issue above, then use "
+                "Check batch status again.")
+            return
+        remaining = int(result.get("remaining", 0) or 0)
+        estimate = result.get("estimated_remaining_gbp")
+        cost_note = (f"\nEstimated remaining primary submission cost: "
+                     f"£{float(estimate):.2f}." if estimate is not None else "")
+        prompt = (f"\n\nResume the {remaining} requests confirmed as not submitted?"
+                  if remaining else
+                  "\n\nSave the recovered batch IDs? No new requests are needed.")
+        if not messagebox.askyesno(
+                "Resume primary batch submission", message + cost_note + prompt):
+            self.set_status("Recovery plan checked. Use Check batch status when ready.")
+            return
+        if self._batch_busy_guard():
+            return
+        self._recovery_busy = True
+        self._refresh_run_controls(busy=True)
+        self.set_status("Recovering primary batch submission…")
+
+        def resume():
+            try:
+                # Re-verifies the plan immediately before saving/submitting.
+                engine.recover_primary_submission(allow_resubmit=True)
+            except Exception as exc:
+                self._on_done(engine.stats, "batch_recovery_blocked:" + str(exc))
+
+        self.worker_thread = threading.Thread(target=resume, daemon=True)
         self.worker_thread.start()
         self._poll_stats()
 
@@ -11189,7 +13358,15 @@ class App(tk.Tk):
 
     # ---------------- run control ----------------
     def _start(self):
-        if not self.care_home_dir:
+        if not self.care_home_dir or self._batch_busy_guard():
+            return
+        if has_pending_batch(self.care_home_dir):
+            self._refresh_folder_state()
+            self._refresh_run_controls()
+            messagebox.showwarning(
+                "Pending batch",
+                "This folder has saved batch work. Use Check batch status "
+                "to recover or continue it before starting a new run.")
             return
         if self.cfg.get("move_mode") and not self.move_dest:
             messagebox.showwarning(
@@ -11271,10 +13448,7 @@ class App(tk.Tk):
         except Exception:
             pass
         self.progress.configure(mode="determinate", value=0)
-        self.pick_btn.configure(state="normal")
-        self.start_btn.configure(state="normal")
-        self.flatten_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
+        self._refresh_run_controls()
         self.set_status("Idle.")
 
     def _start_after_scan(self, api_key, model_id, max_file_mb, scan, already, error):
@@ -11311,12 +13485,21 @@ class App(tk.Tk):
         zoom = float(self.cfg.get("resolution", 1.5))
         adaptive = bool(self.cfg.get("adaptive_pages", True))
         vocab_block = self.kb.vocabulary_block()
-        est_live = estimate_run_cost_gbp(
-            scan["files"], model_id, zoom, adaptive, vocab_block,
-            batch=False, include_second_pass=True, cached_prefix=True)
-        est_batch = estimate_run_cost_gbp(
-            scan["files"], model_id, zoom, False, vocab_block,
-            batch=True, include_second_pass=True, cached_prefix=False)
+        followup_model_id = model_id
+        if bool(self.cfg.get("second_opinion", True)):
+            primary_price = MODELS_BY_ID.get(model_id, {}).get("in", 99.0)
+            stronger_price = MODELS_BY_ID.get(
+                SECOND_OPINION_MODEL_ID, {}).get("in", 0.0)
+            if primary_price < stronger_price:
+                followup_model_id = SECOND_OPINION_MODEL_ID
+        est_live = estimate_pipeline_costs_gbp(
+            scan["files"], model_id, followup_model_id, zoom, vocab_block,
+            batch=False,
+            include_audit=bool(self.cfg.get("post_run_audit", False)))
+        est_batch = estimate_pipeline_costs_gbp(
+            scan["files"], model_id, followup_model_id, zoom, vocab_block,
+            batch=True,
+            include_audit=bool(self.cfg.get("post_run_audit", False)))
         est_gbp = est_live["gbp"]
         self._est_at_start = {"live": est_live, "batch": est_batch,
                               "files": scan["files"]}
@@ -11373,12 +13556,18 @@ class App(tk.Tk):
             f"Model               : {self.cfg['model']}",
             "",
             "--- Estimated cost (rough; billed on real usage) ---",
-            f"Live mode           : ~£{est_live['primary_gbp']:.2f}"
+            f"Live classification : ~£{est_live['primary_gbp']:.2f}"
             f"  (prompt caching applied)",
-            f"Overnight Batch     : ~£{est_batch['primary_gbp']:.2f}"
+            f"Primary batch       : ~£{est_batch['primary_gbp']:.2f}"
             f"  (50% batch discount applied)",
-            f"Second pass (both)  : ~£{est_live['second_pass_gbp']:.2f}"
-            f"  (dating/ranking - always LIVE at standard price)",
+            f"Live finishing      : ~£{est_batch['finishing_gbp']:.2f}"
+            f"  (required dating/ranking checks)",
+            f"Follow-up reserve   : ~£{est_batch['followup_reserve_gbp']:.2f}"
+            f"  ({est_batch['followup_reserve_files']} unresolved docs, optional)",
+            f"Accuracy audit      : ~£{est_batch['audit_gbp']:.2f}"
+            f"  ({'enabled' if self.cfg.get('post_run_audit', False) else 'disabled'})",
+            f"Cumulative live     : ~£{est_live['gbp']:.2f}",
+            f"Cumulative batch    : ~£{est_batch['gbp']:.2f}",
             f"Assumptions         : {self.cfg['model']}, {zoom:.1f}x resolution, "
             f"{'adaptive pages (live)' if adaptive else 'all pages'}; "
             f"~{EST_OUTPUT_TOKENS_PER_DOC} output tokens/doc",
@@ -11415,8 +13604,16 @@ class App(tk.Tk):
         if pend:
             batch_blocked = ("A batch submitted on "
                              f"{pend.get('submitted_ts', '?')} is still pending "
-                             f"for this folder - apply or cancel it first "
-                             f"('Check batch status').")
+                             f"for this folder. Live and new batch processing "
+                             f"are blocked until it is retrieved, completed, "
+                             f"canceled and safely resolved, or its ambiguous "
+                             f"submission is resolved.")
+            messagebox.showwarning(
+                "Existing batch blocks processing",
+                batch_blocked + "\n\nUse 'Check batch status'. No live API "
+                "request has been made.")
+            self._scan_ui_reset()
+            return
         dlg = ConfirmReviewDialog(self, overview, sections, warn,
                                   mode_choice=self.cfg.get("run_mode", "live"),
                                   batch_blocked=batch_blocked)
@@ -11424,7 +13621,7 @@ class App(tk.Tk):
         if not dlg.result:
             self._scan_ui_reset()
             return
-        run_mode = dlg.mode if not batch_blocked else "live"
+        run_mode = dlg.mode
         # persist the last-used mode
         if run_mode != self.cfg.get("run_mode"):
             self.cfg["run_mode"] = run_mode
@@ -11439,6 +13636,7 @@ class App(tk.Tk):
         self._reset_stats()
 
         self.engine = self._make_engine(api_key, model_id, reprocess=reprocess)
+        self.log(pipeline.build_identity("Stage 2"))
         self.log(f"Starting review of: {self.care_home_dir}")
         self.log(f"Mode: {'Overnight Batch (50% price)' if run_mode == 'batch' else 'Live'}   "
                  f"Model: {self.cfg['model']}   FX: {FX_RATE[0]}   "
@@ -11466,6 +13664,12 @@ class App(tk.Tk):
     def _poll_stats(self):
         if self.engine:
             self._update_stats(self.engine.stats)
+            workers = int(self.engine.stats.get("workers", 0))
+            if workers > self._last_notification_worker:
+                self._last_notification_worker = workers
+                total = max(workers, getattr(self, "_notification_workers_total", 0),
+                            TRACKER.snapshot().get("workers_total", workers))
+                self._notify("worker_complete", completed=workers, total=total)
         if self.worker_thread and self.worker_thread.is_alive():
             self.after(500, self._poll_stats)
 
@@ -11479,6 +13683,10 @@ class App(tk.Tk):
             return
         # Phase 2: stop a running review
         if self.engine:
+            if self.dashboard.progress.phase == "audit" and not messagebox.askyesno(
+                    "Stop accuracy audit?", "This leaves an incomplete audit. "
+                    "Restarting checks documents again. Stop after the current request?", parent=self):
+                return
             self.engine.stop()
             self.set_status("Stopping after the current file…")
             # release a blocked unknown-dialog wait, if any
@@ -11489,19 +13697,21 @@ class App(tk.Tk):
         self.after(0, self._done_main, dict(stats), status)
 
     def _done_main(self, stats, status):
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.after(25, self._done_main, stats, status)
+            return
+        self._recovery_busy = False
         self._update_stats(stats)
-        self.start_btn.configure(state="normal")
-        self.pick_btn.configure(state="normal")
-        self.flatten_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-        # batch button reflects whether this folder still has a pending batch
-        try:
-            self.batch_btn.configure(
-                state=("normal" if self.care_home_dir
-                       and has_pending_batch(self.care_home_dir) else "disabled"))
-        except Exception:
-            pass
-        self.set_progress(1, 1)
+        pending, _ = self._refresh_folder_state()
+        self._refresh_run_controls(pending=pending)
+        if getattr(self, "dashboard", None):
+            self.dashboard.finish(stats, status)
+            self._notify_done(stats, status)
+            if self._closing:
+                return
+        kind = status.partition(":")[0] if isinstance(status, str) else status
+        if (not status or kind in ("batch_applied", "batch_audit_complete")) and stats.get("audit_status") not in ("failed", "pending", "skipped"):
+            self.set_progress(1, 1)
 
         # ---- Overnight Batch statuses (Phase A / Phase B outcomes) ----
         if isinstance(status, str) and status.startswith("batch_"):
@@ -11527,7 +13737,7 @@ class App(tk.Tk):
             self.set_status("Finished with errors.")
             head = "Finished with an error"
         else:
-            self.set_status("All workers complete.")
+            self.set_status("Processing complete; accuracy audit needs attention." if stats.get("audit_status") in ("failed", "pending", "skipped") else "All workers complete.")
             head = "Review complete"
 
         # API-credit stop gets its own clear warning dialog (not the info box).
@@ -11581,6 +13791,13 @@ class App(tk.Tk):
                             f"actual: {actual}")
         except Exception:
             pass
+        if stats.get("audit_skipped_budget"):
+            summary += ("\n\nProcessing completed, but the accuracy audit was "
+                        "skipped because the remaining cumulative budget could "
+                        "not cover its separate expected cost "
+                        f"(~£{stats.get('audit_expected_gbp', 0):.2f}).")
+        if stats.get("audit_status") in ("failed", "pending"):
+            summary += "\n\nThe accuracy audit is INCOMPLETE. Its progress is not a completed review; check Details & full log before restarting it."
         n_failed = (stats.get('errors', 0) + stats.get('skipped_oversized', 0)
                     + stats.get('skipped_cloud', 0))
         if n_failed:
@@ -11593,15 +13810,27 @@ class App(tk.Tk):
     def _done_batch(self, stats, status):
         """End-of-run handling for the Overnight Batch statuses."""
         kind, _, payload = status.partition(":")
-        if kind == "batch_submitted":
-            n_req, n_batches, est = (payload.split("|") + ["?", "?", "?"])[:3]
+        if kind == "batch_busy":
+            self.set_status("Another Stage 2 operation is using this folder.")
+            messagebox.showwarning(
+                "Batch folder is already in use",
+                (payload or "Another Stage 2 process is working on this folder.")
+                + "\n\nWait for that operation to finish, then use Check batch "
+                "status in this window. This attempt did not submit or apply "
+                "anything. The saved request list and batch IDs are retained. "
+                "Leave the state and lock files in place; the operation lock "
+                "is released automatically when the other operation ends.")
+        elif kind == "batch_submitted":
+            n_req, n_batches, primary_est, total_est = (
+                payload.split("|") + ["?", "?", "?", "?"])[:4]
             self.set_status("Batch submitted - you can close the app.")
             messagebox.showinfo(
                 "Overnight batch submitted",
                 f"Submitted {n_req} document(s) in {n_batches} batch(es).\n\n"
-                f"Estimated cost: ~£{est}  (50% batch discount applied; the "
-                f"second pass runs live at standard price when results are "
-                f"applied).\n\n"
+                f"Primary batch estimate: ~£{primary_est}\n"
+                f"Cumulative enabled estimate: ~£{total_est}\n"
+                f"(This includes live finishing, the optional discounted "
+                f"follow-up reserve and the enabled audit.)\n\n"
                 f"You can CLOSE this app now. Results are usually ready "
                 f"within an hour (up to 24 hours). Re-open this folder later "
                 f"and press 'Check batch status' to fetch and apply them.")
@@ -11610,10 +13839,11 @@ class App(tk.Tk):
                 c = json.loads(payload)
             except Exception:
                 c = {}
-            self.set_status("Batch still processing.")
+            phase = c.get("phase", "primary")
+            self.set_status(f"{phase.title()} batch still processing.")
             messagebox.showinfo(
-                "Batch still processing",
-                f"The batch has not finished yet.\n\n"
+                f"{phase.title()} batch still processing",
+                f"The {phase} batch has not finished yet.\n\n"
                 f"Succeeded so far : {c.get('succeeded', '?')}\n"
                 f"Still processing : {c.get('processing', '?')}\n"
                 f"Errored          : {c.get('errored', '?')}\n"
@@ -11621,6 +13851,78 @@ class App(tk.Tk):
                 f"Expired          : {c.get('expired', '?')}\n\n"
                 f"Try again later with 'Check batch status'. Batches usually "
                 f"finish within an hour (up to 24 hours).")
+        elif kind == "batch_followup_submitted":
+            n_req, est, model, n_batches = (
+                payload.split("|") + ["?", "?", "?", "?"])[:4]
+            self.set_status("Discounted follow-up batch submitted.")
+            messagebox.showinfo(
+                "Follow-up batch submitted",
+                f"Submitted {n_req} genuinely unresolved document(s) once to "
+                f"the discounted {model} Message Batch service in "
+                f"{n_batches} guarded chunk(s).\n\n"
+                f"Expected follow-up cost: ~£{est}.\n\n"
+                "No worker folders have been finalised or moved. Use 'Check "
+                "batch status' again after all follow-up chunks finish.")
+        elif kind == "batch_followup_warning":
+            n_req, est, model = (payload.split("|") + ["?", "?", "?"])[:3]
+            self.set_status("Large follow-up needs confirmation.")
+            approved = messagebox.askyesno(
+                "Unexpectedly large follow-up batch",
+                f"The primary results left {n_req} documents unresolved. "
+                f"Submitting them once to the discounted {model} batch is "
+                f"expected to cost ~£{est}.\n\n"
+                "No follow-up has been submitted yet. Continue?")
+            if approved and self.engine:
+                self.engine.approve_followup_warning()
+                self.after(300, self._batch_check_status)
+        elif kind == "batch_followup_over_budget":
+            expected, budget = (payload.split("|") + ["?", "?"])[:2]
+            self.set_status("Follow-up not submitted (over budget).")
+            messagebox.showwarning(
+                "Follow-up not submitted - cumulative budget",
+                f"The cumulative expected cost (£{expected}) exceeds the "
+                f"configured £{budget} ceiling. No follow-up request was sent. "
+                "The state is saved; adjust the limit and use 'Check batch "
+                "status' to continue.")
+        elif kind in ("batch_primary_ambiguous", "batch_primary_incomplete"):
+            self.set_status("Primary submission needs recovery — use Check batch status.")
+            messagebox.showwarning(
+                "Primary batch submission needs recovery",
+                "The primary submission stopped before all batch IDs were "
+                "confirmed. This is separate from the follow-up phase.\n\n"
+                "Use Check batch status to compare the saved requests with "
+                "Anthropic's batch records. Stage 2 will show a recovery plan "
+                "and ask before submitting any requests verified as missing. "
+                "Accepted requests are retained.\n\n"
+                "Keep the same care-home folder and its saved state. Start "
+                "processing and Flatten remain unavailable while this batch "
+                "needs recovery.")
+        elif kind == "batch_recovery_blocked":
+            self.set_status("Primary recovery stopped — saved state retained.")
+            messagebox.showwarning(
+                "Primary batch recovery needs attention",
+                f"{payload or 'Recovery could not be verified.'}\n\n"
+                "The saved state and any accepted batch IDs are retained. "
+                "Use Check batch status to verify them before continuing. "
+                "Do not start a new run or remove the state file.")
+        elif kind == "batch_followup_ambiguous":
+            self.set_status("Follow-up resubmission blocked.")
+            messagebox.showwarning(
+                "Follow-up submission needs independent review",
+                "A previous follow-up submission may have reached Anthropic, "
+                "but its batch id was not durably saved. Automatic resubmission "
+                "is blocked to prevent duplicate billing. The state file has "
+                "been retained for independent review.")
+        elif kind == "batch_followup_too_large":
+            self.set_status("Follow-up not submitted (size guard).")
+            payload_mb = (payload.split("|", 1)[0] if payload else "?")
+            messagebox.showwarning(
+                "One follow-up request is too large",
+                f"A rendered follow-up request was {payload_mb} MB, above the "
+                "100 MB per-batch hard guard. That chunk was not submitted; "
+                "the state file and any earlier accepted chunk IDs are "
+                "retained. Lower the processing resolution or prepare that "
+                "single source file separately, then use Check batch status.")
         elif kind == "batch_applied":
             actual, _, est = payload.partition("|")
             self.set_status("Batch results applied.")
@@ -11642,9 +13944,11 @@ class App(tk.Tk):
                 f"Errors            : {stats.get('errors', 0)}\n\n"
                 f"Batch tokens: {stats.get('batch_in_tokens', 0):,} in / "
                 f"{stats.get('batch_out_tokens', 0):,} out\n"
-                f"Batch cost (actual @50%): ~£{actual}  "
+                f"Batch cost (primary + follow-up actual @50%): ~£{actual}  "
                 f"(estimated at submit: £{est})\n"
-                f"Second pass (live): {sp_cost}\n\n"
+                f"Cumulative cost meter: {sp_cost}\n"
+                + ("Audit skipped: remaining budget was insufficient.\n"
+                   if stats.get("audit_skipped_budget") else "") + "\n"
                 f"Records saved in:\n{APP_DIR}")
         elif kind == "batch_over_budget":
             est, _, budget = payload.partition("|")
@@ -11682,9 +13986,22 @@ class App(tk.Tk):
 
     # ---------------- flatten-only ----------------
     def _flatten_only(self):
+        if self._batch_busy_guard():
+            return
+        if self.care_home_dir and has_pending_batch(self.care_home_dir):
+            messagebox.showwarning(
+                "Pending batch", "Finish or recover the selected batch with "
+                "Check batch status before flattening folders.")
+            return
         d = filedialog.askdirectory(title="Choose the care-home folder to FLATTEN",
                                     initialdir=str(desktop_path()))
         if not d:
+            return
+        if has_pending_batch(Path(d)):
+            messagebox.showwarning(
+                "Pending batch", "That folder has saved batch work. Select it "
+                "with Choose care-home folder and use Check batch status "
+                "before flattening it.")
             return
         FlattenTool(self, Path(d)).run()
 

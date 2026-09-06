@@ -23,3 +23,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $Output = Join-Path $PSScriptRoot "installer\Output\Stage2_Processing_Setup.exe"
 if (-not (Test-Path $Output)) { throw "Installer was not produced: $Output" }
 Write-Host "Built: $Output" -ForegroundColor Green
+
+# Generate this only after every public binary is final. Deliberately do not
+# include the manifest itself: an installer cannot embed its own final hash.
+& (Join-Path $PSScriptRoot "generate_release_checksums.ps1")
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

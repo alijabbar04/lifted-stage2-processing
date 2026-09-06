@@ -1,5 +1,39 @@
 # Stage 2 — Processing
 
+## v1.4.0 — Obsidian Compact
+
+The compact near-black UI keeps the three key run measures visible and moves
+the detailed counters/log into **Details**. The real app icon and black Windows
+caption match the design. Jobs, Reports, API Usage, Tools, Guide and Settings
+remain available. The audit shows checked-document progress, its current
+operation and an explicitly incomplete state when interrupted.
+
+**Reports** offers the filename audit or the AI correction ledger.
+**Review audit…** prepares a provider-neutral Luna/Opus handoff;
+**Learn from corrections…** prepares a Sol/Fable code-review handoff. Each role
+shares durable rules and file-based memory, with verified account selection.
+Document corrections use hash-checked transactions and full-category ranking;
+code learning requires evidence and regression tests. Both are explicit actions,
+not hidden extra API work after processing.
+
+**Settings → Notifications…** configures Discord and/or Telegram lifecycle
+updates. Credentials stay local; public builds contain no bot tokens.
+See the [complete user guide](docs/USER_GUIDE.md),
+[AI workflow details](docs/AI_WORKFLOW_INTEGRATION.md) and
+[notification setup](docs/NOTIFICATIONS.md).
+
+### Included pipeline changes
+
+New audit/override reports default to CSV. Audit, Summary and optional
+Orientation tables stay separate, linked by a `- Tables.csv` manifest; the
+report browser archives these companions together. Existing Excel reports
+and the internal Filename Identification Record workbook remain supported.
+
+Completed worker moves update the shared `<Care Home> roster.csv`, preserving
+approved Lifted profile IDs for Stage 3. Classification models, pricing,
+vocabulary and orientation policy are unchanged by this pipeline patch.
+The earlier pipeline and restart-safe batch recovery work is included in this release.
+
 **AI-powered document classification and renaming for UK care-worker compliance
 documents.**
 
@@ -79,11 +113,11 @@ gh auth login --web
 **Step 3 — download and run the installer:**
 
 ```powershell
-gh release download v1.3.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
+gh release download v1.4.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
 ```
 
-That downloads the app (~57 MB), installs it, creates the shortcuts, and
-verifies what landed:
+That downloads the app (~75 MB) and `SHA256SUMS.txt`, verifies the executable
+before copying it anywhere, then installs it and creates the shortcuts:
 
 | Installed | Where |
 |---|---|
@@ -92,10 +126,14 @@ verifies what landed:
 
 > Prefer a normal Windows setup wizard? Download `Stage2_Processing_Setup.exe`
 > from the same release. It installs the app, shortcuts and guide. Alternatively,
-> download `Stage2_Processing.exe` for a single portable file.
+> download `Stage2_Processing.exe` from the
 > [Releases](https://github.com/alijabbar04/lifted-stage2-processing/releases)
-> page — it's a single self-contained exe and runs from anywhere. You just don't
-> get the shortcuts or the in-app guide.
+> page for a self-contained portable file. It includes the in-app guide and AI
+> workflow rules; automatic shortcuts are provided by the installer.
+
+For a manual download, compare `Get-FileHash -Algorithm SHA256` for the portable
+app or setup executable with its exact entry in the release's
+`SHA256SUMS.txt`. A mismatch means the file must not be run.
 
 ### First run
 
@@ -114,6 +152,18 @@ verifies what landed:
    holding one sub-folder per worker.
 5. Pick **Live** (results as it goes) or **Overnight Batch** (half price, ready
    within ~1 hour, guaranteed within 24). Start it.
+
+In v1.3.1, Overnight Batch settles confident controlled matches and descriptive
+Other results from the primary batch. Only genuinely unresolved documents are
+sent once in a second discounted batch; with second opinion enabled, that small
+batch uses Sonnet directly. Keep using **Check batch status** through both
+phases. Worker folders are not finalised or moved while a follow-up is pending.
+
+If a **primary submission needs recovery**, select the same folder and use
+**Check batch status**. Stage 2 checks the saved requests against Anthropic's
+batch records first, then shows a recovery plan before asking to submit any
+verified remaining requests. Start processing and Flatten stay unavailable
+while saved batch work remains. Keep the hidden batch-state file in place.
 
 > There is also a private installer named
 > `Stage2_Processing_Preconfigured_Setup.exe` that pre-configures the API key, so
@@ -166,11 +216,23 @@ Costs are small but real. One measured data point: a full verification sweep of
 Haiku is a third of Sonnet's input price, and **Overnight Batch mode halves it
 again**. Reckon on single-digit pounds for a typical care home, not tens.
 
+The confirmation screen shows primary classification, required live finishing,
+the optional follow-up reserve and the optional accuracy audit separately, then
+applies the configured ceiling to their cumulative total. Before an enabled
+audit begins, Stage 2 reports its own expected cost; processing remains complete
+and the audit is skipped if the remaining budget cannot cover it.
+
+Long PDFs retain the safe bounded view (first two pages plus the last page). They
+are never automatically scanned page-by-page or split from sampled evidence.
+Explicit sampled signs of a bundle create a review flag while leaving the
+original intact. Short PDFs with at most seven useful pages retain the single-
+classification bundle split and archive their originals.
+
 Built-in safeguards, all editable in Settings:
 
 | Guard | Default | Effect |
 |---|---|---|
-| `max_budget_gbp` | **£25** | run stops as soon as the live estimate hits it |
+| `max_budget_gbp` | **£35** | one cumulative ceiling across batch, follow-up, live finishing and audit |
 | `CONFIRM_COST_THRESHOLD_GBP` | £1 | pre-flight estimate above this needs confirmation |
 | `max_workers` | 100 | stops after this many worker folders |
 | `max_files` | 2000 | stops after this many files sent |
@@ -181,23 +243,20 @@ Built-in safeguards, all editable in Settings:
 The live cost meter uses the **real token counts the API returns**, not
 estimates. Prices live in one place — the `MODELS & PRICING` block at the top of
 `src/Stage2_Processing.pyw` (last verified against Anthropic's public pricing
-2026-07-06). Classification traffic goes only to the Anthropic API. If you
-explicitly enable **Local AI** in Settings, image-only orientation checks go only
-to Ollama on `127.0.0.1` and never leave the laptop.
+2026-09-02). Classification traffic goes only to the Anthropic API. Page
+orientation uses the bundled ONNX model through CPU-only ONNX Runtime; pages,
+thumbnails and orientation metadata never leave the laptop.
 
-### Optional local AI orientation
+### Local page orientation
 
-Settings now has a one-click **Set up local AI** control. It checks RAM and free
-disk space, installs/starts Ollama if needed, and downloads or reuses
-`gemma3:4b`. The app deliberately prefers 4B over the installed 12B model: on
-this mostly-CPU laptop the 12B cold-page check exceeded two minutes, while
-orientation is a small repeated task where responsiveness matters more.
-
-When enabled, every PDF page that lacks a reliable text layer is examined twice
-locally: once as stored and once with a known 90-degree probe turn. Stage 2 only
-acts when both answers are high-confidence and mathematically consistent. A
-missing/stopped local service never blocks a run; the normal rotation checks
-continue automatically.
+Settings offers **Off**, **Audit only / shadow mode** and **Automatic
+high-confidence correction**. Audit only is the v1.3.1 default. Every PDF page
+is inspected locally in small batches, separately from the bounded paid
+classification sample. Automatic mode additionally requires both the configured
+confidence and margin thresholds and vetoes blank, sparse, photographic and
+conflicting evidence. The model is shipped in the executable, never downloaded
+at runtime, and a missing/failed runtime leaves documents unchanged with a clear
+audit warning—there is no paid or network orientation fallback.
 
 ---
 
@@ -212,16 +271,22 @@ python src\Stage2_Processing.pyw  # run from source
 ```
 
 Needs **Python 3.13** (3.11+ works) with *"Add python.exe to PATH"* ticked.
-Dependencies are four packages — `pymupdf`, `pillow`, `openpyxl`, `keyring`
-([requirements.txt](requirements.txt)). There is **no Anthropic SDK**: the app
-calls the Messages API and the Message Batches API directly over `urllib`.
+Dependencies include `pymupdf`, `pillow`, `onnxruntime`, `openpyxl`, `keyring`
+and Windows-only `pywin32`; use the pinned
+[requirements.txt](requirements.txt). There is **no Anthropic SDK**. Most API
+traffic uses `urllib`; Windows batch submissions use native WinHTTP with no
+automatic POST retry or transport fallback, preserving ambiguous-submission
+recovery and avoiding duplicate billing.
 
 ### Repository layout
 
 | Path | What |
 |---|---|
-| [`src/Stage2_Processing.pyw`](src/Stage2_Processing.pyw) | the whole app — GUI, engine, vocabulary, rules (9,530 lines) |
+| [`src/Stage2_Processing.pyw`](src/Stage2_Processing.pyw) | the whole app — GUI, engine, vocabulary and rules |
 | [`src/api_usage.py`](src/api_usage.py) | shared cross-app API usage ledger + analytics page |
+| [`src/local_orientation.py`](src/local_orientation.py) | CPU-only ONNX page-orientation inference and safety gates |
+| [`assets/orientation/`](assets/orientation/) | pinned official 7 MB model, licence and provenance |
+| [`tools/orientation_benchmark.py`](tools/orientation_benchmark.py) | explicit-folder, offline orientation benchmark |
 | [`src/eval_classifier.py`](src/eval_classifier.py) | regression harness over the ground-truth set |
 | [`src/Stage2_Recheck_Unknowns.pyw`](src/Stage2_Recheck_Unknowns.pyw) | standalone "re-check leftover unknowns" tool |
 | [`src/misname_log.py`](src/misname_log.py) | appends to the Misnaming Record workbook |
@@ -233,10 +298,9 @@ calls the Messages API and the Message Batches API directly over `urllib`.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` is the exact source that produced the shipped v1.3.0
-exe, so `build\build.ps1` reproduces it. The only edit is one code comment whose
-example filename used a real worker's name, replaced with a synthetic one — no
-functional change.
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for v1.4.0. `build\build.ps1`
+reproduces the application executable and `build\build_public_installer.ps1`
+builds the credential-free public installer.
 
 ### A few things worth knowing before you edit
 
@@ -251,6 +315,11 @@ functional change.
   break silently.
 - **Model IDs are pinned deliberately** (`claude-haiku-4-5`,
   `claude-sonnet-4-6`, `claude-opus-4-8`). Do not "upgrade" them without asking.
+- **Local orientation is separate from paid classification.** It examines every
+  processed PDF page locally with the bundled CPU-only ONNX model. v1.3.1
+  defaults to audit/shadow mode; automatic high-confidence correction must stay
+  opt-in until a representative, manually reviewed local benchmark supports the
+  configured thresholds.
 - **`classify_document_core` and `validate_result` are module-level on purpose**
   so the engine, the regression harness and the re-check tool all share the exact
   same classification path and cannot drift.
@@ -272,7 +341,10 @@ functional change.
    (`python src\eval_classifier.py --tag my-fix` — needs a local ground-truth
    copy via `STAGE2_GT_ROOT`; costs real API money and asks first).
 5. **Rebuild the exe:** `.\build\build.ps1`
-6. **Open a PR.** Say what changed in the vocabulary, and either paste the
+6. **Build the public installer and final checksum manifest:**
+   `.\build\build_public_installer.ps1`. This writes `dist\SHA256SUMS.txt`
+   only after the app, public setup executable and bundled ONNX asset exist.
+7. **Open a PR.** Say what changed in the vocabulary, and either paste the
    harness result or say why it was not run.
 
 If a colleague runs the packaged app, remember the exe/installer must be
@@ -298,11 +370,18 @@ anything tracked here. Treat any built installer as a secret.
   `keyring` (Windows Credential Manager) → `ANTHROPIC_API_KEY` → a
   permission-restricted local file as a last resort. `config.json` actively
   strips any `api_key` field, and migrates legacy plaintext keys into keyring.
-- **No care-worker personal data.** No sample documents, no logs, no caches, no
-  runtime workbooks. The regression harness's ground-truth set is real worker
+- **No care-worker personal data.** The only sample PDFs are synthetic,
+  non-sensitive orientation fixtures; there are no production documents, logs,
+  caches or runtime workbooks. The regression harness's ground-truth set is real worker
   documents and is intentionally absent — supply it locally via
   `STAGE2_GT_ROOT`.
 - The controlled vocabulary contains document *category* names
   ("DBS Certificate", "Share Code") — categories, not people.
 - The repository is **public**. Never commit API keys, worker documents,
   generated reports, browser profiles, or credential-bearing installers.
+
+## Licence
+
+No open-source application licence has been selected. The owner authorized this
+release; publication does not add reuse permissions. The bundled orientation
+model's Apache-2.0 terms remain separate. See [docs/LICENSING.md](docs/LICENSING.md).

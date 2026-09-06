@@ -100,26 +100,26 @@ nothing the classifier can act on — handle it by hand.
 
 ### Sideways or upside-down scans
 
-Handled automatically per page. Stage 2 combines the free text-layer direction
-check with the model's decisions for every page it saw; fixing one text page no
-longer suppresses a different scanned page's correction. With **Local AI**
-enabled in Settings, pages without readable embedded text are double-checked by
-the local Ollama vision model as well. Only mutually consistent high-confidence
-local answers are applied. The corrected PDF is physically saved upright before
-Stage 3 sees it.
+Every PDF page can be checked by the bundled CPU-only ONNX model. v1.3.1 starts
+in **Audit only / shadow mode**, which reports uncertain and apparently rotated
+pages but never changes them. **Automatic high-confidence correction** is
+opt-in: it also requires the confidence-margin gate and refuses blank, sparse,
+photograph-only or locally conflicting pages. Accepted corrections are saved
+atomically before paid classification. No orientation data leaves the laptop
+and there is no API fallback.
 
 If a scan is still misread, it is usually so skewed that no orientation reads
 cleanly. Straighten it with **🧰 Tools → PDF Rotator** and re-run.
 
 ### One PDF contains several different documents
 
-Also automatic. Short PDFs that fit in one request bypass page-one triage and are
-shown in full, so a confident Passport on page 1 cannot hide a visa or BRP later
-in the file. Large PDFs receive a low-resolution scan of every page. Any proposed
-cut is then checked independently by classifying every would-be child; each side
-must resolve to a different controlled type at high confidence before the real
-file is changed. The original bundle is archived outside the worker tree and
-every page is retained. Unconfirmed cuts fail closed and are flagged for review.
+Short PDFs that fit in one request bypass page-one triage and are shown in full,
+so a confident Passport on page 1 cannot hide a visa or BRP later in the file.
+The same response supplies the guarded split plan; it does not trigger extra
+bundle API calls. Long PDFs retain the bounded first-two-plus-last paid sample,
+are never split from sampled evidence, and are only flagged when that sample
+explicitly suggests a bundle. For a confirmed short split, the original is
+archived outside the worker tree and every page is retained.
 
 If a bundle slips through, split it with **🧰 Tools → AI Document Splitter** and
 re-run that worker.
@@ -175,7 +175,7 @@ everywhere automatically. Full explanation in
 
 ### "budget limit reached"
 
-The live cost estimate hit the ceiling — **£25** by default. Raise
+The cumulative cost estimate hit the ceiling — **£35** by default. Raise
 `max_budget_gbp` in Settings if the run is legitimately that large, then re-run;
 completed files are skipped.
 
@@ -192,8 +192,60 @@ lives in `.docreview_batch_state.json` (hidden) in the care-home folder — leav
 it alone, it is how the app resumes and collects results. Re-open the app and the
 same folder to check on and apply a submitted batch.
 
+v1.3.1 can show a second **follow-up** phase for only the genuinely unresolved
+documents. This is also a discounted Message Batch, not a live Haiku-to-Sonnet
+retry chain. Keep using **Check batch status**; workers are not moved until it
+finishes. An unexpectedly large follow-up requires confirmation before it is
+submitted. If Stage 2 reports an ambiguous submission state, it deliberately
+will not resubmit automatically because doing so could bill the same documents
+twice.
+
 Do not delete that file while a batch is outstanding, or the app loses track of
 work you have already paid for.
+
+While that state is pending or ambiguous, Stage 2 blocks all live processing
+for the same folder. This is deliberate: a live fallback could duplicate paid
+work. Use **Check batch status** to retrieve/complete it or resolve the retained
+attempt record safely.
+
+### Primary batch submission needs recovery
+
+This means the first submission phase was interrupted, or the app could not
+confirm a submission response. It is separate from the later follow-up phase.
+Select the same care-home folder and press **Check batch status**. Stage 2
+first performs a read-only comparison of its saved request list and
+Anthropic's batch records. It presents the verified recovery plan and remaining
+primary estimate before asking to resume. Accepted requests are kept; only
+requests verified as unsubmitted can be sent by recovery.
+
+If reconciliation is blocked, the message explains what could not be verified.
+Resolve that condition and check again. Leave `.docreview_batch_state.json`
+in place. Do not use a new run or flatten the folder to work around the
+unfinished batch; those actions remain disabled while it is pending.
+
+After recovery, the main header updates from saved state. Use **Check batch
+status** again to collect and apply the results when the batches finish.
+A stopped, failed or pending operation no longer fills the progress bar just
+because its background operation returned.
+
+### Local orientation warning / model unavailable
+
+Page orientation uses the bundled CPU-only ONNX model and never falls back to a
+paid API. If the model, checksum or ONNX Runtime is unavailable, Stage 2 leaves
+every page unchanged, continues normal classification, and records the warning
+in the Orientation sheet of `Filename_Audit_Report.xlsx`.
+
+v1.3.1 defaults to **Audit only / shadow mode**. Apparently rotated and
+uncertain pages are recorded but not changed. Automatic mode should remain
+opt-in until `tools/orientation_benchmark.py` has been run on an explicitly
+selected, representative and manually reviewed test folder.
+
+Example (offline; the source folder is never modified):
+
+```powershell
+python tools\orientation_benchmark.py C:\path\to\reviewed-test-set `
+  --output C:\Temp\orientation-results.xlsx
+```
 
 ---
 
@@ -235,9 +287,21 @@ or run from the repository root.
 
 ### The app will not start from source
 
-Run `.\setup.ps1` — a missing `pymupdf`, `pillow` or `openpyxl` stops it
+Run `.\setup.ps1` — a missing `pymupdf`, `pillow`, `onnxruntime` or `openpyxl` stops it
 immediately. `keyring` is the exception: without it the app still runs and falls
 back to the `ANTHROPIC_API_KEY` environment variable.
+
+### The installed app says it cannot find a usable `init.tcl`
+
+Use a v1.3.1 build produced after the frozen-startup correction. Earlier
+v1.3.1 candidates allowed Windows to select `C:\Windows\Temp` for PyInstaller's
+one-file extraction; Tcl/Tk could then fail before the Stage 2 window opened.
+Corrected builds extract into the current user's
+`%LOCALAPPDATA%\Lifted\Stage2Runtime` directory and are rejected by the build
+script unless the real Stage 2 window opens in a launch test.
+
+This error happens before any worker folder is selected. It does not process,
+rename, move or upload documents, and it does not make an API call.
 
 ---
 
