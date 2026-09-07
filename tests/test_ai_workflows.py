@@ -36,8 +36,12 @@ def setup(tmp_path, monkeypatch):
     (ledger.parent / "review_records.jsonl").write_text("", encoding="utf-8")
     account = wf.Account("test", "codex", "Personal", tmp_path / "codex-home", "test@example.com")
     account.config_dir.mkdir()
-    verified = {"provider": "codex", "email": "test@example.com", "model": "gpt-5.6-luna", "effort": "high", "status": "verified", "executable": "codex.exe"}
-    monkeypatch.setattr(wf, "validate_selection", lambda *a, **k: verified.copy())
+    def fake_validate(account, model_key, expected_email=None, effort=None, role=None):
+        # Echo the exact requested model/effort like the real preflight does.
+        choice = wf.model_choice(model_key, effort, role)
+        return {"provider": account.provider, "email": "test@example.com", "model": choice["id"], "model_key": model_key,
+                "effort": choice["effort"], "status": "verified", "executable": "codex.exe"}
+    monkeypatch.setattr(wf, "validate_selection", fake_validate)
     return SimpleNamespace(account=account, audit=audit, documents=documents, processing=processing, source=source, ledger=ledger,
                            kwargs=dict(audit_report=audit, document_root=documents, care_home="Care home", source_root=source,
                                        assets_root=assets, workspace_root=tmp_path / "context", ledger_path=ledger,
@@ -126,7 +130,7 @@ def test_incomplete_audit_and_missing_source_rejected(setup):
     with pytest.raises(wf.WorkflowError, match="Git source checkout"):
         wf.prepare_workflow("code-learning", setup.account, "sol", **(setup.kwargs | {"source_root": setup.documents}))
     with pytest.raises(wf.WorkflowError, match="supported model"):
-        wf.prepare_workflow("audit-review", setup.account, "sol", **setup.kwargs)
+        wf.prepare_workflow("audit-review", setup.account, "not-a-model", **setup.kwargs)
     with pytest.raises(wf.WorkflowError, match="Audit review requires"):
         wf.prepare_workflow("audit-review", setup.account, "luna", allow_document_changes=True,
                             **(setup.kwargs | {"source_root": setup.documents}))
@@ -225,3 +229,190 @@ def test_real_powershell_roundtrips_prompt_without_execution(setup, shell_name):
     result = subprocess.run(args, capture_output=True, text=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == [payload]
+
+
+# --------------------------------------------------------------------------- #
+# Shared model catalog, explicit effort and pre-run automatic review defaults
+# --------------------------------------------------------------------------- #
+def test_catalog_uses_explicit_ids_with_inferred_provider_and_per_role_ranking():
+    assert set(wf.MODEL_CATALOG) == {"sol", "terra", "luna", "astra", "opus", "fable"}
+    assert wf.MODEL_CATALOG["sol"]["id"] == "gpt-5.6-sol" and wf.MODEL_CATALOG["astra"]["id"] == "gpt-6-astra"
+    assert wf.MODEL_CATALOG["opus"]["id"] == "claude-opus-5" and wf.MODEL_CATALOG["fable"]["id"] == "claude-fable-5-1"
+    assert wf.model_keys_for_role("audit-review")[0] == "sol"
+    assert wf.model_keys_for_role("code-learning")[0] == "fable"
+    assert set(wf.model_keys_for_role("audit-review")) == set(wf.MODEL_CATALOG)  # no single-role lock
+    assert wf.DEFAULT_MODEL == {"audit-review": "sol", "code-learning": "fable"}
+    assert wf.DEFAULT_EXPECTED_EMAIL == ""
+    # Compatibility view still exposes label/provider/id/effort/role.
+    for key, choice in wf.MODEL_CHOICES.items():
+        assert {"label", "provider", "id", "effort", "role", "roles"} <= set(choice)
+        assert choice["provider"] == ("claude" if key in ("opus", "fable") else "codex")
+    with pytest.raises(wf.WorkflowError):
+        wf.model_keys_for_role("other")
+
+
+def test_model_choice_resolves_immutable_metadata_and_effort_ranking():
+    choice = wf.model_choice("sol", role="audit-review")
+    assert choice["id"] == "gpt-5.6-sol" and choice["provider_label"] == "Codex (OpenAI)"
+    assert choice["effort"] == "high" and choice["recommended_effort"] == "high" and not choice["effort_explicit"]
+    assert choice["efforts"][:4] == ("high", "xhigh", "medium", "max")
+    assert set(choice["advanced_efforts"]) == {"minimal", "low", "ultra"}
+    with pytest.raises(TypeError):
+        choice["effort"] = "low"
+    explicit = wf.model_choice("sol", "XHigh", "audit-review")
+    assert explicit["effort"] == "xhigh" and explicit["effort_explicit"] and explicit["effort_label"] == "Extra High"
+    assert wf.model_choice("astra", role="code-learning")["recommended_effort"] == "medium"
+    assert wf.model_choice("astra", role="audit-review")["recommended_effort"] == "high"
+    assert wf.model_choice("fable", role="code-learning")["rank"] == 1
+    assert wf.model_choice("fable")["role"] == "code-learning"  # primary role when unspecified
+    assert wf.effort_choices("sol", "audit-review", advertised=["low", "medium", "high"]) == ("high", "medium", "low")
+    assert wf.effort_choices("fable", "code-learning")[-1] == "low"
+    with pytest.raises(wf.WorkflowError, match="does not accept"):
+        wf.model_choice("fable", "ultra", "code-learning")
+    with pytest.raises(wf.WorkflowError, match="supported model"):
+        wf.model_choice("gpt-4")
+    with pytest.raises(wf.WorkflowError, match="Unknown AI workflow role"):
+        wf.model_choice("sol", role="publishing")
+
+
+def test_explicit_effort_carried_through_manifest_prompt_command_and_status(setup):
+    prepared = wf.prepare_workflow("audit-review", setup.account, "sol", effort="xhigh", **setup.kwargs)
+    assert prepared.effort == "xhigh"
+    manifest = json.loads((prepared.request_dir / "manifest.json").read_text())
+    assert manifest["model"] == "gpt-5.6-sol" and manifest["model_key"] == "sol"
+    assert manifest["effort"] == "xhigh" and manifest["effort_source"] == "explicit"
+    assert manifest["preflight"]["effort"] == "xhigh"
+    assert 'model_reasoning_effort="xhigh"' in prepared.provider_args
+    assert "gpt-5.6-sol (Sol · Codex (OpenAI)) / xhigh effort" in prepared.prompt_file.read_text(encoding="utf-8")
+    recommended = wf.prepare_workflow("code-learning", setup.account, "astra", **setup.kwargs)
+    manifest = json.loads((recommended.request_dir / "manifest.json").read_text())
+    assert manifest["effort"] == "medium" and manifest["effort_source"] == "recommended"
+    # The old single-role default must never overwrite an explicit selection.
+    assert wf.MODEL_CHOICES["astra"]["effort"] == "medium"
+    assert json.loads((wf.prepare_workflow("code-learning", setup.account, "astra", effort="high", **setup.kwargs).request_dir / "manifest.json").read_text())["effort"] == "high"
+    claude = wf.Account("claude-test", "claude", "Personal", setup.account.config_dir, "test@example.com")
+    prepared = wf.prepare_workflow("audit-review", claude, "opus", effort="max", preflight=False, **setup.kwargs)
+    assert prepared.provider_args[1:5] == ["--model", "claude-opus-5", "--effort", "max"]
+    with pytest.raises(wf.WorkflowError, match="does not accept"):
+        wf.prepare_workflow("audit-review", claude, "opus", effort="ultra", preflight=False, **setup.kwargs)
+    run = wf.HeadlessRun(prepared, SimpleNamespace(poll=lambda: None))
+    assert run.poll() is None
+
+
+def test_launch_revalidates_the_exact_effort(setup, monkeypatch):
+    prepared = wf.prepare_workflow("audit-review", setup.account, "sol", effort="xhigh", **setup.kwargs)
+    seen = {}
+    def revalidate(account, model_key, expected_email=None, effort=None, role=None):
+        assert role == "audit-review"
+        seen.update(model_key=model_key, effort=effort, expected=expected_email)
+        return {"provider": "codex", "email": expected_email, "model": "gpt-5.6-sol", "effort": effort, "executable": "codex.exe"}
+    monkeypatch.setattr(wf, "validate_selection", revalidate)
+    monkeypatch.setattr(wf.subprocess, "Popen", lambda *a, **k: SimpleNamespace(pid=1))
+    wf.launch_workflow(prepared)
+    assert seen == {"model_key": "sol", "effort": "xhigh", "expected": "test@example.com"}
+    # Tampered manifest effort blocks launch rather than silently re-choosing.
+    fresh = wf.prepare_workflow("audit-review", setup.account, "sol", effort="xhigh", **setup.kwargs)
+    manifest_path = fresh.request_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["effort"] = "low"
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(wf.WorkflowError, match="effort no longer matches"):
+        wf.launch_workflow(fresh)
+    # Revalidation that reports a different model/effort also blocks.
+    other = wf.prepare_workflow("audit-review", setup.account, "sol", effort="xhigh", **setup.kwargs)
+    monkeypatch.setattr(wf, "validate_selection", lambda *a, **k: {"provider": "codex", "email": "test@example.com", "model": "gpt-5.6-luna", "effort": "xhigh"})
+    with pytest.raises(wf.WorkflowError, match="different model/effort"):
+        wf.launch_workflow(other)
+
+
+def test_codex_preflight_checks_advertised_effort_for_the_explicit_selection(tmp_path, monkeypatch):
+    account = wf.Account("1", "codex", "Personal", tmp_path)
+    monkeypatch.setattr(wf, "find_cli", lambda p: "codex.exe")
+    catalog = {"account": {"type": "chatgpt", "email": "personal@example.com", "planType": "pro"},
+               "models": [{"model": "gpt-5.6-sol", "supportedReasoningEfforts": [{"reasoningEffort": level} for level in ("low", "medium", "high", "xhigh", "max", "ultra")]},
+                          {"model": "gpt-5.6-luna", "supportedReasoningEfforts": [{"reasoningEffort": level} for level in ("low", "medium", "high", "xhigh", "max")]}]}
+    monkeypatch.setattr(wf, "query_codex", lambda *a: catalog)
+    result = wf.validate_selection(account, "sol", "personal@example.com", effort="ultra")
+    assert result["model"] == "gpt-5.6-sol" and result["effort"] == "ultra" and result["plan"] == "pro"
+    assert result["supported_efforts"] == ("low", "medium", "high", "xhigh", "max", "ultra")
+    assert result["status"] == "account-and-model-verified"
+    assert wf.validate_selection(account, "sol")["effort"] == "high"
+    with pytest.raises(wf.WorkflowError, match="does not advertise Ultra"):
+        wf.validate_selection(account, "luna", effort="ultra")
+    with pytest.raises(wf.WorkflowError, match="No fallback model"):
+        wf.validate_selection(account, "astra")
+    with pytest.raises(wf.WorkflowError, match="belonging to the selected model"):
+        wf.validate_selection(account, "opus")
+    # Empty profile metadata is not "no account": the live identity is used.
+    assert account.email == "" and result["email"] == "personal@example.com"
+
+
+def test_claude_preflight_accepts_full_model_ids_and_documented_efforts(tmp_path, monkeypatch):
+    account = wf.Account("1", "claude", "Personal", tmp_path, "someone@example.com")
+    monkeypatch.setattr(wf, "find_cli", lambda p: "claude.exe")
+    monkeypatch.setattr(wf, "_run_json", lambda args, env: {"loggedIn": True, "email": "someone@example.com", "authMethod": "claude.ai"})
+    help_text = ("Options:\n  --effort <level>                      Effort level for the current session\n"
+                 "                                        (low, medium, high, xhigh, max)\n"
+                 "  --model <model>                       Model for the current session. Provide\n"
+                 "                                        an alias (e.g. 'fable') or a model's full name (e.g. 'claude-fable-5').\n"
+                 "  -n, --name <name>                     Session name\n")
+    monkeypatch.setattr(wf.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=help_text, returncode=0))
+    result = wf.validate_selection(account, "fable", effort="xhigh")
+    assert result["model"] == "claude-fable-5-1" and result["effort"] == "xhigh"
+    assert result["supported_efforts"] == ("low", "medium", "high", "xhigh", "max")
+    assert "entitlement-checked-by-Claude-at-launch" in result["status"]
+    assert wf.validate_selection(account, "opus")["effort"] == "high"
+    old_help = help_text.replace("(low, medium, high, xhigh, max)", "(low, medium, high)")
+    monkeypatch.setattr(wf.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=old_help, returncode=0))
+    with pytest.raises(wf.WorkflowError, match="does not document Extra High"):
+        wf.validate_selection(account, "fable", effort="xhigh")
+    monkeypatch.setattr(wf.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="Usage: claude [options]", returncode=0))
+    with pytest.raises(wf.WorkflowError, match="--model/--effort"):
+        wf.validate_selection(account, "fable")
+    monkeypatch.setattr(wf.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=help_text, returncode=0))
+    with pytest.raises(wf.WorkflowError, match="identity changed"):
+        wf.validate_selection(account, "fable", "other@example.com")
+
+
+def test_auto_review_defaults_merge_without_inventing_paths(tmp_path):
+    defaults = wf.auto_review_defaults({})
+    assert defaults == {"enabled": True, "model_key": "sol", "effort": "high", "account_id": "", "expected_email": "",
+                        "allow_document_changes": True, "review_all_flags": True, "source_root": "", "workspace_root": "", "ledger_path": "", "misnaming_path": ""}
+    assert wf.auto_review_defaults(None) == defaults and wf.auto_review_defaults({"ai_workflows": "bad"}) == defaults
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    cfg = {"ai_workflows": {"source_root": str(checkout), "ledger_path": "L.xlsx", "workspace_root": "W", "audit-review_account": "codex-abc",
+                            "auto_review": {"enabled": False, "effort": "XHIGH", "model_key": "terra", "expected_email": None}}}
+    merged = wf.auto_review_defaults(cfg)
+    assert merged["enabled"] is False and merged["model_key"] == "terra" and merged["effort"] == "xhigh"
+    assert merged["expected_email"] == ""  # None never overrides the default
+    assert merged["source_root"] == str(checkout) and merged["ledger_path"] == "L.xlsx" and merged["workspace_root"] == "W"
+    assert merged["account_id"] == "codex-abc"
+    assert merged is not cfg["ai_workflows"]["auto_review"] and cfg["ai_workflows"]["auto_review"] == {"enabled": False, "effort": "XHIGH", "model_key": "terra", "expected_email": None}
+    stale = {"ai_workflows": {"source_root": str(tmp_path / "gone")}}
+    assert wf.auto_review_defaults(stale)["source_root"] == ""
+    assert wf.AUTO_REVIEW_DEFAULTS["enabled"] is True
+
+
+def test_auto_review_summary_is_honest_about_state():
+    assert wf.auto_review_summary({}) == "After processing: Accuracy audit → Sol / High document review · account identity verified at launch · Apply corrections on."
+    off = wf.auto_review_summary({"ai_workflows": {"auto_review": {"enabled": False}}})
+    assert "Automatic AI document review is off" in off
+    proposals = wf.auto_review_summary({"ai_workflows": {"auto_review": {"allow_document_changes": False, "model_key": "opus", "effort": "max", "expected_email": ""}}})
+    assert "Opus 5 / Max" in proposals and "Propose corrections only" in proposals and "verified at launch" in proposals
+    assert "needs configuration" in wf.auto_review_summary({"ai_workflows": {"auto_review": {"model_key": "nope"}}})
+
+
+def test_role_aware_validation_and_live_output_reexport(tmp_path, monkeypatch):
+    account = wf.Account("1", "codex", "Personal", tmp_path)
+    monkeypatch.setattr(wf, "find_cli", lambda p: "codex.exe")
+    monkeypatch.setattr(wf, "query_codex", lambda *a: {"account": {"type": "chatgpt", "email": "personal@example.com"},
+                                                     "models": [{"model": "gpt-6-astra", "supportedReasoningEfforts": ["medium", "high"]}]})
+    # role decides the recommended effort when none is explicit: Astra is Medium for code learning, High for document review.
+    assert wf.validate_selection(account, "astra", role="code-learning")["effort"] == "medium"
+    assert wf.validate_selection(account, "astra", role="audit-review")["effort"] == "high"
+    import stage2_live_output as live
+    seen = {}
+    monkeypatch.setattr(live, "open_live_output", lambda request_dir, **kwargs: seen.update(request_dir=request_dir, **kwargs) or "viewer")
+    assert wf.open_live_output(tmp_path, title="t") == "viewer"
+    assert seen == {"request_dir": tmp_path, "title": "t"}

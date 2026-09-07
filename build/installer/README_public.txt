@@ -1,4 +1,4 @@
-Stage 2 - Processing v1.4.1 - Obsidian Compact
+Stage 2 - Processing v1.5.0 - Obsidian / Jade
 ===========================
 
 Stage 2 classifies, ranks and organises worker documents for Stage 3, with

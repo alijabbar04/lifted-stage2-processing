@@ -15,15 +15,24 @@ import tkinter.font as tkfont
 from tkinter import ttk
 
 from stage2_progress import PhaseProgress, concise_duration
+from stage2_theme import resolve_palette
 
-BG = "#060708"
-PANEL = "#0e1012"
-RAISED = "#16191c"
-LINE = "#282c30"
-TEXT = "#eff1f3"
-MUTED = "#a2a8af"
-SILVER = "#e4e9ee"
-ATTENTION = "#dec098"
+_DEFAULT_PALETTE = resolve_palette("C")
+BG = _DEFAULT_PALETTE.bg
+PANEL = _DEFAULT_PALETTE.panel
+RAISED = _DEFAULT_PALETTE.raised
+LINE = _DEFAULT_PALETTE.line
+TEXT = _DEFAULT_PALETTE.text
+MUTED = _DEFAULT_PALETTE.muted
+SILVER = _DEFAULT_PALETTE.primary
+ATTENTION = _DEFAULT_PALETTE.attention
+
+
+def _set_compat_palette(palette):
+    """Keep legacy helpers in this module on the selected palette."""
+    global BG, PANEL, RAISED, LINE, TEXT, MUTED, SILVER, ATTENTION
+    BG, PANEL, RAISED, LINE = palette.bg, palette.panel, palette.raised, palette.line
+    TEXT, MUTED, SILVER, ATTENTION = palette.text, palette.muted, palette.primary, palette.attention
 FIELDS = [
     ("Workers completed", "workers"), ("Converted to PDF", "converted"),
     ("Renamed", "renamed"), ("Unknowns defined", "unknown"),
@@ -46,12 +55,34 @@ def label(parent, text="", *, dim=False, size=10, **kwargs):
 
 
 def button(parent, text, command, *, primary=False, **kwargs):
-    bg, fg = (SILVER, BG) if primary else (parent.cget("bg"), TEXT)
-    return tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
-        activebackground="#ffffff" if primary else RAISED,
-        activeforeground=BG if primary else TEXT, disabledforeground="#70777e",
+    # Native Button keeps keyboard focus/invoke and disabled semantics.  Tk does
+    # not provide a dependable rounded button across Windows themes, so use a
+    # deliberately filled, bounded control rather than a canvas imitation.
+    bg, fg = (SILVER, BG) if primary else (RAISED, TEXT)
+    options = {"font": ("Segoe UI", 10), "padx": 12, "pady": 7, "cursor": "hand2"}
+    options.update(kwargs)
+    result = tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
+        activebackground="#ffffff" if primary else PANEL,
+        activeforeground=BG if primary else TEXT, disabledforeground=MUTED,
         relief="flat", bd=0, highlightthickness=1, highlightbackground=LINE,
-        font=("Segoe UI", 10), padx=12, pady=7, cursor="hand2", **kwargs)
+        highlightcolor=SILVER, takefocus=True, **options)
+    result._stage2_primary = primary
+    return result
+
+
+def _paint_button(widget, palette):
+    """Keep native disabled buttons legible without leaving a green dead-end."""
+    primary = widget._stage2_primary
+    disabled = str(widget.cget("state")) == "disabled"
+    widget.configure(
+        bg=palette.raised if disabled else (palette.primary if primary else palette.raised),
+        fg=palette.muted if disabled else (palette.primary_text if primary else palette.text),
+        activebackground=palette.panel if disabled or not primary else "#ffffff",
+        activeforeground=palette.muted if disabled else (palette.primary_text if primary else palette.text),
+        disabledforeground=palette.muted,
+        highlightbackground=palette.line,
+        highlightcolor=palette.primary,
+    )
 
 
 def separator(parent):
@@ -61,6 +92,12 @@ def separator(parent):
 class CompactDashboard:
     def __init__(self, app, namespace):
         self.app, self.ns = app, namespace
+        # Build against C first, then repaint the entire native widget tree if
+        # Settings has selected A or B.  This keeps inherited Tk colours in
+        # sync instead of leaving mixed parent/child surfaces.
+        self.palette = resolve_palette("C")
+        self._requested_palette = app.cfg.get("ui_palette", "C")
+        _set_compat_palette(self.palette)
         self.progress = PhaseProgress()
         self.events = collections.deque(maxlen=150)
         self._preview_on = bool(app.cfg.get("show_document_preview", False))
@@ -88,23 +125,24 @@ class CompactDashboard:
                 pass
 
     def _build_styles(self):
+        palette = self.palette
         style = ttk.Style(self.app)
         style.theme_use("clam")
-        style.configure("Obsidian.Horizontal.TProgressbar", troughcolor=LINE,
-                        background=SILVER, borderwidth=0, lightcolor=SILVER,
-                        darkcolor=SILVER, thickness=5)
+        style.configure("Obsidian.Horizontal.TProgressbar", troughcolor=palette.line,
+                        background=palette.primary, borderwidth=0, lightcolor=palette.primary,
+                        darkcolor=palette.primary, thickness=5)
         style.layout("Obsidian.Horizontal.TProgressbar", [
             ("Horizontal.Progressbar.trough", {"sticky":"nswe", "children":[
                 ("Horizontal.Progressbar.pbar", {"side":"left", "sticky":"ns"})]})])
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=PANEL, foreground=MUTED, padding=(14, 8))
-        style.map("TNotebook.Tab", background=[("selected", RAISED)], foreground=[("selected", TEXT)])
-        style.configure("TCombobox", fieldbackground=RAISED, background=PANEL,
-                        foreground=TEXT, arrowcolor=TEXT)
-        style.map("TCombobox", fieldbackground=[("readonly", RAISED)], foreground=[("readonly", TEXT)])
-        style.configure("Treeview", background=PANEL, fieldbackground=PANEL,
-                        foreground=TEXT, borderwidth=0, rowheight=29)
-        style.configure("Treeview.Heading", background=RAISED, foreground=TEXT,
+        style.configure("TNotebook", background=palette.bg, borderwidth=0)
+        style.configure("TNotebook.Tab", background=palette.panel, foreground=palette.muted, padding=(14, 8))
+        style.map("TNotebook.Tab", background=[("selected", palette.raised)], foreground=[("selected", palette.text)])
+        style.configure("TCombobox", fieldbackground=palette.raised, background=palette.panel,
+                        foreground=palette.text, arrowcolor=palette.text)
+        style.map("TCombobox", fieldbackground=[("readonly", palette.raised)], foreground=[("readonly", palette.text)])
+        style.configure("Treeview", background=palette.panel, fieldbackground=palette.panel,
+                        foreground=palette.text, borderwidth=0, rowheight=29)
+        style.configure("Treeview.Heading", background=palette.raised, foreground=palette.text,
                         font=("Segoe UI", 10))
 
     def _build(self):
@@ -150,7 +188,28 @@ class CompactDashboard:
         app.pick_btn.grid(row=0, column=1, padx=(12, 0), sticky="e")
         separator(body).pack(fill="x")
 
-        strip = tk.Frame(body, bg=BG)
+        # This is intentionally available before Start.  The controller may
+        # supply a frozen/configured summary, but the safe visible default does
+        # not claim that a work profile is connected.
+        self.review_setup = tk.Frame(body, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
+        self.review_setup.pack(fill="x", pady=(10, 2))
+        review_copy = tk.Frame(self.review_setup, bg=PANEL)
+        review_copy.pack(side="left", fill="x", expand=True, padx=13, pady=10)
+        label(review_copy, "REVIEW AFTER PROCESSING", dim=True, size=9).pack(anchor="w")
+        self.review_summary = tk.Label(review_copy, bg=PANEL, fg=TEXT, anchor="w", justify="left",
+                                       wraplength=720, font=("Segoe UI", 9))
+        self.review_summary.pack(fill="x", pady=(3, 0))
+        review_actions = tk.Frame(self.review_setup, bg=PANEL)
+        review_actions.pack(side="right", padx=10, pady=10)
+        self.review_config_btn = button(review_actions, "Configure review", self._configure_review)
+        self.review_config_btn.pack(side="left", padx=(0, 6))
+        self.view_session_btn = button(review_actions, "View AI session", self._view_ai_session)
+        self.view_session_btn.pack(side="left")
+
+        self.dashboard_panel = tk.Frame(body, bg=BG)
+        self.dashboard_panel.pack(fill="both", expand=True)
+
+        strip = tk.Frame(self.dashboard_panel, bg=BG)
         strip.pack(fill="x", pady=10)
         self.phase_label = label(strip, "Ready to process", size=17, anchor="w")
         self.phase_label.pack(side="left")
@@ -173,23 +232,23 @@ class CompactDashboard:
                 value.configure(fg=ATTENTION, cursor="hand2")
                 value.bind("<Button-1>", lambda e:app._open_reports())
             value.pack(anchor="w", pady=(2, 0))
-        progress_track = tk.Frame(body, bg=LINE, height=5)
+        progress_track = tk.Frame(self.dashboard_panel, bg=LINE, height=5)
         progress_track.pack(fill="x", pady=(0, 10))
         progress_track.pack_propagate(False)
         app.progress = ttk.Progressbar(progress_track, mode="determinate", maximum=1,
                                        style="Obsidian.Horizontal.TProgressbar")
         app.progress.pack(fill="both", expand=True)
-        meta = tk.Frame(body, bg=BG)
+        meta = tk.Frame(self.dashboard_panel, bg=BG)
         meta.pack(fill="x")
         self.progress_label = label(meta, "Choose a care-home folder to begin", dim=True, size=9,
                                     anchor="w", justify="left", wraplength=680)
         self.progress_label.pack(side="left")
         self.eta_label = label(meta, "", dim=True, size=9, anchor="e")
         self.eta_label.pack(side="right")
-        app.status_lbl = label(body, "Idle.", dim=True, anchor="w", justify="left", wraplength=1100)
+        app.status_lbl = label(self.dashboard_panel, "Idle.", dim=True, anchor="w", justify="left", wraplength=1100)
         app.status_lbl.pack(fill="x", pady=(6, 0))
 
-        content = tk.Frame(body, bg=BG)
+        content = tk.Frame(self.dashboard_panel, bg=BG)
         content.pack(fill="both", expand=True, pady=(12, 0))
         self.main_content = tk.Frame(content, bg=BG)
         self.main_content.pack(side="left", fill="both", expand=True)
@@ -239,10 +298,19 @@ class CompactDashboard:
         app.batch_btn.pack(side="left", padx=(0, 8))
         app.stop_btn = button(self.controls, "Stop", app._stop, state="disabled")
         app.stop_btn.pack(side="left")
-        self.review_btn = button(footer, "Review audit…", lambda:app._open_ai_workflow("audit-review"))
-        self.learning_btn = button(footer, "Learn from corrections…", lambda:app._open_ai_workflow("code-learning"))
+        # These compact controls retain visible fills and a usable focus ring at
+        # the 1000px minimum while keeping all post-run entry points available.
+        footer_button = {"font": ("Segoe UI", 9), "padx": 8, "pady": 6}
+        self.review_btn = button(footer, "AI Document Review", self._configure_review, **footer_button)
+        self.learning_btn = button(footer, "Improve Stage 2", lambda:app._open_ai_workflow("code-learning"), **footer_button)
         self.learning_btn.pack(side="right", padx=(7, 0))
         self.review_btn.pack(side="right", padx=(12, 0))
+        self.report_btn = button(footer, "View Audit Report", app._open_reports, **footer_button)
+        self.report_btn.pack(side="right", padx=(12, 0))
+        # The same viewer is intentionally offered once, beside its review
+        # configuration.  Retain the old attribute as a compatibility alias for
+        # callers that previously addressed the footer control directly.
+        self.session_btn = self.view_session_btn
         self.footer_note = label(app, "Processing uses the API key in Settings. AI reviews use the account you choose.", dim=True, size=8, anchor="w")
         self.footer_note.pack(fill="x", padx=26, pady=(0, 8))
         # Allocate fixed footer controls before the flexible activity area. Tk's
@@ -254,8 +322,108 @@ class CompactDashboard:
         self._build_details()
         self._body = body
         self._sync_banner()
+        self._refresh_review_summary()
         self.set_preview_visible(self._preview_on)
+        self._sync_dashboard_visibility()
+        self.apply_palette(self._requested_palette)
         app.bind("<Configure>", self._resize, add="+")
+
+    def _configure_review(self):
+        """Open pre-run review configuration without assuming a provider login."""
+        callback = getattr(self.app, "_configure_ai_review", None)
+        if callable(callback):
+            callback()
+        else:
+            self.app._open_ai_workflow("audit-review")
+
+    def _view_ai_session(self):
+        """Return to an existing AI session when the controller supports it."""
+        callback = getattr(self.app, "_view_ai_session", None)
+        if callable(callback):
+            callback()
+        else:
+            # Existing releases have no session viewer.  Keep this honest and
+            # offer the review setup rather than creating a second run.
+            self.status_changed("No AI session viewer is available yet. Configure AI Document Review; this does not start a review.")
+            self._configure_review()
+
+    def _review_summary_text(self):
+        summary = getattr(self.app, "_ai_review_summary", None)
+        if callable(summary):
+            try:
+                summary = summary()
+            except Exception:
+                # A partially upgraded controller must not stop the dashboard
+                # opening.  Keep setup visible and let its own dialog explain
+                # any unavailable account/model integration.
+                summary = None
+        if summary is None:
+            # The controller can expose a dynamic snapshot hook.  Until it
+            # does, a local Settings dictionary is enough to describe the next
+            # run without publishing an account identity in source.
+            summary = self.app.cfg.get("ai_review_summary") or self.app.cfg.get("ai_review")
+        if isinstance(summary, dict):
+            model = summary.get("model", "Sol")
+            effort = summary.get("effort", "High")
+            account = summary.get("account", summary.get("account_email", "Current Codex account"))
+            corrections = "Apply corrections on" if summary.get("apply_corrections", True) else "Propose corrections only"
+            return f"After processing: Accuracy audit → {model} / {effort} document review · {account} · {corrections}."
+        if str(summary or "").strip():
+            return str(summary).strip()
+        return ("After processing: Accuracy audit → Sol / High document review · "
+                "Current Codex account · Apply corrections on.")
+
+    def _refresh_review_summary(self):
+        self.review_summary.configure(text=self._review_summary_text())
+
+    def _should_show_dashboard(self):
+        # A zero-filled dashboard is not useful setup information.  Any real
+        # phase, terminal result, recovery/pending state, or active worker must
+        # remain visible so hiding presentation never hides recoverable work.
+        if self.is_busy() or self._terminal_status:
+            return True
+        return self.progress.phase != "idle" or self.progress.state != "idle"
+
+    def _sync_dashboard_visibility(self):
+        show = self._should_show_dashboard()
+        if show and not self.dashboard_panel.winfo_manager():
+            self.dashboard_panel.pack(fill="both", expand=True)
+        elif not show and self.dashboard_panel.winfo_manager():
+            self.dashboard_panel.pack_forget()
+
+    def apply_palette(self, palette=None):
+        """Apply A/B/C immediately; this never mutates a run configuration."""
+        old, new = self.palette, resolve_palette(palette or self.app.cfg.get("ui_palette", "C"))
+        self.palette = new
+        _set_compat_palette(new)
+        replacements = {
+            old.bg: new.bg, old.panel: new.panel, old.raised: new.raised,
+            old.line: new.line, old.text: new.text, old.muted: new.muted,
+            old.primary: new.primary, old.primary_text: new.primary_text,
+            old.attention: new.attention,
+        }
+        def repaint(widget):
+            try:
+                if isinstance(widget, tk.Button) and hasattr(widget, "_stage2_primary"):
+                    _paint_button(widget, new)
+                else:
+                    for option in ("bg", "fg", "activebackground", "activeforeground",
+                                   "highlightbackground", "highlightcolor", "insertbackground"):
+                        try:
+                            value = str(widget.cget(option))
+                            if value in replacements:
+                                widget.configure(**{option: replacements[value]})
+                        except tk.TclError:
+                            pass
+                for child in widget.winfo_children():
+                    repaint(child)
+            except tk.TclError:
+                return
+        repaint(self.app)
+        self._build_styles()
+        return new.key
+
+    set_palette = apply_palette
 
     def _build_details(self):
         app = self.app
@@ -394,6 +562,7 @@ class CompactDashboard:
             self.app.progress.configure(mode="determinate", maximum=max(self.progress.total, 1), value=self.progress.completed)
             self.state_label.configure(text="Working")
             self.refresh_progress()
+            self._sync_dashboard_visibility()
             return
         if event.get("phase") == "audit":
             self.progress.observe(event)
@@ -416,8 +585,10 @@ class CompactDashboard:
             elif state in ("stopped", "failed", "skipped"):
                 self.add_activity("Accuracy audit " + state + "; review incomplete")
             self.refresh_progress()
+            self._sync_dashboard_visibility()
         elif event.get("kind") == "phase_started":
             self.add_activity(str(event.get("label") or event.get("phase", "Processing")).capitalize() + " started")
+            self._sync_dashboard_visibility()
 
     def refresh_progress(self):
         state = self.progress
@@ -477,6 +648,7 @@ class CompactDashboard:
         self.phase_label.configure(text="Document processing")
         self.state_label.configure(text="Running")
         self.refresh_progress()
+        self._sync_dashboard_visibility()
 
     def reset(self):
         self.progress = PhaseProgress()
@@ -490,6 +662,7 @@ class CompactDashboard:
         self.app.preview_name.configure(text="Preparing documents…")
         self.app.preview_canvas.configure(image="", text="No current document")
         self.app._preview_ref = None
+        self._sync_dashboard_visibility()
 
     def add_activity(self, msg):
         msg = str(msg).strip()
@@ -525,6 +698,7 @@ class CompactDashboard:
                     self.phase_label.configure(text="Batch processing")
                 self.state_label.configure(text="Working" if self.is_busy() else "Idle")
         self.add_activity(msg)
+        self._sync_dashboard_visibility()
 
     def is_busy(self):
         app = self.app
@@ -557,6 +731,7 @@ class CompactDashboard:
                     # The zero-renderable path is deliberately retryable, not
                     # a provider wait or a generic failure.
                     self.refresh_progress()
+                    self._sync_dashboard_visibility()
                     return
                 if kind in ("batch_submitted", "batch_followup_submitted", "batch_pending"):
                     if self.progress.state != "submitted":
@@ -575,6 +750,7 @@ class CompactDashboard:
                     self.progress.observe({"phase": self.progress.phase,
                                            "state": "failed"})
                 self.refresh_progress()
+                self._sync_dashboard_visibility()
                 return
             # _done_batch queues set_status after every terminal finish.
             # Preserve the final label while idle; release it for new work.
@@ -594,6 +770,7 @@ class CompactDashboard:
                 self._terminal_status = kind
             else:
                 self.state_label.configure(text="Needs attention")
+        self._sync_dashboard_visibility()
 
     def refresh_context(self):
         app = self.app
@@ -618,11 +795,20 @@ class CompactDashboard:
             return
         self.refresh_context()
         self._sync_banner()
+        self._refresh_review_summary()
+        self._sync_dashboard_visibility()
         if self.progress.phase == "audit" or (self.is_busy() and self.progress.phase in ("preparing", "scanning", "batch", "followup_plan", "followup_upload")):
             self.refresh_progress()
         busy = self.is_busy()
         self.review_btn.configure(state="disabled" if busy else "normal")
         self.learning_btn.configure(state="disabled" if busy else "normal")
+        # The application changes button states directly; repaint only native
+        # Stage 2 buttons here so a disabled primary action has the same dark,
+        # readable treatment as the surrounding controls.
+        for widget in (self.app.start_btn, self.app.batch_btn, self.app.stop_btn,
+                       self.review_btn, self.learning_btn, self.report_btn,
+                       self.review_config_btn, self.view_session_btn):
+            _paint_button(widget, self.palette)
         try:
             while True:
                 generation, data = self._preview_queue.get_nowait()

@@ -79,6 +79,8 @@ class TestCompactDashboard(unittest.TestCase):
         self.assertIsInstance(self.dashboard._brand_icon, tk.PhotoImage)
 
     def test_essential_buttons_fit_normal_and_minimum_sizes(self):
+        # A clean idle screen deliberately hides empty progress/current-document
+        # panels, but navigation and all workflow entry points remain usable.
         for width, height in ((1180, 760), (1000, 640)):
             for preview in (False, True):
                 with self.subTest(size=(width, height), preview=preview):
@@ -86,10 +88,68 @@ class TestCompactDashboard(unittest.TestCase):
                     self.dashboard.set_preview_visible(preview)
                     self.app.update_idletasks()
                     for widget in [*self.dashboard.nav_buttons.values(), self.app.pick_btn,
-                                   self.app.start_btn, self.app.batch_btn, self.app.stop_btn,
-                                   self.dashboard.review_btn, self.dashboard.learning_btn, self.dashboard.preview_btn]:
+                                    self.app.start_btn, self.app.batch_btn, self.app.stop_btn,
+                                    self.dashboard.report_btn, self.dashboard.review_btn,
+                                   self.dashboard.learning_btn,
+                                   self.dashboard.review_config_btn,
+                                   self.dashboard.view_session_btn]:
                         self.assert_visible_fitted(widget)
-                    self.assertGreater(self.dashboard.activity.winfo_height(), 70)
+                    self.assertFalse(self.dashboard.preview_btn.winfo_viewable())
+
+    def test_idle_dashboard_is_clean_but_pending_and_active_states_are_never_hidden(self):
+        self.assertFalse(self.dashboard.dashboard_panel.winfo_manager())
+        self.app.care_home_dir = Path("C:/Test/Example [Files]")
+        self.dashboard.refresh_context()
+        self.dashboard._sync_dashboard_visibility()
+        self.assertFalse(self.dashboard.dashboard_panel.winfo_manager())
+        self.dashboard.finish({}, "batch_pending")
+        self.app.update_idletasks()
+        self.assertTrue(self.dashboard.dashboard_panel.winfo_viewable())
+        self.dashboard.reset()
+        self.assertFalse(self.dashboard.dashboard_panel.winfo_manager())
+        self.dashboard.activity_event({"phase": "audit", "state": "checking", "completed": 1, "total": 3})
+        self.app.update_idletasks()
+        self.assertTrue(self.dashboard.dashboard_panel.winfo_viewable())
+
+    def test_palettes_are_live_and_buttons_remain_native_filled_controls(self):
+        self.assertIsInstance(self.app.start_btn, tk.Button)
+        self.assertEqual(self.dashboard.palette.key, "C")
+        for key, expected in (("A", "Deep jade"), ("B", "Graphite"), ("C", "Graphite + jade")):
+            with self.subTest(key=key):
+                self.assertEqual(self.dashboard.apply_palette(key), key)
+                self.assertEqual(self.dashboard.palette.name, expected)
+                self.assertEqual(self.app.start_btn.cget("bg"), self.dashboard.palette.raised)
+                self.assertEqual(self.app.start_btn.cget("fg"), self.dashboard.palette.muted)
+                self.assertEqual(self.app.start_btn.cget("highlightcolor"), self.dashboard.palette.primary)
+
+    def test_review_summary_and_controller_hooks_are_available_before_start(self):
+        self.app._ai_review_summary = {"model": "Sol", "effort": "High",
+                                       "account": "local-profile@example.test",
+                                       "apply_corrections": True}
+        configure, session = Mock(), Mock()
+        self.app._configure_ai_review, self.app._view_ai_session = configure, session
+        self.dashboard._refresh_review_summary()
+        self.assertIn("Sol / High", self.dashboard.review_summary.cget("text"))
+        self.assertIn("local-profile@example.test", self.dashboard.review_summary.cget("text"))
+        self.dashboard.review_config_btn.invoke()
+        self.dashboard.view_session_btn.invoke()
+        configure.assert_called_once_with()
+        session.assert_called_once_with()
+        self.assertIs(self.dashboard.session_btn, self.dashboard.view_session_btn)
+        self.assertEqual(self.dashboard.footer_note.cget("text"),
+                         "Processing uses the API key in Settings. AI reviews use the account you choose.")
+
+    def test_summary_uses_local_cfg_and_optional_hooks_have_safe_fallbacks(self):
+        self.assertIn("Current Codex account", self.dashboard.review_summary.cget("text"))
+        self.app.cfg["ai_review"] = {"model": "Terra", "effort": "Medium",
+                                      "account_email": "configured-locally@example.test",
+                                      "apply_corrections": False}
+        self.dashboard._refresh_review_summary()
+        self.assertIn("Terra / Medium", self.dashboard.review_summary.cget("text"))
+        self.assertIn("configured-locally@example.test", self.dashboard.review_summary.cget("text"))
+        self.assertIn("Propose corrections only", self.dashboard.review_summary.cget("text"))
+        self.dashboard.view_session_btn.invoke()
+        self.app._open_ai_workflow.assert_called_once_with("audit-review")
 
     def test_long_care_home_and_audit_status_do_not_hide_controls(self):
         self.app.care_home_dir = Path("C:/Test") / ("A long care-home name with a regional office " * 3 + " [Files]")

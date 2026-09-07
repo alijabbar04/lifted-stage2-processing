@@ -1,6 +1,50 @@
 # Stage 2 — Processing
 
-## v1.4.1 — Obsidian Compact
+## v1.5.0 Obsidian / Jade refinement
+
+The current UI direction is **Graphite + Deep Jade**: a near-black/graphite
+surface with restrained jade accents, real filled/outlined buttons, a clean
+idle screen and progressive panels while work is active. The existing
+**Jobs, Reports, API Usage, Tools and Guide** navigation remains available.
+
+The three post-processing actions have separate meanings:
+
+- **Accuracy Audit** finds possible filename or evidence problems and writes a
+  report. It does not rename documents.
+- **AI Document Review** checks that report against the actual document pages,
+  records Keep/Rename/Defer decisions, and applies supported filename
+  corrections only when explicitly enabled.
+- **Improve Stage 2** studies the review ledger and evidence to decide whether
+  a general software change is justified. It is separate from document review
+  and never receives code-change authority merely because corrections are on.
+
+For AI review, choose **Model → Account → Effort**. The provider is inferred
+from the model and shown read-only (Sol/Terra/Luna/Astra use Codex; Fable/Opus
+use Claude). Changing model refreshes compatible accounts and efforts; an
+incompatible previous choice must be selected again. The default document
+review setup is **Sol / High**, with corrections and automatic review enabled
+only when the completed Accuracy Audit permits it. The app snapshots the exact
+model, account identity, effort, scope and authority at Start; later global
+changes affect the next run only.
+
+Automatic review runs only after processing, follow-up work and a complete,
+durable audit receipt. It must not select the newest report by filename, launch
+from a partial/pending/error audit, submit twice, or silently substitute an
+account/model. A visible desktop terminal or log viewer shows the existing
+supervised CLI stream (assistant messages, tool activity, results and attention
+requests where available); it is not promised to expose private reasoning and
+must not be labelled an interactive chat when it is only live output. **View AI
+session** reopens that existing stream and does not create a second job.
+
+The processing API key/billing and the subscribed Codex or Claude CLI account
+are separate. Sign-in may require the user; there is no automatic OAuth or
+silent personal-account fallback. VS Code is optional and is not the runner.
+The shipped CLI minimum is Fable 5.1 version 2.1.251; the currently updated
+CLI is 2.1.263. Fable 5.1 / High is a code-learning recommendation, while
+Astra / Medium is a provisional complex-case alternative—not a benchmark
+claim—and filename corrections must never trigger automatic code changes.
+
+## Earlier compact baseline (v1.4.1)
 
 The compact near-black UI keeps the three key run measures visible and moves
 the detailed counters/log into **Details**. The real app icon and black Windows
@@ -9,8 +53,8 @@ remain available. The audit shows checked-document progress, its current
 operation and an explicitly incomplete state when interrupted.
 
 **Reports** offers the filename audit or the AI correction ledger.
-**Review audit…** prepares a provider-neutral Luna/Opus handoff;
-**Learn from corrections…** prepares a Sol/Fable code-review handoff. Each role
+**AI Document Review** prepares the selected model-led handoff;
+**Improve Stage 2** prepares the separate software-learning handoff. Each role
 shares durable rules and file-based memory, with verified account selection.
 Document corrections use hash-checked transactions and full-category ranking;
 code learning requires evidence and regression tests. Both are explicit actions,
@@ -283,7 +327,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for v1.4.1. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.0 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

@@ -1,8 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ExePath,
-    [string]$ExpectedVersion = "1.4.1",
-    [string]$ExpectedBuild = "2026.09.07-obsidian2"
+    [string]$ExpectedVersion = "1.5.0",
+    [string]$ExpectedBuild = "2026.09.07-jade1"
 )
 
 $ErrorActionPreference = "Stop"

@@ -121,8 +121,10 @@ import datetime
 import threading
 import traceback
 import collections
+import copy
 import functools
 import tempfile
+import uuid
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -138,6 +140,8 @@ if str(_SOURCE_DIR) not in sys.path:
 import pipeline_shared as pipeline
 from stage2_compact_ui import CompactDashboard
 from stage2_notifications import NotificationService, normalize_settings
+import stage2_ai_workflows as ai_workflows
+from stage2_theme import PALETTES, resolve_palette
 from local_orientation import (
     MODEL_NAME as ORIENTATION_MODEL_NAME,
     MODEL_REVISION as ORIENTATION_MODEL_REVISION,
@@ -1338,8 +1342,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.4.1"
-APP_BUILD = "2026.09.07-obsidian2"
+APP_VERSION = "1.5.0"
+APP_BUILD = "2026.09.07-jade1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -1551,7 +1555,8 @@ def load_config() -> dict:
            # OPTIONAL second accuracy check after the run: re-checks every
            # renamed document (full pages, adjudicated) and writes
            # Filename_Audit_Report.xlsx into the care-home folder
-           "post_run_audit": False,
+           "post_run_audit": True,
+           "ui_palette": "C",
            "run_mode": "live",   # "live" | "batch" - last-used processing mode
            "max_workers": DEFAULT_MAX_WORKERS, "max_files": DEFAULT_MAX_FILES,
            "max_budget_gbp": DEFAULT_MAX_BUDGET_GBP,
@@ -1633,6 +1638,7 @@ def load_config() -> dict:
         cfg["model"] = DEFAULT_MODEL
     cfg["notifications"] = normalize_settings(cfg.get("notifications"))
     cfg["show_document_preview"] = bool(cfg.get("show_document_preview", False))
+    cfg["ui_palette"] = resolve_palette(cfg.get("ui_palette")).key
     return cfg
 
 
@@ -4643,18 +4649,28 @@ LIVE_CHECKPOINT_NAME = ".docreview_live_checkpoint.json"
 
 
 def write_live_checkpoint(care_dir: Path, done: int, total: int,
-                          current: str, errors: int, finished: bool):
+                          current: str, errors: int, finished: bool,
+                          auto_review_run_id: str = "", audit_worker_dirs=(),
+                          processing_complete: bool = False):
     try:
         p = Path(care_dir) / LIVE_CHECKPOINT_NAME
-        p.write_text(json.dumps({
-            "version": 1,
+        _write_hidden_json(p, {
+            "version": 2,
             "ts": datetime.datetime.now().isoformat(timespec="seconds"),
             "workers_done": done, "workers_total": total,
             "current_worker": current, "errors": errors,
             "finished": finished,
-        }), encoding="utf-8")
+            "auto_review_run_id": str(auto_review_run_id or ""),
+            "audit_worker_dirs": [str(Path(p).resolve()) for p in audit_worker_dirs],
+            "processing_complete": bool(processing_complete),
+        })
+        return True
     except Exception:
-        pass
+        return False
+
+
+class LiveCheckpointWriteError(RuntimeError):
+    """A review-enabled live run could not save its required restart link."""
 
 
 def read_live_checkpoint(care_dir: Path):
@@ -7445,6 +7461,29 @@ class Engine:
         self._activity({"kind":"run_progress", "phase":phase, "state":"running",
                         "completed":done, "total":total, **details})
 
+    def _record_review_processing(self):
+        """Persist the exact post-movement scope before an automatic audit."""
+        controller = getattr(self, "_review_controller", None)
+        run_id = getattr(self, "_review_run_id", "")
+        if controller is not None and run_id:
+            if controller.get_status(run_id, processing_root=self.dir).get("processing_receipt"):
+                return
+            controller.record_processing_complete(run_id, processing_root=self.dir,
+                worker_dirs=list(self._audit_worker_dirs),
+                errors=([f"Processing recorded {self.stats.get('errors', 0)} errors"]
+                        if self.stats.get("errors") else ()))
+
+    def _record_review_audit(self, status, report=None):
+        controller = getattr(self, "_review_controller", None)
+        run_id = getattr(self, "_review_run_id", "")
+        if controller is not None and run_id:
+            if status == "complete":
+                controller.record_audit_receipt(run_id, processing_root=self.dir,
+                    report_path=report, status=status, worker_dirs=list(self._audit_worker_dirs))
+            else:
+                controller.record_audit_status(run_id, status,
+                    reason="The accuracy audit is not complete; automatic review has not started.")
+
     def _run_post_run_audit(self):
         """When the Settings toggle is on, re-check every processed document
         (run_accuracy_audit: full pages, adjudicated flags) and write
@@ -7456,11 +7495,15 @@ class Engine:
         audit_state = (batch_state.data.setdefault("audit", {})
                        if batch_state is not None else {})
         if audit_state.get("status") == "complete":
+            self.stats["audit_status"] = "complete"
+            self.stats["audit_report"] = audit_state.get("report", "")
+            self._record_review_audit("complete", audit_state.get("report"))
             return
         out_dir = (self.move_dest if (self.move_mode and self.move_dest)
                    else self.dir)
         if not self.post_run_audit or not self._audit_worker_dirs:
             self.stats["audit_status"] = "disabled" if not self.post_run_audit else "skipped"
+            self._record_review_audit(self.stats["audit_status"])
             if orientation_rows:
                 xlsx = write_orientation_audit(orientation_rows, out_dir)
                 self.stats["orientation_audit_rows"] = len(orientation_rows)
@@ -7501,6 +7544,7 @@ class Engine:
                      "because the remaining budget cannot cover its separate "
                      f"~£{expected:.2f} expected cost.")
             self.stats["audit_status"] = "skipped"
+            self._record_review_audit("skipped")
             self._activity({"phase":"audit", "state":"skipped", "completed":0,
                             "total":len(docs), "reason":"budget"})
             return
@@ -7529,6 +7573,7 @@ class Engine:
             self.stats["audit_needs_review"] = flagged
             self.stats["audit_status"] = "complete"
             self.stats["audit_report"] = str(xlsx)
+            self._record_review_audit("complete", xlsx)
             self.log(f"audit report -> {xlsx}")
             self.manifest.save()
             if batch_state is not None:
@@ -7539,6 +7584,7 @@ class Engine:
                 batch_state.save()
         except (StopRequested, LimitReached, CreditExhausted):
             self.stats["audit_status"] = "pending"
+            self._record_review_audit("pending")
             self._activity(dict(getattr(self, "_audit_progress_snapshot", {}),
                                 phase="audit", state="stopped"))
             if batch_state is not None:
@@ -7549,6 +7595,10 @@ class Engine:
             raise
         except Exception as e:
             self.stats["audit_status"] = "failed"
+            try:
+                self._record_review_audit("failed")
+            except Exception:
+                traceback.print_exc()
             self._activity(dict(getattr(self, "_audit_progress_snapshot", {}),
                                 phase="audit", state="failed"))
             if batch_state is not None:
@@ -7570,7 +7620,31 @@ class Engine:
                          "request was made.")
                 self.on_done(self.stats, "live_blocked_by_batch")
                 return
+            if getattr(self, "_resume_processing_complete", False):
+                self.log("Live processing is already complete; resuming only "
+                         "the saved Accuracy Audit for its original review run.")
+                self._record_review_processing()
+                controller = getattr(self, "_review_controller", None)
+                run_id = getattr(self, "_review_run_id", "")
+                saved_review = (controller.get_status(
+                    run_id, processing_root=self.dir)
+                    if controller is not None and run_id else {})
+                audit_receipt = saved_review.get("audit_receipt") or {}
+                if audit_receipt.get("status") == "complete":
+                    self.stats["audit_status"] = "complete"
+                    self.stats["audit_report"] = audit_receipt.get("report_path", "")
+                    clear_live_checkpoint(self.dir)
+                    self.on_done(self.stats, None)
+                    return
+                self._run_post_run_audit()
+                if self.stats.get("audit_status") in ("complete", "skipped", "disabled"):
+                    clear_live_checkpoint(self.dir)
+                self.on_done(self.stats, None)
+                return
             workers = worker_dirs_in(self.dir)
+            saved_scope = getattr(self, "_review_scope_worker_names", None)
+            if saved_scope is not None:
+                workers = [worker for worker in workers if worker.name.casefold() in saved_scope]
             if not workers:
                 self.log("No worker sub-folders found in that care-home folder.")
                 self.on_done(self.stats, None)
@@ -7592,8 +7666,15 @@ class Engine:
                                stats=dict(self.stats))
                 # checkpoint BEFORE the worker so a crash mid-worker records
                 # the exact position for the next launch's resume offer.
-                write_live_checkpoint(self.dir, idx - 1, total, w.name,
-                                      self.stats.get("errors", 0), False)
+                review_run_id = getattr(self, "_review_run_id", "")
+                checkpoint_saved = write_live_checkpoint(
+                    self.dir, idx - 1, total, w.name,
+                    self.stats.get("errors", 0), False,
+                    review_run_id, self._audit_worker_dirs)
+                if review_run_id and not checkpoint_saved:
+                    raise LiveCheckpointWriteError(
+                        "The automatic-review live checkpoint could not be saved; "
+                        "processing stopped before this worker was sent.")
                 # In move mode, a worker already present in the destination has
                 # been processed before - skip it entirely (no API calls).
                 if self.move_mode and (self.move_dest / w.name).exists():
@@ -7622,9 +7703,22 @@ class Engine:
                             self.log(f"  ! could not move {w.name} to destination: "
                                      f"{e} (left in source)")
                             traceback.print_exc()
-                    self._audit_worker_dirs.append(final_dir)
+                    final_key = str(Path(final_dir).resolve()).casefold()
+                    if all(str(Path(old).resolve()).casefold() != final_key
+                           for old in self._audit_worker_dirs):
+                        self._audit_worker_dirs.append(final_dir)
                     self._record_roster_handover(w, final_dir)
+                    checkpoint_saved = write_live_checkpoint(
+                        self.dir, idx, total, "",
+                        self.stats.get("errors", 0), False,
+                        review_run_id, self._audit_worker_dirs)
+                    if review_run_id and not checkpoint_saved:
+                        raise LiveCheckpointWriteError(
+                            "The completed worker could not be added to the "
+                            "automatic-review checkpoint; processing stopped safely.")
                 except (StopRequested, LimitReached, CreditExhausted):
+                    raise
+                except LiveCheckpointWriteError:
                     raise
                 except Exception as e:
                     self.stats["errors"] += 1
@@ -7634,14 +7728,25 @@ class Engine:
                 self._emit_cost()
             self._phase_progress("processing", total, total)
             self.set_progress(total, total)
-            # run completed cleanly — the checkpoint is no longer needed and
-            # must not trigger a resume offer next launch.
-            clear_live_checkpoint(self.dir)
+            review_run_id = getattr(self, "_review_run_id", "")
+            checkpoint_saved = write_live_checkpoint(
+                self.dir, total, total, "", self.stats.get("errors", 0),
+                False, review_run_id, self._audit_worker_dirs,
+                processing_complete=True)
+            if review_run_id and not checkpoint_saved:
+                raise LiveCheckpointWriteError(
+                    "Processing completed, but its automatic-review checkpoint "
+                    "could not be saved; the Accuracy Audit was not started.")
             TRACKER.update(workers_done=total, current_worker="",
                            status="complete", finished=True,
                            stats=dict(self.stats))
             self.manifest.save()
+            self._record_review_processing()
             self._run_post_run_audit()
+            # Retain a processing-complete checkpoint while an audit is pending
+            # or failed, so Start resumes the exact captured review run.
+            if self.stats.get("audit_status") in ("complete", "skipped", "disabled"):
+                clear_live_checkpoint(self.dir)
             self.on_done(self.stats, None)
         except CreditExhausted as e:
             # Out of API credit: stop immediately, mark the worker we were on,
@@ -8815,6 +8920,8 @@ class Engine:
             for batch in evidence["matched_batches"]:
                 state.data.setdefault("batches", []).append(batch)
             state.data["primary_inventory"] = inventory
+            if getattr(self, "_review_run_id", ""):
+                state.data["auto_review_run_id"] = self._review_run_id
             state.data["requests"] = {cid: dict(meta) for cid, meta in inventory.items()}
             state.data["primary_vocabulary"] = vocab
             state.data["primary_submission_complete"] = False
@@ -9978,6 +10085,7 @@ class Engine:
                         self._audit_worker_dirs.append(final_path)
                 self.log("Batch processing is already complete; resuming only "
                          "the separate post-run audit phase.")
+                self._record_review_processing()
                 self._run_post_run_audit()
                 audit_status = (state.data.get("audit") or {}).get("status")
                 if audit_status in ("complete", "skipped", "disabled"):
@@ -10451,6 +10559,7 @@ class Engine:
                     seen_audit_dirs.add(key)
                     unique_audit_dirs.append(Path(path))
             self._audit_worker_dirs = unique_audit_dirs
+            self._record_review_processing()
             self._run_post_run_audit()
             audit_status = (state.data.get("audit") or {}).get("status")
             if audit_status in ("complete", "skipped", "disabled"):
@@ -11127,10 +11236,13 @@ def open_stage_guide(parent):
 
 
 def style_button(btn, base, hover):
-    btn.configure(bg=base, fg="white", activebackground=hover,
-                  activeforeground="white", relief="flat", bd=0,
+    foreground = resolve_palette(getattr(btn.winfo_toplevel(), "cfg", {}).get("ui_palette")).primary_text if base in (ACCENT, GREEN, GREEN_HI) else FG
+    btn.configure(bg=base, fg=foreground, activebackground=hover,
+                  activeforeground=foreground, relief="flat", bd=0,
+                  highlightthickness=1, highlightbackground=BORDER,
+                  highlightcolor=ACCENT, disabledforeground=FG_DIM, takefocus=True,
                   font=UI_B, cursor="hand2", padx=14, pady=7)
-    btn.bind("<Enter>", lambda e: btn.configure(bg=hover))
+    btn.bind("<Enter>", lambda e: btn.configure(bg=hover) if str(btn.cget("state")) != "disabled" else None)
     btn.bind("<Leave>", lambda e: btn.configure(bg=base))
 
 
@@ -11186,12 +11298,13 @@ class SettingsDialog(tk.Toplevel):
         self.on_save = on_save
         self.title("Settings")
         self.configure(bg=BG)
-        self.resizable(False, True)
+        self.resizable(True, True)
         self.transient(master)
         self.grab_set()
         self.after(0, lambda: style_titlebar_black(self))
         _ui = float(getattr(master, "_ui_scale", 1.0) or 1.0)
-        self.geometry(f"{int(590*_ui)}x{int(820*_ui)}")
+        self.geometry(f"{min(int(790*_ui), self.winfo_screenwidth()-80)}x{min(int(820*_ui), self.winfo_screenheight()-90)}")
+        self.minsize(min(int(700*_ui), self.winfo_screenwidth()-80), 440)
 
         # ---- scrollable body so all controls fit on small screens ----
         outer = tk.Frame(self, bg=BG)
@@ -11201,7 +11314,8 @@ class SettingsDialog(tk.Toplevel):
         self.body = tk.Frame(canvas, bg=BG)
         self.body.bind("<Configure>",
                        lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.body, anchor="nw")
+        body_window = canvas.create_window((0, 0), window=self.body, anchor="nw")
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(body_window, width=event.width))
         canvas.configure(yscrollcommand=vsb.set)
         canvas.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
@@ -11209,14 +11323,27 @@ class SettingsDialog(tk.Toplevel):
                         lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
 
         b = self.body
+        b.columnconfigure(1, weight=1)
         pad = {"padx": 16, "pady": 6}
         settings_head = tk.Frame(b, bg=BG)
         settings_head.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 8))
-        tk.Label(settings_head, text="Settings", bg=BG, fg=FG, font=UI_H).pack(side="left")
+        settings_head.columnconfigure(1, weight=1)
+        tk.Label(settings_head, text="Settings", bg=BG, fg=FG, font=UI_H).grid(row=0, column=0, sticky="w")
         notifications_btn = tk.Button(settings_head, text="Notifications…",
             command=lambda:master._open_notification_settings())
         style_button(notifications_btn, PANEL2, BORDER)
-        notifications_btn.pack(side="right", padx=(12, 0))
+        notifications_btn.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        appearance = tk.Frame(settings_head, bg=BG)
+        appearance.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        tk.Label(appearance, text="Colour palette", bg=BG, fg=FG_DIM, font=UI).pack(side="left")
+        self._palette_labels = {f"{key} · {value.name}": key for key, value in PALETTES.items()}
+        selected_palette = resolve_palette(cfg.get("ui_palette"))
+        self.palette_var = tk.StringVar(value=f"{selected_palette.key} · {selected_palette.name}")
+        self.palette_box = ttk.Combobox(appearance, textvariable=self.palette_var,
+            values=list(self._palette_labels), state="readonly", width=25)
+        self.palette_box.pack(side="right")
+        self.palette_box.bind("<<ComboboxSelected>>", self._preview_palette)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
 
         # ---------------- API KEY (stored securely) ----------------
         tk.Label(b, text="API key & security", bg=BG, fg=ACCENT, font=UI_B).grid(
@@ -11317,7 +11444,7 @@ class SettingsDialog(tk.Toplevel):
         rframe = tk.Frame(b, bg=BG)
         rframe.grid(row=17, column=1, sticky="w", **pad)
         self.res_var = tk.DoubleVar(value=float(cfg.get("resolution", 1.5)))
-        self.res_label = tk.Label(rframe, text="", bg=BG, fg=FG, font=UI_B, width=10,
+        self.res_label = tk.Label(rframe, text="", bg=BG, fg=FG, font=UI_B,
                                   anchor="w")
         scale = tk.Scale(rframe, from_=1.0, to=3.0, resolution=0.1,
                          orient="horizontal", variable=self.res_var,
@@ -11459,9 +11586,24 @@ class SettingsDialog(tk.Toplevel):
             row=31, column=0, columnspan=2, sticky="w", padx=16, pady=(2, 0))
 
         # buttons
+        review_settings = tk.Frame(b, bg=BG)
+        review_settings.grid(row=32, column=0, columnspan=2, sticky="ew", padx=16, pady=(12, 0))
+        tk.Label(review_settings, text="AI Document Review after the audit", bg=BG,
+                 fg=ACCENT, font=UI_B).pack(anchor="w")
+        tk.Label(review_settings, text="Choose model, account, effort and corrections before Start.\n"
+                 "Changes to defaults affect the next run only.", bg=BG, fg=FG_DIM,
+                 font=UI, justify="left").pack(anchor="w", pady=5)
+        self.review_setup_btn = tk.Button(review_settings, text="Configure AI Document Review…",
+                                         command=self._configure_review)
+        style_button(self.review_setup_btn, PANEL2, BORDER)
+        self.review_setup_btn.pack(anchor="w")
+        self.cancel_queued_review_btn = tk.Button(review_settings, text="Cancel queued automatic review",
+                                                  command=self.master._cancel_queued_automatic_review)
+        style_button(self.cancel_queued_review_btn, PANEL2, BORDER)
+        self.cancel_queued_review_btn.pack(anchor="w", pady=(6, 0))
         bframe = tk.Frame(b, bg=BG)
-        bframe.grid(row=32, column=0, columnspan=2, sticky="e", padx=16, pady=(12, 16))
-        cancel = tk.Button(bframe, text="Cancel", command=self.destroy)
+        bframe.grid(row=33, column=0, columnspan=2, sticky="e", padx=16, pady=(12, 16))
+        cancel = tk.Button(bframe, text="Cancel", command=self._cancel)
         style_button(cancel, PANEL2, BORDER)
         cancel.pack(side="right", padx=(8, 0))
         save = tk.Button(bframe, text="Save", command=self._save)
@@ -11471,7 +11613,25 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(b, text=f"Settings saved to  {CONFIG_PATH}\n"
                          f"(the API key is NOT stored in this file)",
                  bg=BG, fg=FG_DIM, font=("Segoe UI", 8), justify="left").grid(
-            row=33, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 10))
+            row=34, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 10))
+
+    def _configure_review(self):
+        dialog = self.master._configure_ai_review()
+        if dialog is not None:
+            self.wait_window(dialog)
+        self.cfg["ai_workflows"] = copy.deepcopy(self.master.cfg.get("ai_workflows", {}))
+        self.audit_var.set(bool(self.master.cfg.get("post_run_audit", False)))
+
+    def _preview_palette(self, _event=None):
+        value = self._palette_labels.get(self.palette_var.get(), "C")
+        self.master._set_palette_globals(value)
+        self.master.dashboard.apply_palette(value)
+
+    def _cancel(self):
+        value = self.master.cfg.get("ui_palette", "C")
+        self.master._set_palette_globals(value)
+        self.master.dashboard.apply_palette(value)
+        self.destroy()
 
     def _render_model_choices(self):
         """(Re)build the model radio list, including Opus only when advanced is on."""
@@ -11547,6 +11707,15 @@ class SettingsDialog(tk.Toplevel):
                 "decimal values below 1.0.", parent=self)
             return
 
+        review_defaults = ai_workflows.auto_review_defaults(self.cfg)
+        if review_defaults.get("enabled", True) and not bool(self.audit_var.get()):
+            messagebox.showerror(
+                "Accuracy Audit required",
+                "Automatic AI Document Review can run only after a complete Accuracy Audit. "
+                "Keep the post-run accuracy audit enabled, or disable automatic review in Configure AI Document Review.",
+                parent=self)
+            return
+
         chosen_model = self.model_var.get()
         # Opus guard: require an explicit extra confirmation before saving it.
         if chosen_model in ADVANCED_MODELS:
@@ -11581,6 +11750,7 @@ class SettingsDialog(tk.Toplevel):
         self.cfg["move_mode"] = bool(self.move_var.get())
         self.cfg["convert_pdf"] = bool(self.convert_var.get())
         self.cfg["post_run_audit"] = bool(self.audit_var.get())
+        self.cfg["ui_palette"] = self._palette_labels.get(self.palette_var.get(), "C")
         self.cfg["max_workers"] = maxw
         self.cfg["max_files"] = maxf
         self.cfg["max_budget_gbp"] = maxb
@@ -12855,6 +13025,7 @@ class App(tk.Tk):
         except Exception:
             pass
         self.cfg = load_config()
+        self._set_palette_globals(self.cfg.get("ui_palette"))
         FX_RATE[0] = self.cfg.get("fx", 0.79)
         self.kb = KnowledgeBase()
 
@@ -12889,6 +13060,15 @@ class App(tk.Tk):
         self._notification_workers_total = 0
         self._last_cost_gbp = 0.0
         self._closing = False
+        self._run_config = None
+        self._review_snapshot_draft = None
+        self._review_run_id = ""
+        self._review_controller = None
+        self._review_busy = False
+        self._review_check_thread = None
+        self._review_events = collections.deque()
+        self._review_notification_run_id = ""
+        self._review_notification_category = ""
         self.notification_service = NotificationService(self.cfg.get("notifications"))
 
         # thread-safe bridge for blocking unknown-dialog
@@ -12970,11 +13150,243 @@ class App(tk.Tk):
         from stage2_workflow_ui import open_ai_workflow
         open_ai_workflow(self, globals(), role)
 
+    @staticmethod
+    def _set_palette_globals(value):
+        palette = resolve_palette(value)
+        globals().update(BG=palette.bg, PANEL=palette.panel, PANEL2=palette.raised,
+                         BORDER=palette.line, FG=palette.text, FG_DIM=palette.muted,
+                         ACCENT=palette.primary, GREEN=palette.primary, GREEN_HI=palette.primary)
+
+    def _configure_ai_review(self):
+        from stage2_workflow_ui import configure_auto_review
+        return configure_auto_review(self, globals())
+
+    def _refresh_ai_review_summary(self):
+        if getattr(self, "dashboard", None):
+            self.dashboard._refresh_review_summary()
+
+    def _show_ai_review_state(self, state, reason=""):
+        """Render a real review state without inventing document progress."""
+        dashboard = getattr(self, "dashboard", None)
+        if not dashboard:
+            return
+        active = state in ("preparing", "launching", "launched", "running", "verifying")
+        attention = state in ("needs-attention", "outputs-awaiting-verification", "failed")
+        labels = {"preparing": "Preparing", "launching": "Launching", "launched": "Launched",
+                  "running": "Running", "verifying": "Verifying results",
+                  "outputs-awaiting-verification": "Needs attention", "needs-attention": "Needs attention",
+                  "failed": "Needs attention", "completed": "Complete",
+                  "completed-with-unresolved": "Completed with unresolved", "no-candidates": "No candidates",
+                  "cancelled": "Cancelled"}
+        dashboard.phase_label.configure(text="AI Document Review")
+        dashboard.state_label.configure(text=labels.get(state, state.replace("-", " ").title()))
+        # A provider session reports no trustworthy document count here.  Keep
+        # the native bar neutral rather than drawing a misleading percentage.
+        self.progress.configure(mode="determinate", maximum=1, value=0)
+        if attention:
+            message = "The AI session needs review before its result can be accepted."
+        elif active:
+            message = "AI Document Review is working in its visible session; no document percentage is inferred."
+        elif state == "completed":
+            message = "AI Document Review and ledger reconciliation completed."
+        elif state == "no-candidates":
+            message = "Accuracy audit found no review candidates; no paid AI review was started."
+        elif state == "cancelled":
+            message = "Queued automatic AI Document Review was cancelled; processing and audit records remain available."
+        else:
+            message = "AI Document Review is not running."
+        if reason:
+            message += " " + reason
+        dashboard.progress_label.configure(text=message)
+        dashboard.wait_label.configure(text=message)
+
+    def _notify_review_transition(self, run_id, state):
+        """Emit only state changes that alter a user's next action."""
+        if run_id != self._review_notification_run_id:
+            self._review_notification_run_id = run_id
+            self._review_notification_category = ""
+        if state in ("launched", "running"):
+            category, event = "started", "review_started"
+        elif state in ("completed", "completed-with-unresolved", "no-candidates"):
+            category, event = "complete", "review_complete"
+        elif state in ("needs-attention", "outputs-awaiting-verification", "failed"):
+            category, event = "attention", "blocked"
+        else:
+            return
+        if category == self._review_notification_category:
+            return
+        self._review_notification_category = category
+        if event == "blocked":
+            self._notify(event, phase="audit_review", reason="review")
+        else:
+            self._notify(event, phase="audit_review")
+
+    def _ai_review_summary(self):
+        active = getattr(self, "_review_run_id", "")
+        if active and getattr(self, "_review_controller", None):
+            try:
+                record = self._review_controller.get_status(active)
+                settings = record.get("snapshot", {}).get("review", {})
+                if settings and record.get("state") not in ("completed", "completed-with-unresolved", "no-candidates", "cancelled", "disabled"):
+                    return self._format_review_summary(settings, captured=True)
+            except Exception:
+                pass
+        return self._format_review_summary(ai_workflows.auto_review_defaults(self.cfg))
+
+    @staticmethod
+    def _format_review_summary(settings, captured=False):
+        if not settings.get("enabled", True):
+            return "Automatic AI Document Review is off · Configure before Start"
+        model = str(settings.get("model_key", "sol")).title()
+        effort = str(settings.get("effort", "high")).replace("xhigh", "Extra High").title()
+        email = settings.get("expected_email") or "Selected account verified before Start"
+        corrections = "Apply supported corrections" if settings.get("allow_document_changes", True) else "Propose corrections only"
+        return f"{'This run' if captured else 'After audit'}: {model} / {effort} · {email} · {corrections}"
+
+    def _view_ai_session(self):
+        controller = self._get_review_controller()
+        run_id = self._review_run_id
+        if not run_id and self.care_home_dir:
+            records = controller.find_runs(self.care_home_dir)
+            run_id = records[0].get("run_id", "") if records else ""
+        if not run_id:
+            messagebox.showinfo("AI session", "No automatic review session has started for this care home yet.", parent=self)
+            return
+        try:
+            controller.view_existing(run_id)
+        except Exception as exc:
+            messagebox.showinfo("AI session", str(exc), parent=self)
+
+    def _cancel_queued_automatic_review(self):
+        """Cancel only an unclaimed queued review; never stop a launched CLI."""
+        controller = self._get_review_controller()
+        run_id = self._review_run_id
+        if not run_id and self.care_home_dir:
+            records = controller.find_runs(self.care_home_dir)
+            run_id = records[0].get("run_id", "") if records else ""
+        if not run_id:
+            messagebox.showinfo("AI Document Review", "No queued automatic review was found for this care home.", parent=self)
+            return
+        try:
+            record = controller.get_status(run_id)
+            if record.get("launch_claim") or record.get("state") not in ("waiting-processing", "waiting-audit", "ready"):
+                messagebox.showinfo("AI Document Review", "Only an unclaimed queued review can be cancelled. A launched session remains available through View AI session.", parent=self)
+                return
+            if not messagebox.askyesno("Cancel queued AI review", "Cancel the queued automatic AI Document Review? Processing and the Accuracy Audit report are kept.", parent=self):
+                return
+            result = controller.cancel_queued(run_id)
+        except Exception as exc:
+            messagebox.showerror("AI Document Review", str(exc), parent=self)
+            return
+        self._review_run_id = run_id
+        self._review_busy = False
+        self._review_events.append((run_id, result))
+        self._poll_ai_review()
+
+    def _restore_ai_review(self, pending=None):
+        """Resume supervision of a saved run, never infer a new review request."""
+        if not self.care_home_dir:
+            return
+        controller = self._get_review_controller()
+        if pending:
+            self._review_run_id = str(pending.get("auto_review_run_id") or "")
+            self._refresh_ai_review_summary()
+            return
+        try:
+            records = controller.find_runs(self.care_home_dir)
+            if not records:
+                self._review_run_id = ""
+                self._refresh_ai_review_summary()
+                return
+            record = records[0]
+            self._review_run_id = record["run_id"]
+            self._refresh_ai_review_summary()
+            if record["state"] == "ready":
+                self._begin_automatic_review({"audit_status": "complete"}, None)
+            elif record.get("request_dir"):
+                self._review_busy = True
+                self._review_events.append((record["run_id"], record))
+            elif record.get("processing_receipt") and not record.get("audit_receipt"):
+                self.set_status("Saved processing is complete; its accuracy audit needs attention. "
+                                "Automatic AI Document Review has not started.")
+        except Exception as exc:
+            self.log("Saved AI review needs attention: " + str(exc))
+
+    def _get_review_controller(self):
+        if self._review_controller is None:
+            from stage2_autoreview import Stage2AutoReviewController
+            self._review_controller = Stage2AutoReviewController(APP_DIR / "AI Review Runs")
+        return self._review_controller
+
+    def _begin_automatic_review(self, stats, status):
+        """Called only after the engine thread and its writer lock have ended."""
+        run_id = getattr(self, "_review_run_id", "")
+        if not run_id:
+            return False
+        kind = str(status or "").partition(":")[0]
+        if kind not in ("", "batch_applied", "batch_audit_complete"):
+            return False
+        if stats.get("audit_status") != "complete":
+            return False
+        if self._review_check_thread and self._review_check_thread.is_alive():
+            return True
+        controller = self._get_review_controller()
+        self._review_busy = True
+        self._refresh_run_controls()
+        self.set_status("Accuracy audit complete · preparing AI Document Review…")
+        self._show_ai_review_state("preparing")
+        def work():
+            try:
+                result = controller.maybe_launch(run_id)
+            except Exception as exc:
+                result = {"state": "needs-attention", "reason": str(exc)}
+            self._review_events.append((run_id, result))
+        self._review_check_thread = threading.Thread(target=work, daemon=True)
+        self._review_check_thread.start()
+        return True
+
+    def _poll_ai_review(self):
+        while self._review_events:
+            run_id, result = self._review_events.popleft()
+            if run_id != self._review_run_id:
+                continue
+            state = str(result.get("state", "needs-attention"))
+            active = state in ("preparing", "launching", "launched", "running", "verifying")
+            self._review_busy = active
+            self._refresh_run_controls()
+            reason = str(result.get("reason") or result.get("message") or result.get("summary") or "")
+            self.set_status(f"AI Document Review · {state.replace('-', ' ')}" + (f" · {reason}" if reason else ""))
+            self._show_ai_review_state(state, reason)
+            self._refresh_ai_review_summary()
+            self._notify_review_transition(run_id, state)
+        if self._review_busy and not (self._review_check_thread and self._review_check_thread.is_alive()):
+            run_id = self._review_run_id
+            def check():
+                try:
+                    result = self._get_review_controller().reconcile(run_id)
+                except Exception as exc:
+                    result = {"state": "needs-attention", "reason": str(exc)}
+                self._review_events.append((run_id, result))
+            self._review_check_thread = threading.Thread(target=check, daemon=True)
+            self._review_check_thread.start()
+
     def _open_notification_settings(self):
         from stage2_workflow_ui import open_notification_settings
         open_notification_settings(self, globals())
 
     def _close_app(self):
+        if self._review_busy:
+            if not messagebox.askyesno("Close the dashboard?",
+                    "AI Document Review is running in its own process. Closing "
+                    "Stage 2 does not cancel that review, but pauses dashboard "
+                    "monitoring. Its saved session can be checked when you reopen "
+                    "this care home.\n\nKeep Stage 2 open for live completion "
+                    "updates. Close the dashboard anyway?", parent=self):
+                return
+            self._closing = True
+            self.notification_service.close()
+            self.destroy()
+            return
         if self.dashboard.is_busy():
             if not messagebox.askyesno("Stop and close?",
                     "A Stage 2 operation is running. Stop safely after the current "
@@ -13004,6 +13416,7 @@ class App(tk.Tk):
         self.notification_service.emit(event, run_id=self._notification_run_id or "stage2", **data)
 
     def _poll_notifications(self):
+        self._poll_ai_review()
         for status in self.notification_service.drain_statuses():
             CONSOLE.add(str(status), "info")
         if (self.dashboard.progress.phase in ("audit", "preparing", "scanning", "batch", "followup_plan", "followup_upload")
@@ -13141,12 +13554,15 @@ class App(tk.Tk):
         self._tools_win = ToolsDialog(self)
 
     def _open_settings(self):
-        SettingsDialog(self, dict(self.cfg), self._on_settings_saved)
+        SettingsDialog(self, copy.deepcopy(self.cfg), self._on_settings_saved)
 
     def _on_settings_saved(self, cfg):
         self.cfg = cfg
         FX_RATE[0] = cfg.get("fx", 0.79)
         self.notification_service.configure(cfg.get("notifications"))
+        self._set_palette_globals(cfg.get("ui_palette"))
+        self.dashboard.apply_palette(cfg.get("ui_palette"))
+        self._refresh_ai_review_summary()
         self._refresh_env_banner()
 
     # ---------------- folder ----------------
@@ -13207,7 +13623,12 @@ class App(tk.Tk):
         if pending is None:
             pending = (has_pending_batch(self.care_home_dir)
                        if self.care_home_dir else {})
-        busy = busy or getattr(self, "_recovery_busy", False)
+        review_busy = bool(getattr(self, "_review_busy", False))
+        processing_busy = bool(busy or getattr(self, "_recovery_busy", False)
+                               or getattr(self, "_scanning", False)
+                               or (getattr(self, "worker_thread", None)
+                                   and self.worker_thread.is_alive()))
+        busy = processing_busy or review_busy
         self.pick_btn.configure(state="disabled" if busy else "normal")
         self.start_btn.configure(state=("normal" if self.care_home_dir
             and not busy and not pending else "disabled"))
@@ -13215,7 +13636,10 @@ class App(tk.Tk):
                                           else "normal"))
         self.batch_btn.configure(state=("normal" if pending and not busy
                                         else "disabled"))
-        self.stop_btn.configure(state="normal" if busy else "disabled")
+        # Stop controls processing/audit only.  The external review session is
+        # deliberately not cancelled by this control; use its viewer or cancel
+        # the queue before it launches.
+        self.stop_btn.configure(state="normal" if processing_busy else "disabled")
 
     def _pick_folder(self):
         if self._batch_busy_guard():
@@ -13260,6 +13684,7 @@ class App(tk.Tk):
 
         pend, ckpt = self._refresh_folder_state()
         self._refresh_run_controls(pending=pend)
+        self._restore_ai_review(pend)
 
         if ckpt and not ckpt.get("finished") and not pend:
             if messagebox.askyesno(
@@ -13398,14 +13823,15 @@ class App(tk.Tk):
         self._unknown_event.wait()
         return bool(self._unknown_result)
 
-    def _make_engine(self, api_key: str, model_id: str, reprocess=False) -> Engine:
+    def _make_engine(self, api_key: str, model_id: str, reprocess=False, run_config=None) -> Engine:
         """Build an Engine wired to this window (shared by live + batch runs)."""
+        cfg = run_config if run_config is not None else self.cfg
         api = ClaudeAPI(api_key, model_id)
         # Second opinion: a stronger-model client used ONLY for documents the
         # primary model can't settle (no match / confidence < threshold).
         # Skipped when the primary model is already at least that strong.
         escalation_api = None
-        if bool(self.cfg.get("second_opinion", True)):
+        if bool(cfg.get("second_opinion", True)):
             prim = MODELS_BY_ID.get(model_id, {})
             strong = MODELS_BY_ID.get(SECOND_OPINION_MODEL_ID, {})
             if (model_id != SECOND_OPINION_MODEL_ID
@@ -13423,46 +13849,73 @@ class App(tk.Tk):
             self._notify("phase_started", phase="batch")
         else:
             self._notify("run_started", workers=len(worker_dirs_in(self.care_home_dir)))
-        return Engine(
+        engine = Engine(
             self.care_home_dir, self.kb, api, self.care_home_dir.name,
             log=self.log, set_status=self.set_status,
             set_progress=self.set_progress, set_preview=self.set_preview,
             ask_unknown=self.ask_unknown, on_cost=self.on_cost,
             on_done=self._on_done,
-            resolution=self.cfg.get("resolution", 1.5),
-            skip_when_clear=self.cfg.get("skip_when_clear", False),
-            adaptive_pages=self.cfg.get("adaptive_pages", True),
-            auto_other=self.cfg.get("auto_other", False),
-            max_workers=int(self.cfg.get("max_workers", DEFAULT_MAX_WORKERS)),
-            max_files=int(self.cfg.get("max_files", DEFAULT_MAX_FILES)),
-            max_budget_gbp=float(self.cfg.get("max_budget_gbp",
+            resolution=cfg.get("resolution", 1.5),
+            skip_when_clear=cfg.get("skip_when_clear", False),
+            adaptive_pages=cfg.get("adaptive_pages", True),
+            auto_other=cfg.get("auto_other", False),
+            max_workers=int(cfg.get("max_workers", DEFAULT_MAX_WORKERS)),
+            max_files=int(cfg.get("max_files", DEFAULT_MAX_FILES)),
+            max_budget_gbp=float(cfg.get("max_budget_gbp",
                                               DEFAULT_MAX_BUDGET_GBP)),
-            max_file_mb=float(self.cfg.get("max_file_mb", DEFAULT_MAX_FILE_MB)),
-            redact_logs=bool(self.cfg.get("redact_logs", False)),
+            max_file_mb=float(cfg.get("max_file_mb", DEFAULT_MAX_FILE_MB)),
+            redact_logs=bool(cfg.get("redact_logs", False)),
             reprocess=reprocess,
-            convert_pdf=bool(self.cfg.get("convert_pdf", True)),
-            move_mode=bool(self.cfg.get("move_mode", False)),
+            convert_pdf=bool(cfg.get("convert_pdf", True)),
+            move_mode=bool(cfg.get("move_mode", False)),
             move_dest=self.move_dest,
             review_unknowns=self.review_unknowns,
             escalation_api=escalation_api,
             orientation_mode=str(
-                self.cfg.get("orientation_mode", "audit")),
+                cfg.get("orientation_mode", "audit")),
             orientation_confidence=float(
-                self.cfg.get("orientation_confidence", 0.95)),
+                cfg.get("orientation_confidence", 0.95)),
             orientation_margin=float(
-                self.cfg.get("orientation_margin", 0.20)),
-            bundle_split=bool(self.cfg.get("bundle_split", True)),
-            cleanup_leftovers=bool(self.cfg.get("cleanup_leftovers", True)),
-            post_run_audit=bool(self.cfg.get("post_run_audit", False)),
+                cfg.get("orientation_margin", 0.20)),
+            bundle_split=bool(cfg.get("bundle_split", True)),
+            cleanup_leftovers=bool(cfg.get("cleanup_leftovers", True)),
+            post_run_audit=bool(cfg.get("post_run_audit", False)),
             on_activity=self.on_activity)
+        # Existing batches opt in only through the marker saved with their
+        # original submission. Never attach today's settings to a legacy batch.
+        if pending:
+            self._review_run_id = str(pending.get("auto_review_run_id") or "")
+        if self._review_run_id:
+            engine._review_run_id = self._review_run_id
+            engine._review_controller = self._get_review_controller()
+            engine.stats["auto_review_run_id"] = self._review_run_id
+            snapshot = engine._review_controller.get_status(self._review_run_id).get("snapshot", {})
+            if snapshot.get("review", {}).get("enabled"):
+                engine.post_run_audit = True
+            if not pending and getattr(self, "_resuming_live", False):
+                engine._review_scope_worker_names = {name.casefold() for name in snapshot.get("scope_worker_names", [])}
+                saved = read_live_checkpoint(self.care_home_dir) or {}
+                engine._resume_processing_complete = bool(saved.get("processing_complete"))
+                root = Path(snapshot["document_root"]).resolve()
+                restored = set()
+                for item in saved.get("audit_worker_dirs", []):
+                    folder = Path(item).resolve()
+                    key = str(folder).casefold()
+                    if (key not in restored and folder.parent == root
+                            and folder.name.casefold() in engine._review_scope_worker_names
+                            and folder.is_dir()):
+                        engine._audit_worker_dirs.append(folder)
+                        restored.add(key)
+        return engine
 
     def _batch_busy_guard(self) -> bool:
         """True (and warns) if a run/scan is already in progress."""
         if (self.worker_thread and self.worker_thread.is_alive()) \
                 or getattr(self, "_scanning", False) \
-                or getattr(self, "_recovery_busy", False):
+                or getattr(self, "_recovery_busy", False) \
+                or getattr(self, "_review_busy", False):
             messagebox.showwarning(
-                "Busy", "Another run, scan or recovery check is already in progress.")
+                "Busy", "Another run, scan, recovery check or AI Document Review is already in progress.")
             return True
         return False
 
@@ -13640,8 +14093,16 @@ class App(tk.Tk):
                     "for the AI (only images will work). Continue anyway?"):
                 return
 
-        model_id = MODELS[self.cfg["model"]]["id"]
-        max_file_mb = float(self.cfg.get("max_file_mb", DEFAULT_MAX_FILE_MB))
+        # One immutable draft drives scan, confirmation and the resulting run.
+        cfg = copy.deepcopy(self.cfg)
+        checkpoint = read_live_checkpoint(self.care_home_dir) or {}
+        self._resuming_live = bool(checkpoint and not checkpoint.get("finished"))
+        self._resume_live_checkpoint = copy.deepcopy(checkpoint) if self._resuming_live else {}
+        self._resume_review_run_id = str(checkpoint.get("auto_review_run_id") or "") if self._resuming_live else ""
+        self._run_config = cfg
+        self._review_snapshot_draft = None
+        model_id = MODELS[cfg["model"]]["id"]
+        max_file_mb = float(cfg.get("max_file_mb", DEFAULT_MAX_FILE_MB))
 
         # ---- PRE-FLIGHT SCAN (no API calls) on a BACKGROUND thread ---------
         # The scan walks the whole care-home tree, which can be slow on very
@@ -13672,13 +14133,51 @@ class App(tk.Tk):
         def _bg_scan():
             try:
                 scan_ext = (CONVERT_SCAN_EXT
-                            if self.cfg.get("convert_pdf", True) else None)
+                            if cfg.get("convert_pdf", True) else None)
                 scan = preflight_scan(care_dir, max_file_mb,
                                       cancel_event=cancel, progress_cb=_progress,
                                       scan_ext=scan_ext)
                 already = 0
                 if not scan.get("cancelled"):
                     already = has_existing_batches(care_dir, cancel_event=cancel)
+                    review_settings = ai_workflows.auto_review_defaults(cfg)
+                    if self._resuming_live:
+                        if self._resume_review_run_id:
+                            saved = self._get_review_controller().get_status(self._resume_review_run_id, processing_root=care_dir)
+                            snapshot = saved["snapshot"]
+                            expected_root = self.move_dest if cfg.get("move_mode") else care_dir
+                            if Path(snapshot["document_root"]).resolve() != Path(expected_root).resolve():
+                                raise RuntimeError("This interrupted run has a different saved document destination. Select its original destination before resuming.")
+                            # Free identity/model preflight again, but keep the original
+                            # snapshot, authority and worker scope, not today's defaults.
+                            checked = self._get_review_controller().capture_snapshot(
+                                run_id=snapshot["run_id"], processing_root=care_dir,
+                                document_root=snapshot["document_root"], care_home=snapshot["care_home"],
+                                worker_names=snapshot["scope_worker_names"], settings=snapshot["review"],
+                                accuracy_audit_enabled=snapshot["accuracy_audit_enabled"])
+                            for key in ("provider", "model", "effort", "expected_email"):
+                                if checked["review"].get(key) != snapshot["review"].get(key):
+                                    raise RuntimeError("The saved review account/model no longer matches. No processing was started.")
+                            cfg.setdefault("ai_workflows", {})["auto_review"] = copy.deepcopy(snapshot["review"])
+                            cfg["post_run_audit"] = snapshot["accuracy_audit_enabled"]
+                        else:
+                            # Legacy live checkpoints did not authorize auto review.
+                            cfg.setdefault("ai_workflows", {})["auto_review"] = {"enabled": False}
+                    elif review_settings.get("enabled", True) and scan.get("files"):
+                        review_settings["workspace_root"] = review_settings.get("workspace_root") or str(ai_workflows.default_workspace_root())
+                        review_settings["ledger_path"] = review_settings.get("ledger_path") or str(ai_workflows.default_ledger_path())
+                        review_settings["misnaming_path"] = review_settings.get("misnaming_path") or str(APP_DIR / "Misnaming Record.xlsx")
+                        review_settings["assets_root"] = str(bundled_resource("docs", "ai-review"))
+                        review_settings["codex_homes"] = copy.deepcopy(cfg.get("ai_workflows", {}).get("codex_homes", []))
+                        scope = worker_dirs_in(care_dir)[:int(cfg.get("max_workers", DEFAULT_MAX_WORKERS))]
+                        self._review_snapshot_draft = self._get_review_controller().capture_snapshot(
+                            run_id="stage2-" + uuid.uuid4().hex, processing_root=care_dir,
+                            document_root=self.move_dest if cfg.get("move_mode") else care_dir,
+                            care_home=care_dir.name, worker_names=[p.name for p in scope],
+                            settings=review_settings,
+                            accuracy_audit_enabled=bool(cfg.get("post_run_audit", False)))
+                    if cancel.is_set():
+                        scan["cancelled"] = True
                 self.after(0, self._start_after_scan, api_key, model_id,
                            max_file_mb, scan, already, None)
             except Exception as e:
@@ -13700,6 +14199,8 @@ class App(tk.Tk):
     def _scan_ui_reset(self):
         """Restore the controls/progress bar after a scan that doesn't proceed."""
         self._scanning = False
+        self._run_config = None
+        self._review_snapshot_draft = None
         try:
             self.progress.stop()
         except Exception:
@@ -13710,6 +14211,7 @@ class App(tk.Tk):
 
     def _start_after_scan(self, api_key, model_id, max_file_mb, scan, already, error):
         # back on the UI thread now; the scan thread has finished
+        cfg = self._run_config or copy.deepcopy(self.cfg)
         self._scanning = False
         try:
             self.progress.stop()
@@ -13729,7 +14231,12 @@ class App(tk.Tk):
             self.set_status("Scan cancelled.")
             return
 
-        if scan["files"] == 0:
+        resume_audit_only = bool(
+            getattr(self, "_resuming_live", False)
+            and getattr(self, "_resume_review_run_id", "")
+            and (getattr(self, "_resume_live_checkpoint", {}) or {}).get("processing_complete")
+            and (getattr(self, "_resume_live_checkpoint", {}) or {}).get("audit_worker_dirs"))
+        if scan["files"] == 0 and not resume_audit_only:
             messagebox.showinfo(
                 "Nothing to do",
                 "No eligible documents were found to send.\n\n"
@@ -13739,11 +14246,11 @@ class App(tk.Tk):
             return
 
         # ---- Part-2 estimator: page/resolution-aware Live vs Batch figures ---
-        zoom = float(self.cfg.get("resolution", 1.5))
-        adaptive = bool(self.cfg.get("adaptive_pages", True))
+        zoom = float(cfg.get("resolution", 1.5))
+        adaptive = bool(cfg.get("adaptive_pages", True))
         vocab_block = self.kb.vocabulary_block()
         followup_model_id = model_id
-        if bool(self.cfg.get("second_opinion", True)):
+        if bool(cfg.get("second_opinion", True)):
             primary_price = MODELS_BY_ID.get(model_id, {}).get("in", 99.0)
             stronger_price = MODELS_BY_ID.get(
                 SECOND_OPINION_MODEL_ID, {}).get("in", 0.0)
@@ -13752,11 +14259,11 @@ class App(tk.Tk):
         est_live = estimate_pipeline_costs_gbp(
             scan["files"], model_id, followup_model_id, zoom, vocab_block,
             batch=False,
-            include_audit=bool(self.cfg.get("post_run_audit", False)))
+            include_audit=bool(cfg.get("post_run_audit", False)))
         est_batch = estimate_pipeline_costs_gbp(
             scan["files"], model_id, followup_model_id, zoom, vocab_block,
             batch=True,
-            include_audit=bool(self.cfg.get("post_run_audit", False)))
+            include_audit=bool(cfg.get("post_run_audit", False)))
         est_gbp = est_live["gbp"]
         self._est_at_start = {"live": est_live, "batch": est_batch,
                               "files": scan["files"]}
@@ -13764,9 +14271,9 @@ class App(tk.Tk):
         # Time estimate is based on the number of files that will ACTUALLY be
         # sent this run - capped by the per-run file limit, since the run stops
         # there. So the figure matches what will really happen.
-        sec_per_file = float(self.cfg.get("sec_per_file", DEFAULT_SEC_PER_FILE))
+        sec_per_file = float(cfg.get("sec_per_file", DEFAULT_SEC_PER_FILE))
         files_this_run = min(scan["files"],
-                             int(self.cfg.get("max_files", DEFAULT_MAX_FILES)))
+                             int(cfg.get("max_files", DEFAULT_MAX_FILES)))
         est_secs = estimate_runtime_seconds(files_this_run, sec_per_file)
 
         # detect a folder that was processed before (via the saved manifest)
@@ -13800,7 +14307,7 @@ class App(tk.Tk):
             f"Documents to send   : {scan['files']}",
             f"Total size          : {size_mb:.1f} MB",
         ]
-        if self.cfg.get("move_mode") and self.move_dest:
+        if cfg.get("move_mode") and self.move_dest:
             lines.append(f"Move processed to   : {self.move_dest}")
         if scan["oversized"]:
             lines.append(f"Skipped (too big)   : {len(scan['oversized'])} "
@@ -13810,7 +14317,7 @@ class App(tk.Tk):
                          f"(not downloaded)")
         lines += [
             "",
-            f"Model               : {self.cfg['model']}",
+            f"Model               : {cfg['model']}",
             "",
             "--- Estimated cost (rough; billed on real usage) ---",
             f"Live classification : ~£{est_live['primary_gbp']:.2f}"
@@ -13822,19 +14329,21 @@ class App(tk.Tk):
             f"Follow-up reserve   : ~£{est_batch['followup_reserve_gbp']:.2f}"
             f"  ({est_batch['followup_reserve_files']} unresolved docs, optional)",
             f"Accuracy audit      : ~£{est_batch['audit_gbp']:.2f}"
-            f"  ({'enabled' if self.cfg.get('post_run_audit', False) else 'disabled'})",
+            f"  ({'enabled' if cfg.get('post_run_audit', False) else 'disabled'})",
             f"Cumulative live     : ~£{est_live['gbp']:.2f}",
             f"Cumulative batch    : ~£{est_batch['gbp']:.2f}",
-            f"Assumptions         : {self.cfg['model']}, {zoom:.1f}x resolution, "
+            f"Assumptions         : {cfg['model']}, {zoom:.1f}x resolution, "
             f"{'adaptive pages (live)' if adaptive else 'all pages'}; "
             f"~{EST_OUTPUT_TOKENS_PER_DOC} output tokens/doc",
             "",
             f"Estimated time      : ~{human_duration(est_secs)}"
             f"  (live mode, {files_this_run} files @ {sec_per_file:g}s; batch "
             f"results take ~1h-24h)",
-            f"Hard spend limit    : £{float(self.cfg.get('max_budget_gbp', DEFAULT_MAX_BUDGET_GBP)):.2f}",
-            f"Hard file limit     : {int(self.cfg.get('max_files', DEFAULT_MAX_FILES))} files",
-            f"Hard worker limit   : {int(self.cfg.get('max_workers', DEFAULT_MAX_WORKERS))} workers",
+            f"Hard spend limit    : £{float(cfg.get('max_budget_gbp', DEFAULT_MAX_BUDGET_GBP)):.2f}",
+            f"Hard file limit     : {int(cfg.get('max_files', DEFAULT_MAX_FILES))} files",
+            f"Hard worker limit   : {int(cfg.get('max_workers', DEFAULT_MAX_WORKERS))} workers",
+            "", self._format_review_summary(ai_workflows.auto_review_defaults(cfg)),
+            "AI Document Review uses the selected CLI subscription, separate from the API estimate above.",
         ]
         if rerun_note:
             lines += ["", f"Re-run mode         : {rerun_note}"]
@@ -13872,13 +14381,22 @@ class App(tk.Tk):
             self._scan_ui_reset()
             return
         dlg = ConfirmReviewDialog(self, overview, sections, warn,
-                                  mode_choice=self.cfg.get("run_mode", "live"),
+                                  mode_choice=cfg.get("run_mode", "live"),
                                   batch_blocked=batch_blocked)
         self.wait_window(dlg)
         if not dlg.result:
             self._scan_ui_reset()
             return
         run_mode = dlg.mode
+        try:
+            self._review_run_id = getattr(self, "_resume_review_run_id", "")
+            if self._review_snapshot_draft:
+                self._get_review_controller().commit_run(self._review_snapshot_draft)
+                self._review_run_id = self._review_snapshot_draft["run_id"]
+        except Exception as exc:
+            messagebox.showerror("Review setup could not be saved", str(exc) + "\nNo processing was started.", parent=self)
+            self._scan_ui_reset()
+            return
         # persist the last-used mode
         if run_mode != self.cfg.get("run_mode"):
             self.cfg["run_mode"] = run_mode
@@ -13892,20 +14410,20 @@ class App(tk.Tk):
         self.stop_btn.configure(state="normal")
         self._reset_stats()
 
-        self.engine = self._make_engine(api_key, model_id, reprocess=reprocess)
+        self.engine = self._make_engine(api_key, model_id, reprocess=reprocess, run_config=cfg)
         self.log(pipeline.build_identity("Stage 2"))
         self.log(f"Starting review of: {self.care_home_dir}")
         self.log(f"Mode: {'Overnight Batch (50% price)' if run_mode == 'batch' else 'Live'}   "
-                 f"Model: {self.cfg['model']}   FX: {FX_RATE[0]}   "
-                 f"Resolution: {self.cfg.get('resolution',1.5)}x")
-        self.log(f"Limits — workers: {self.cfg.get('max_workers', DEFAULT_MAX_WORKERS)}, "
-                 f"files: {self.cfg.get('max_files', DEFAULT_MAX_FILES)}, "
-                 f"spend: £{float(self.cfg.get('max_budget_gbp', DEFAULT_MAX_BUDGET_GBP)):.2f}, "
+                 f"Model: {cfg['model']}   FX: {cfg.get('fx', 0.79)}   "
+                 f"Resolution: {cfg.get('resolution',1.5)}x")
+        self.log(f"Limits — workers: {cfg.get('max_workers', DEFAULT_MAX_WORKERS)}, "
+                 f"files: {cfg.get('max_files', DEFAULT_MAX_FILES)}, "
+                 f"spend: £{float(cfg.get('max_budget_gbp', DEFAULT_MAX_BUDGET_GBP)):.2f}, "
                  f"max file: {max_file_mb:.0f} MB")
-        self.log(f"Adaptive pages: {'on' if self.cfg.get('adaptive_pages',True) else 'off'}   "
-                 f"Skip API when clear: {'on' if self.cfg.get('skip_when_clear',False) else 'off'}   "
-                 f"Auto-Other: {'on' if self.cfg.get('auto_other',False) else 'off'}   "
-                 f"Redact logs: {'on' if self.cfg.get('redact_logs',False) else 'off'}")
+        self.log(f"Adaptive pages: {'on' if cfg.get('adaptive_pages',True) else 'off'}   "
+                 f"Skip API when clear: {'on' if cfg.get('skip_when_clear',False) else 'off'}   "
+                 f"Auto-Other: {'on' if cfg.get('auto_other',False) else 'off'}   "
+                 f"Redact logs: {'on' if cfg.get('redact_logs',False) else 'off'}")
         if reprocess:
             self.log("Re-run mode: FORCING full re-process (cache ignored).")
         target = (self.engine.run_batch_submit if run_mode == "batch"
@@ -13931,6 +14449,11 @@ class App(tk.Tk):
             self.after(500, self._poll_stats)
 
     def _stop(self):
+        if getattr(self, "_review_busy", False):
+            messagebox.showinfo("AI Document Review", "This review runs in a separate CLI process. "
+                "View AI session shows its current work. Stage 2's Stop button "
+                "controls processing and the accuracy audit, not the external AI.", parent=self)
+            return
         # Phase 1: cancel an in-progress pre-flight scan
         if getattr(self, "_scanning", False):
             if getattr(self, "_scan_cancel", None) is not None:
@@ -13966,6 +14489,10 @@ class App(tk.Tk):
             self._notify_done(stats, status)
             if self._closing:
                 return
+        if self._begin_automatic_review(stats, status):
+            # Do not put a modal completion dialog in front of an unattended
+            # handoff. Its result remains visible in the dashboard and reports.
+            return
         kind = status.partition(":")[0] if isinstance(status, str) else status
         if (not status or kind in ("batch_applied", "batch_audit_complete")) and stats.get("audit_status") not in ("failed", "pending", "skipped"):
             self.set_progress(1, 1)

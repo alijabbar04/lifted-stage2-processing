@@ -18,17 +18,119 @@ import shutil
 import subprocess
 import threading
 import time
+from types import MappingProxyType
 import uuid
 
 
-MODEL_CHOICES = {
-    "opus": {"label": "Opus · Claude Code", "provider": "claude", "id": "opus", "effort": "high", "role": "audit-review"},
-    "luna": {"label": "Luna · Codex", "provider": "codex", "id": "gpt-5.6-luna", "effort": "high", "role": "audit-review"},
-    "fable": {"label": "Fable · Claude Code", "provider": "claude", "id": "fable", "effort": "xhigh", "role": "code-learning"},
-    "sol": {"label": "Sol · Codex", "provider": "codex", "id": "gpt-5.6-sol", "effort": "xhigh", "role": "code-learning"},
-}
-RULE_FILES = ("REVIEW_RULES.md", "LEARNING_RULES.md", "NAMING_RULES.md", "WORKFLOW_GUIDE.md", "REVIEW_RECORDS.md")
+PROVIDER_LABELS = {"codex": "Codex (OpenAI)", "claude": "Claude Code (Anthropic)"}
+# Every effort token a provider's CLI can accept. Ranked recommendations below
+# are a subset; the remainder are offered as advanced choices. Actual
+# entitlement is re-checked against the account's advertised catalog (Codex) or
+# the installed CLI's supported levels (Claude) before any launch.
+PROVIDER_EFFORTS = {"codex": ("minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+                    "claude": ("low", "medium", "high", "xhigh", "max")}
+EFFORT_LABELS = {"minimal": "Minimal", "low": "Low", "medium": "Medium", "high": "High",
+                 "xhigh": "Extra High", "max": "Max", "ultra": "Ultra"}
 ROLES = ("audit-review", "code-learning")
+ROLE_TITLES = {"audit-review": "AI Document Review", "code-learning": "Improve Stage 2"}
+DEFAULT_MODEL = {"audit-review": "sol", "code-learning": "fable"}
+# Identity preferences belong to the user's local configuration, not a release.
+DEFAULT_EXPECTED_EMAIL = ""
+
+# Shared model catalog. Explicit model IDs only; the provider is inferred from
+# the model. Ranks are practical-suitability orderings per role from the
+# approved proposal, not measured Stage 2 accuracy. Each role tuple lists the
+# recommended effort first, then other reasonable efforts.
+_CATALOG = (
+    ("sol", "Sol", "codex", "gpt-5.6-sol",
+     {"audit-review": (1, ("high", "xhigh", "medium", "max")), "code-learning": (2, ("high", "xhigh", "medium", "max"))},
+     "Default for consequential, unattended document review; routine Codex choice for bounded code fixes."),
+    ("opus", "Opus 5", "claude", "claude-opus-5",
+     {"audit-review": (2, ("high", "xhigh", "medium", "max")), "code-learning": (4, ("high", "xhigh", "medium", "max"))},
+     "Credible Claude alternative for document review; not a proven upgrade or downgrade on these files."),
+    ("terra", "Terra", "codex", "gpt-5.6-terra",
+     {"audit-review": (3, ("high", "xhigh", "medium", "max")), "code-learning": (5, ("high", "xhigh", "medium", "max"))},
+     "Lower-usage full-review alternative pending a task-specific comparison."),
+    ("astra", "Astra", "codex", "gpt-6-astra",
+     {"audit-review": (4, ("high", "xhigh", "medium", "max")), "code-learning": (3, ("medium", "high", "xhigh", "max"))},
+     "Escalation for difficult cross-document or cross-cutting judgments; not a routine default."),
+    ("fable", "Fable 5.1", "claude", "claude-fable-5-1",
+     {"audit-review": (5, ("high", "xhigh", "medium", "max")), "code-learning": (1, ("high", "xhigh", "medium", "max"))},
+     "Claude-first choice for the full correction-led investigation across rules, causes, implementation and regressions."),
+    ("luna", "Luna", "codex", "gpt-5.6-luna",
+     {"audit-review": (6, ("high", "xhigh", "medium")), "code-learning": (6, ("high", "medium", "xhigh"))},
+     "Routine triage, clerical checks or supervised review; the prior Luna review needed supervisor intervention."),
+)
+MODEL_CATALOG = {}
+for _key, _family, _provider, _id, _roles, _note in _CATALOG:
+    _primary = min(_roles, key=lambda role: _roles[role][0])
+    MODEL_CATALOG[_key] = {"key": _key, "family": _family, "provider": _provider, "provider_label": PROVIDER_LABELS[_provider],
+                           "id": _id, "label": f"{_family} · {PROVIDER_LABELS[_provider]}", "roles": _roles, "primary_role": _primary, "note": _note}
+del _key, _family, _provider, _id, _roles, _note, _primary
+# Backwards-compatible view: label/provider/id plus the primary role and its
+# recommended effort. "role" is no longer a lock; see model_choice(role=...).
+MODEL_CHOICES = {key: {"label": entry["label"], "provider": entry["provider"], "id": entry["id"],
+                       "effort": entry["roles"][entry["primary_role"]][1][0], "role": entry["primary_role"],
+                       "roles": tuple(sorted(entry["roles"], key=lambda role: entry["roles"][role][0])), "family": entry["family"]}
+                 for key, entry in MODEL_CATALOG.items()}
+RULE_FILES = ("REVIEW_RULES.md", "LEARNING_RULES.md", "NAMING_RULES.md", "WORKFLOW_GUIDE.md", "REVIEW_RECORDS.md")
+
+
+def model_keys_for_role(role):
+    """Catalog keys usable for a role, ranked by practical suitability."""
+    if role not in ROLES:
+        raise WorkflowError("Unknown AI workflow role.")
+    return tuple(sorted((key for key, entry in MODEL_CATALOG.items() if role in entry["roles"]),
+                        key=lambda key: MODEL_CATALOG[key]["roles"][role][0]))
+
+
+def effort_choices(model_key, role=None, advertised=None):
+    """Efforts for a model, recommended first, then advanced provider levels.
+
+    advertised, when given, filters to levels the account/CLI actually
+    supports. Nothing is invented: an unlisted level is simply not offered.
+    """
+    entry = MODEL_CATALOG.get(model_key)
+    if not entry:
+        raise WorkflowError("Select a supported model.")
+    role = role or entry["primary_role"]
+    if role not in entry["roles"]:
+        raise WorkflowError(f"{entry['family']} is not offered for this review role.")
+    recommended = list(entry["roles"][role][1])
+    ordered = recommended + [level for level in PROVIDER_EFFORTS[entry["provider"]] if level not in recommended]
+    if advertised is not None:
+        allowed = {str(level).casefold() for level in advertised}
+        ordered = [level for level in ordered if level in allowed]
+    return tuple(ordered)
+
+
+def model_choice(key, effort=None, role=None):
+    """Resolve immutable metadata for a catalog model, optional effort and role.
+
+    Raises WorkflowError for an unknown model, an unsupported role, or an
+    effort the provider cannot accept. An explicit effort is never replaced by
+    the recommended one; it is only checked.
+    """
+    entry = MODEL_CATALOG.get(str(key or ""))
+    if not entry:
+        raise WorkflowError("Select a supported model for this review role.")
+    role = role or entry["primary_role"]
+    if role not in ROLES:
+        raise WorkflowError("Unknown AI workflow role.")
+    if role not in entry["roles"]:
+        raise WorkflowError(f"{entry['family']} is not offered for {ROLE_TITLES[role]}.")
+    rank, recommended = entry["roles"][role]
+    efforts = effort_choices(key, role)
+    resolved = str(effort or recommended[0]).strip().casefold()
+    if resolved not in PROVIDER_EFFORTS[entry["provider"]]:
+        raise WorkflowError(f"{entry['provider_label']} does not accept '{effort}' effort for {entry['family']}. Choose a listed effort; no fallback was selected.")
+    data = {"key": entry["key"], "label": entry["label"], "family": entry["family"], "provider": entry["provider"],
+            "provider_label": entry["provider_label"], "id": entry["id"], "role": role, "roles": MODEL_CHOICES[key]["roles"],
+            "rank": rank, "recommended_effort": recommended[0], "efforts": efforts,
+            "advanced_efforts": tuple(level for level in efforts if level not in recommended),
+            "effort": resolved, "effort_label": EFFORT_LABELS.get(resolved, resolved),
+            "effort_explicit": effort is not None, "note": entry["note"]}
+    return MappingProxyType(data)
 
 
 class WorkflowError(RuntimeError):
@@ -61,6 +163,7 @@ class PreparedWorkflow:
     model_key: str
     environment: dict = field(repr=False)
     preflight: dict = field(default_factory=dict)
+    effort: str = ""
 
 
 def _json(path, default=None):
@@ -254,25 +357,42 @@ def query_codex(account, executable=None, timeout=25):
             proc.stdout.close()
 
 
-def validate_selection(account, model_key, expected_email=None):
-    choice = MODEL_CHOICES.get(model_key)
-    if not choice or choice["provider"] != account.provider:
+def _claude_effort_levels(help_text):
+    """Effort tokens the installed Claude CLI documents for --effort."""
+    import re
+    match = re.search(r"--effort\s+<level>(.*?)(?:\n\s*-|\n\s*--|\Z)", help_text, re.S)
+    section = match.group(1) if match else ""
+    found = [level for level in PROVIDER_EFFORTS["claude"] if re.search(r"\b" + level + r"\b", section)]
+    return found
+
+
+def validate_selection(account, model_key, expected_email=None, effort=None, role=None):
+    """Verify identity and the exact model/effort with read-only CLI calls.
+
+    effort=None keeps the catalog's recommended effort for the model's primary
+    role (or for `role` when given); an explicit effort is checked as given,
+    never replaced.
+    """
+    choice = model_choice(model_key, effort, role)
+    if choice["provider"] != account.provider:
         raise WorkflowError("Choose an account belonging to the selected model's provider.")
     exe = find_cli(account.provider)
     if account.provider == "codex":
         result = query_codex(account, exe)
         identity = result.get("account") or {}
         if identity.get("type") not in ("chatgpt", "chatgptAuthTokens") or not identity.get("email"):
-            raise WorkflowError("The selected Codex home is not signed in to a identifiable ChatGPT subscription. Sign in using the intended account.")
+            raise WorkflowError("The selected Codex home is not signed in to an identifiable ChatGPT subscription. Sign in using the intended account.")
         matches = [item for item in result["models"] if item.get("model", item.get("id")) == choice["id"]]
         if not matches:
-            raise WorkflowError(f"{choice['label']} is not advertised by this Codex account. No fallback model was selected.")
+            raise WorkflowError(f"{choice['label']} ({choice['id']}) is not advertised by this Codex account. No fallback model was selected.")
         levels = matches[0].get("supportedReasoningEfforts", [])
-        levels = [item.get("reasoningEffort", item.get("effort")) if isinstance(item, dict) else item for item in levels]
+        levels = [str(item.get("reasoningEffort", item.get("effort")) if isinstance(item, dict) else item) for item in levels]
         if choice["effort"] not in levels:
-            raise WorkflowError(f"The selected model does not advertise {choice['effort']} effort. No review was launched.")
+            raise WorkflowError(f"{choice['family']} does not advertise {choice['effort_label']} effort for this account (advertised: {', '.join(levels) or 'none'}). No review was launched.")
         email = str(identity["email"])
         status = "account-and-model-verified"
+        supported = tuple(levels)
+        plan = str(identity.get("planType") or "")
     else:
         env = account_environment(account)
         identity = _run_json([exe, "auth", "status", "--json"], env)
@@ -280,16 +400,25 @@ def validate_selection(account, model_key, expected_email=None):
             raise WorkflowError("The selected Claude profile is not signed in to a verified Claude subscription. Sign in using AI Account Manager.")
         help_text = subprocess.run([exe, "--help"], env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-        if choice["id"] not in help_text or "--effort" not in help_text or choice["effort"] not in help_text:
-            raise WorkflowError("This Claude CLI does not advertise the requested model/effort. Update it; no fallback was selected.")
+        # Claude's --model accepts full model names (documented as e.g.
+        # 'claude-fable-5'), so the exact ID is not expected to appear in
+        # --help. Verify the option exists and that the effort level is one the
+        # installed CLI documents; entitlement is decided by Claude at launch.
+        supported = tuple(_claude_effort_levels(help_text))
+        if "--model" not in help_text or "--effort" not in help_text:
+            raise WorkflowError("This Claude CLI does not offer --model/--effort selection. Update it; no fallback was selected.")
+        if choice["effort"] not in supported:
+            raise WorkflowError(f"This Claude CLI does not document {choice['effort_label']} effort (documented: {', '.join(supported) or 'none'}). Update it; no fallback was selected.")
         email = str(identity["email"])
         # Claude does not expose a free per-account model entitlement endpoint.
-        # Do not claim that CLI alias support proves runtime entitlement.
-        status = "account-verified-model-alias-supported; entitlement-checked-by-Claude-at-launch"
+        # Do not claim that CLI syntax support proves runtime entitlement.
+        status = "account-verified; model-id-accepted-by-cli-syntax; entitlement-checked-by-Claude-at-launch"
+        plan = ""
     expected = expected_email or account.email
     if expected and email.casefold() != str(expected).casefold():
         raise WorkflowError(f"Account identity changed: expected {expected}, but the selected profile reports {email}. Re-select the correct account.")
-    return {"provider": account.provider, "email": email, "model": choice["id"], "effort": choice["effort"], "status": status, "executable": exe}
+    return {"provider": account.provider, "email": email, "model": choice["id"], "model_key": choice["key"], "model_label": choice["label"],
+            "effort": choice["effort"], "supported_efforts": supported, "plan": plan, "status": status, "executable": exe}
 
 
 def report_choices(search_roots=(), ledger_path=None, misnaming_path=None):
@@ -327,15 +456,18 @@ def _hash_file(path):
 def prepare_workflow(role, account, model_key, *, audit_report=None, document_root=None, care_home="", source_root=None,
                      assets_root=None, workspace_root=None, ledger_path=None, misnaming_path=None,
                      allow_document_changes=False, allow_code_changes=False, completed_audit=False, preflight=True, expected_email=None,
-                     processing_root=None, review_all_flags=False):
+                     processing_root=None, review_all_flags=False, effort=None):
     """Prepare a fresh exact request in a persistent provider-neutral role folder.
 
     preflight=False is for offline inspection/tests only. launch_workflow refuses
     such a plan until identity and capability verification has succeeded.
+    effort=None selects the catalog's recommended effort for this role; an
+    explicit effort is carried unchanged into the manifest, prompt and command.
     """
-    if role not in ROLES or model_key not in MODEL_CHOICES or MODEL_CHOICES[model_key]["role"] != role:
-        raise WorkflowError("Select a supported model for this review role.")
-    if MODEL_CHOICES[model_key]["provider"] != account.provider:
+    if role not in ROLES:
+        raise WorkflowError("Unknown AI workflow role.")
+    choice = model_choice(model_key, effort, role)
+    if choice["provider"] != account.provider:
         raise WorkflowError("The selected account belongs to a different provider.")
     assets = Path(assets_root or Path(__file__).resolve().parent.parent / "docs" / "ai-review").resolve()
     if not all((assets / name).is_file() for name in RULE_FILES):
@@ -368,7 +500,9 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
             raise WorkflowError("Code learning requires the canonical AI review master ledger and its review_records.jsonl journal. Complete or reconcile an audit review first; the legacy Misnaming Record alone cannot finalize learning statuses.")
         if allow_document_changes:
             raise WorkflowError("The code-learning reviewer cannot be authorized to rename care-home documents.")
-    verified = validate_selection(account, model_key, expected_email) if preflight else {}
+    verified = validate_selection(account, model_key, expected_email, effort=choice["effort"], role=role) if preflight else {}
+    if verified and (verified.get("model") != choice["id"] or verified.get("effort") != choice["effort"]):
+        raise WorkflowError("Verification returned a different model/effort than selected. No request was prepared.")
     workspace = (Path(workspace_root or default_workspace_root()) / role).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     request_dir = workspace / "requests" / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8])
@@ -397,8 +531,7 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
                     "Read and follow the exact request file supplied as $ARGUMENTS. First read AGENTS.md, MEMORY.md, and the request's context rules. "
                     "Do not substitute the older global stage2-audit-review workflow or another request. Validate identity and authorization before acting.\n")
     _write_atomic(workspace / ".claude" / "commands" / (command_name + ".md"), command_body)
-    choice = MODEL_CHOICES[model_key]
-    manifest = {"schema_version": 1, "role": role, "created_utc": datetime.now(timezone.utc).isoformat(),
+    manifest = {"schema_version": 2, "role": role, "created_utc": datetime.now(timezone.utc).isoformat(),
                 "care_home": care_home.strip(), "audit_report": str(audit) if audit else None, "audit_sha256": _hash_file(audit) if audit else None,
                 "completed_audit": bool(completed_audit), "document_root": str(documents) if documents else None, "source_root": str(source) if source else None,
                 "processing_root": str(processing) if processing else None,
@@ -406,7 +539,8 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
                 "expanded_review_authorized": bool(review_all_flags),
                 "ledger_path": str(ledger), "ledger_root": str(ledger.parent), "record_journal": str(ledger.parent / "review_records.jsonl"),
                 "misnaming_path": str(misnames), "workspace": str(workspace), "request_dir": str(request_dir),
-                "provider": account.provider, "model": choice["id"], "effort": choice["effort"], "account_id": account.id,
+                "provider": account.provider, "model": choice["id"], "model_key": choice["key"], "model_label": choice["label"],
+                "effort": choice["effort"], "effort_source": "explicit" if choice["effort_explicit"] else "recommended", "account_id": account.id,
                 "expected_account_email": verified.get("email") or expected_email or account.email, "rules_sha256": rule_hashes,
                 "allow_document_changes": bool(allow_document_changes), "allow_code_changes": bool(allow_code_changes),
                 "allow_record_updates": True, "allow_publish_or_install": False, "state": "prepared", "preflight": {k: v for k, v in verified.items() if k != "executable"}}
@@ -424,7 +558,7 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
                     f"Read `{request_dir / 'context' / rule_name}`, NAMING_RULES.md and WORKFLOW_GUIDE.md fully before acting.\n"
                     f"Read shared context `{memory}`. Both providers for this role receive these exact same files.\n\n"
                     f"Selected account: {manifest['expected_account_email'] or 'must be verified before launch'}\n"
-                    f"Selected model: {choice['id']} / {choice['effort']} effort. No alternate account or model is authorized.\n"
+                    f"Selected model: {choice['id']} ({choice['label']}) / {choice['effort']} effort. No alternate account, model or effort is authorized.\n"
                     f"Care home: {care_home.strip() or '(cross-run learning)'}\n"
                     f"Audit: {audit or '(not required for cross-run learning)'}\nDocuments: {documents or '(not in write scope)'}\n"
                     f"Processing (Files) root to lock while applying: {processing or '(not configured; do not guess)'}\n"
@@ -489,7 +623,8 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
         for additional in dict.fromkeys(str(p) for p in writable):
             args += ["--add-dir", additional]
         args += [command]
-    return PreparedWorkflow(role, workspace, request_dir, prompt_file, command, args, account, model_key, account_environment(account), verified)
+    return PreparedWorkflow(role, workspace, request_dir, prompt_file, command, args, account, model_key, account_environment(account), verified,
+                            choice["effort"])
 
 
 def _ps_quote(value):
@@ -534,9 +669,14 @@ def launch_workflow(prepared, interactive=True):
 def _check_launch(prepared):
     if not prepared.preflight:
         raise WorkflowError("This handoff was prepared offline. Verify the selected account/model before launching.")
-    # The account manager may have changed the profile after preparation.
-    validate_selection(prepared.account, prepared.model_key, prepared.preflight["email"])
     manifest = _json(prepared.request_dir / "manifest.json", {})
+    effort = prepared.effort or manifest.get("effort") or prepared.preflight.get("effort")
+    if manifest.get("effort") != effort or prepared.preflight.get("effort") != effort:
+        raise WorkflowError("The prepared effort no longer matches its manifest. Prepare a fresh handoff.")
+    # The account manager may have changed the profile after preparation.
+    verified = validate_selection(prepared.account, prepared.model_key, prepared.preflight["email"], effort=effort, role=prepared.role)
+    if verified.get("model") != manifest.get("model") or verified.get("effort") != effort:
+        raise WorkflowError("Revalidation returned a different model/effort than the prepared request. Nothing was launched.")
     if manifest.get("state") != "prepared":
         raise WorkflowError("This request has already been launched. Prepare a new handoff or open its existing terminal.")
     try:
@@ -614,6 +754,75 @@ def launch_headless(prepared, *, authorized_unattended=False):
     manifest.update(state="launched", launched_utc=datetime.now(timezone.utc).isoformat(), launcher_pid=proc.pid, unattended=True)
     _write_atomic(prepared.request_dir / "manifest.json", json.dumps(manifest, indent=2) + "\n")
     _write_atomic(prepared.request_dir / "runner-status.json", json.dumps({"state": "running", "pid": proc.pid,
-                  "provider": prepared.account.provider, "model": prepared.preflight["model"], "account_email": prepared.preflight["email"],
+                  "provider": prepared.account.provider, "model": prepared.preflight["model"], "model_key": prepared.model_key,
+                  "effort": prepared.effort or manifest.get("effort"), "role": prepared.role, "account_email": prepared.preflight["email"],
                   "started_utc": manifest["launched_utc"], "stdout": str(stdout_path), "stderr": str(stderr_path)}, indent=2) + "\n")
     return HeadlessRun(prepared, proc)
+
+
+AUTO_REVIEW_DEFAULTS = {"enabled": True, "model_key": DEFAULT_MODEL["audit-review"], "effort": "high", "account_id": "",
+                        "expected_email": DEFAULT_EXPECTED_EMAIL, "allow_document_changes": True, "review_all_flags": True,
+                        "source_root": "", "workspace_root": "", "ledger_path": "", "misnaming_path": ""}
+
+
+def auto_review_defaults(cfg):
+    """Return a NEW dict: saved cfg['ai_workflows']['auto_review'] merged onto defaults.
+
+    Path fallbacks reuse what the manual dialogs already registered under
+    ai_workflows. The source root is only ever an existing registered checkout;
+    it is never guessed from the home folder.
+    """
+    workflows_cfg = (cfg or {}).get("ai_workflows") if isinstance(cfg, dict) else None
+    if not isinstance(workflows_cfg, dict):
+        workflows_cfg = {}
+    saved = workflows_cfg.get("auto_review")
+    if not isinstance(saved, dict):
+        saved = {}
+    merged = dict(AUTO_REVIEW_DEFAULTS)
+    for key in AUTO_REVIEW_DEFAULTS:
+        if key in saved and saved[key] is not None:
+            merged[key] = saved[key]
+    merged["enabled"] = bool(merged["enabled"])
+    merged["allow_document_changes"] = bool(merged["allow_document_changes"])
+    merged["review_all_flags"] = bool(merged["review_all_flags"])
+    for key in ("model_key", "effort", "account_id", "expected_email", "source_root", "workspace_root", "ledger_path", "misnaming_path"):
+        merged[key] = str(merged[key] or "").strip()
+    merged["effort"] = merged["effort"].casefold()
+    if not merged["source_root"]:
+        registered = str(workflows_cfg.get("source_root") or "").strip()
+        if registered and Path(registered).is_dir():
+            merged["source_root"] = registered
+    if not merged["workspace_root"]:
+        merged["workspace_root"] = str(workflows_cfg.get("workspace_root") or "").strip()
+    if not merged["ledger_path"]:
+        merged["ledger_path"] = str(workflows_cfg.get("ledger_path") or "").strip()
+    if not merged["account_id"]:
+        merged["account_id"] = str(workflows_cfg.get("audit-review_account") or "").strip()
+    if not merged["expected_email"] and "expected_email" not in saved:
+        merged["expected_email"] = str(workflows_cfg.get("audit-review_expected_email") or "").strip()
+    return merged
+
+
+def auto_review_summary(cfg):
+    """One-line pre-run summary of the saved automatic review defaults."""
+    values = auto_review_defaults(cfg)
+    if not values["enabled"]:
+        return "After processing: Accuracy audit only. Automatic AI document review is off."
+    try:
+        choice = model_choice(values["model_key"], values["effort"] or None, "audit-review")
+        model = f"{choice['family']} / {choice['effort_label']}"
+    except WorkflowError:
+        model = f"{values['model_key'] or 'unset model'} / {values['effort'] or 'unset effort'} (needs configuration)"
+    account = values["expected_email"] or "account identity verified at launch"
+    corrections = "Apply corrections on" if values["allow_document_changes"] else "Propose corrections only"
+    return f"After processing: Accuracy audit → {model} document review · {account} · {corrections}."
+
+
+def open_live_output(request_dir, *, title=None):
+    """Open the read-only visible viewer for a supervised run's recorded output.
+
+    Thin re-export for controllers that only import this module; the viewer
+    lives in stage2_live_output and never submits or resumes an agent.
+    """
+    from stage2_live_output import open_live_output as opener
+    return opener(request_dir, title=title)

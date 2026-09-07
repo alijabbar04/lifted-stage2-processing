@@ -98,6 +98,7 @@ class TestPrimaryRecoveryUI(unittest.TestCase):
             with self.subTest(status=status):
                 ui = SimpleNamespace(
                     worker_thread=None, _update_stats=Mock(),
+                    _begin_automatic_review=Mock(return_value=False),
                     _refresh_folder_state=Mock(return_value=({}, {})),
                     _refresh_run_controls=Mock(), set_progress=Mock(),
                     _done_batch=Mock(), set_status=Mock(),
@@ -110,6 +111,7 @@ class TestPrimaryRecoveryUI(unittest.TestCase):
     def test_confirmed_completion_can_fill_progress(self):
         ui = SimpleNamespace(
             worker_thread=None, _update_stats=Mock(),
+            _begin_automatic_review=Mock(return_value=False),
             _refresh_folder_state=Mock(return_value=({}, {})),
             _refresh_run_controls=Mock(), set_progress=Mock(), _done_batch=Mock())
         app.App._done_main(ui, {}, "batch_applied:1|1")

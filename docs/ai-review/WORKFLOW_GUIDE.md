@@ -1,5 +1,43 @@
 # Stage 2: from an audit to better naming
 
+## v1.5.0 workflow contract
+
+Use these names consistently. **Accuracy Audit** finds possible mistakes and
+writes the report; **AI Document Review** checks the report against actual
+pages and may apply explicitly authorised filename corrections; **Improve Stage
+2** studies the review ledger and decides whether a general software change is
+justified. The third role is not enabled by document corrections and must not
+make automatic code changes from filename corrections.
+
+The review form is **Model → Account → Effort**. Provider is inferred from the
+selected model and shown read-only: Sol/Terra/Luna/Astra are Codex, while
+Fable/Opus are Claude. Resolve an explicit supported model version and verify
+the selected account before launch; do not silently substitute an account,
+provider or effort. The processing API/billing account is separate from a
+subscribed CLI account. Sign-in may require the user; there is no automatic
+OAuth. VS Code is optional and is not the runner.
+
+The default document-review recommendation is Sol / High with corrections and
+automatic review enabled. Fable 5.1 / High remains the code-learning
+recommendation, with Astra / Medium a provisional complex-case alternative;
+these are bounded recommendations, not benchmark results. The CLI minimum for
+Fable 5.1 is 2.1.251; the currently updated CLI is 2.1.263.
+
+Automatic review may launch only after the matching run has finished
+processing and follow-up work, released writer locks, and recorded a durable
+complete Accuracy Audit receipt. Bind the exact report path/hash, run, model,
+account, effort, scope and authority to an immutable run snapshot. Never pick
+the newest report, launch from pending/stopped/failed/incomplete audit state,
+or submit a duplicate after a retry or resume. Keep queued/needs-attention
+states for sign-in, quota, changed-input and unavailable-model problems.
+
+The visible desktop surface must be described accurately. A supervised CLI may
+be rendered as live output in a terminal/log viewer; it is not an interactive
+chat unless it accepts input. **View AI session** reopens the existing stream,
+does not create a new job, and closing a viewer does not cancel that job. Show
+readable assistant messages, tool/command activity, results and attention
+requests where available, but do not promise private internal reasoning.
+
 The audit identifies possible mistakes. A document reviewer checks the actual pages and corrects supported mistakes. A separate software reviewer studies those decisions and changes the general naming rules only when the evidence justifies it.
 
 ## The four steps

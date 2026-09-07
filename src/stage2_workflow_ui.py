@@ -14,22 +14,39 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import stage2_ai_workflows as workflows
+import stage2_live_output as live_output
 import stage2_notifications as notifications
 
+try:  # Shared palette helper; presentation only, no import cycle (theme imports nothing of ours).
+    from stage2_theme import resolve_palette as _resolve_palette
+except ImportError:  # pragma: no cover - older bundles without the theme module
+    _resolve_palette = None
 
-BG = "#08090b"
-PANEL = "#101215"
-RAISED = "#191c20"
-BORDER = "#2a2e33"
-FG = "#edf0f3"
-MUTED = "#a1a8b1"
-SILVER = "#e3e8ed"
+_PALETTE = _resolve_palette("C") if _resolve_palette else None
+BG = _PALETTE.bg if _PALETTE else "#08090b"
+PANEL = _PALETTE.panel if _PALETTE else "#101215"
+RAISED = _PALETTE.raised if _PALETTE else "#191c20"
+BORDER = _PALETTE.line if _PALETTE else "#2a2e33"
+FG = _PALETTE.text if _PALETTE else "#edf0f3"
+MUTED = _PALETTE.muted if _PALETTE else "#a1a8b1"
+SILVER = _PALETTE.primary if _PALETTE else "#e3e8ed"
+PRIMARY_TEXT = _PALETTE.primary_text if _PALETTE else "#08090b"
 
 
 def is_processing_busy(app):
     worker = getattr(app, "worker_thread", None)
     return bool((worker and worker.is_alive()) or getattr(app, "_scanning", False)
-                or getattr(app, "_recovery_busy", False))
+                or getattr(app, "_recovery_busy", False) or getattr(app, "_review_busy", False))
+
+
+def _use_app_palette(app):
+    """New dialogs inherit the current saved palette instead of import-time C."""
+    if _resolve_palette is None:
+        return
+    palette = _resolve_palette(getattr(app, "cfg", {}).get("ui_palette", "C"))
+    globals().update(BG=palette.bg, PANEL=palette.panel, RAISED=palette.raised,
+                     BORDER=palette.line, FG=palette.text, MUTED=palette.muted,
+                     SILVER=palette.primary, PRIMARY_TEXT=palette.primary_text)
 
 
 def latest_audit_report(app, namespace):
@@ -79,10 +96,11 @@ def _open_path(parent, path):
 
 def _button(parent, text, command, primary=False):
     button = tk.Button(parent, text=text, command=command, bg=SILVER if primary else RAISED,
-                       fg=BG if primary else FG, activebackground="#ffffff" if primary else BORDER,
-                       activeforeground=BG if primary else FG, disabledforeground="#747b84",
+                       fg=PRIMARY_TEXT if primary else FG, activebackground="#ffffff" if primary else BORDER,
+                       activeforeground=PRIMARY_TEXT if primary else FG, disabledforeground="#747b84",
                        relief="flat", bd=0, padx=14, pady=8, cursor="hand2", font=("Segoe UI", 10),
-                       highlightthickness=1, highlightbackground=BORDER)
+                       highlightthickness=1, highlightbackground=BORDER,
+                       highlightcolor=SILVER, takefocus=True)
     return button
 
 
@@ -107,6 +125,7 @@ def _check(parent, text, variable, command=None):
 
 class _Dialog(tk.Toplevel):
     def __init__(self, app, namespace, title, subtitle, width=780, height=780):
+        _use_app_palette(app)
         previous_grab = app.grab_current()
         modal_parent = previous_grab.winfo_toplevel() if previous_grab else app
         super().__init__(modal_parent)
@@ -146,6 +165,8 @@ class _Dialog(tk.Toplevel):
         head.pack(fill="x", padx=22, pady=(20, 12))
         _label(head, title, bold=True).pack(anchor="w")
         _label(head, subtitle, small=True).pack(fill="x", pady=(5, 0))
+        head.bind("<Configure>", lambda event: [widget.configure(wraplength=max(240, event.width))
+                  for widget in head.winfo_children() if isinstance(widget, tk.Label)])
         frame = tk.Frame(self, bg=BG)
         frame.pack(fill="both", expand=True, padx=(22, 12))
         self._scroll_frame = frame
@@ -314,6 +335,23 @@ class _Dialog(tk.Toplevel):
             if service:
                 service.close()
 
+    def _selector(self, label, variable, values, callback):
+        row = tk.Frame(self.body, bg=BG)
+        row.pack(fill="x", pady=(0, 10))
+        _label(row, label, small=True).pack(anchor="w", pady=(0, 4))
+        style = ttk.Style(self)
+        style.configure("Stage2Workflow.TCombobox", fieldbackground=PANEL, background=RAISED,
+                        foreground=FG, arrowcolor=FG, bordercolor=BORDER, padding=7)
+        style.map("Stage2Workflow.TCombobox", fieldbackground=[("readonly", PANEL), ("disabled", BG)],
+                  foreground=[("readonly", FG), ("disabled", MUTED)], selectbackground=[("readonly", PANEL)], selectforeground=[("readonly", FG)])
+        self.option_add("*TCombobox*Listbox.background", PANEL)
+        self.option_add("*TCombobox*Listbox.foreground", FG)
+        box = ttk.Combobox(row, textvariable=variable, values=values, state="readonly",
+                           style="Stage2Workflow.TCombobox", font=("Segoe UI", 10))
+        box.pack(fill="x")
+        box.bind("<<ComboboxSelected>>", lambda _event: callback())
+        return box
+
     def _field(self, label, variable, *, browse=None, show=None):
         row = tk.Frame(self.body, bg=BG)
         row.pack(fill="x", pady=(0, 10))
@@ -327,15 +365,149 @@ class _Dialog(tk.Toplevel):
         return entry
 
 
+class ModelSelector:
+    """Shared Model → Account → Effort form with a read-only inferred provider.
+
+    Used identically by AI Document Review, Improve Stage 2 and the pre-run
+    automatic review setup. Changing the model updates the compatible accounts
+    and efforts, preserves a still-valid choice, and visibly requires a new
+    account choice when the old one belongs to another provider. Nothing here
+    verifies identity; that happens in the preflight before launch.
+    """
+
+    NO_ACCOUNT = "No compatible {provider} profile registered · sign in through AI Account Manager"
+    CHOOSE_ACCOUNT = "Choose a {provider} account · {count} available"
+
+    def __init__(self, dialog, role, *, model_key=None, effort=None, account_id=None, on_change=None):
+        if role not in workflows.ROLES:
+            raise ValueError("Unknown AI workflow role.")
+        self.dialog, self.role, self.on_change = dialog, role, on_change
+        self.accounts, self.filtered_accounts = [], []
+        self.model_keys = list(workflows.model_keys_for_role(role))
+        if model_key not in self.model_keys:
+            model_key = workflows.DEFAULT_MODEL[role]
+        self._model_labels = {}
+        values = []
+        for index, key in enumerate(self.model_keys):
+            entry = workflows.MODEL_CATALOG[key]
+            label = f"{entry['family']} · {entry['provider_label']}" + (" · recommended" if index == 0 else "")
+            self._model_labels[label] = key
+            values.append(label)
+        self._effort_labels = {}
+        self._preferred_account = str(account_id or "")
+        self._pending_effort = str(effort or "").strip().casefold() or None
+        self._selected_account_id = None
+        self.model_var = tk.StringVar(value=next(label for label, key in self._model_labels.items() if key == model_key))
+        self.account_var = tk.StringVar(value="")
+        self.effort_var = tk.StringVar(value="")
+        self.model_box = dialog._selector("Model · ranked by practical suitability for this step; the provider is inferred from the model",
+                                          self.model_var, values, self._model_changed)
+        self.provider_label = _label(dialog.body, "", small=True)
+        self.provider_label.pack(fill="x", pady=(0, 10))
+        self.account_box = dialog._selector("Account · identity is verified before launch, never inferred from the profile name",
+                                            self.account_var, [], self._account_changed)
+        self.effort_box = dialog._selector("Effort · recommended level first, then alternatives; advanced levels are marked",
+                                           self.effort_var, [], self._effort_changed)
+        self._sync(initial=True)
+
+    # ---- state -------------------------------------------------------------
+    def model_key(self):
+        return self._model_labels.get(self.model_var.get(), self.model_keys[0])
+
+    def choice(self):
+        return workflows.model_choice(self.model_key(), self.effort(), self.role)
+
+    def effort(self):
+        return self._effort_labels.get(self.effort_var.get()) or workflows.model_choice(self.model_key(), None, self.role)["recommended_effort"]
+
+    def account(self):
+        index = self.account_box.current()
+        if 0 <= index < len(self.filtered_accounts) and self.account_var.get() == self._account_label(self.filtered_accounts[index]):
+            return self.filtered_accounts[index]
+        return None
+
+    def provider(self):
+        return workflows.MODEL_CATALOG[self.model_key()]["provider"]
+
+    def set_accounts(self, accounts):
+        self.accounts = list(accounts)
+        self._sync(initial=True)
+
+    def set_enabled(self, enabled):
+        state = "readonly" if enabled else "disabled"
+        for box in (self.model_box, self.account_box, self.effort_box):
+            box.configure(state=state)
+
+    # ---- internals ---------------------------------------------------------
+    @staticmethod
+    def _account_label(account):
+        return account.label + " [" + account.id[-8:] + "]"
+
+    def _sync(self, initial=False):
+        choice = workflows.model_choice(self.model_key(), None, self.role)
+        self.provider_label.configure(text=f"Provider (inferred): {choice['provider_label']} · model ID {choice['id']} · {choice['note']}")
+        previous_id = self._selected_account_id if not initial else (self._selected_account_id or self._preferred_account)
+        self.filtered_accounts = [account for account in self.accounts if account.provider == choice["provider"]]
+        labels = [self._account_label(account) for account in self.filtered_accounts]
+        self.account_box.configure(values=labels)
+        keep = next((account for account in self.filtered_accounts if account.id == previous_id), None)
+        if keep is None and initial and not self._preferred_account and self.filtered_accounts:
+            keep = self.filtered_accounts[0]
+        if keep is not None:
+            self.account_var.set(self._account_label(keep))
+            self._selected_account_id = keep.id
+        elif labels:
+            # The old account belongs to another provider: require a visible new choice.
+            self.account_var.set(self.CHOOSE_ACCOUNT.format(provider=choice["provider_label"], count=len(labels)))
+            self._selected_account_id = None
+        else:
+            self.account_var.set(self.NO_ACCOUNT.format(provider=choice["provider_label"]))
+            self._selected_account_id = None
+        efforts = choice["efforts"]
+        self._effort_labels = {}
+        values = []
+        for level in efforts:
+            label = workflows.EFFORT_LABELS.get(level, level)
+            if level == choice["recommended_effort"]:
+                label += " · recommended"
+            elif level in choice["advanced_efforts"]:
+                label += " · advanced"
+            self._effort_labels[label] = level
+            values.append(label)
+        self.effort_box.configure(values=values)
+        current = self._effort_labels.get(self.effort_var.get()) or self._pending_effort
+        self._pending_effort = None
+        if current not in efforts:
+            current = choice["recommended_effort"]
+        self.effort_var.set(next(label for label, level in self._effort_labels.items() if level == current))
+
+    def _model_changed(self):
+        self._sync()
+        if self.on_change:
+            self.on_change("model")
+
+    def _account_changed(self):
+        account = self.account()
+        self._selected_account_id = account.id if account else None
+        if self.on_change:
+            self.on_change("account")
+
+    def _effort_changed(self):
+        if self.on_change:
+            self.on_change("effort")
+
+
 class AIWorkflowDialog(_Dialog):
     def __init__(self, app, namespace, role):
         if role not in workflows.ROLES:
             raise ValueError("Unknown AI workflow role.")
         self.role = role
-        title = "Review the filename audit" if role == "audit-review" else "Learn from review corrections"
-        subtitle = ("Step 1 · Check the actual documents, make evidence-backed corrections when allowed, and record every decision."
+        title = workflows.ROLE_TITLES[role]
+        subtitle = ("Open the actual document pages for each audit flag, judge whether the flag is justified, record Keep / Rename / Defer, "
+                    "and apply supported filename corrections only when permitted. The accuracy audit itself never renames files."
                     if role == "audit-review" else
-                    "Step 2 · Critically review the accumulated correction evidence, test general fixes, and improve Stage 2 only when justified.")
+                    "Critically review the accumulated correction evidence, reproduce defects, test general fixes, and change Stage 2 code only when justified and authorized. "
+                    "This never renames worker documents.")
         super().__init__(app, namespace, title, subtitle)
         saved = app.cfg.get("ai_workflows", {})
         if not isinstance(saved, dict):
@@ -343,15 +515,7 @@ class AIWorkflowDialog(_Dialog):
         self._saved = saved
         self.prepared = None
         self._revision = 0
-        self.accounts = []
-        self.filtered_accounts = []
-        self.model_keys = [key for key, choice in workflows.MODEL_CHOICES.items() if choice["role"] == role]
-        selected = saved.get(role + "_model", "luna" if role == "audit-review" else "fable")
-        if selected not in self.model_keys:
-            selected = self.model_keys[0]
-        self.model_var = tk.StringVar(value=workflows.MODEL_CHOICES[selected]["label"])
-        self.account_var = tk.StringVar()
-        self.expected_email = tk.StringVar(value=str(saved.get(role + "_expected_email", "")))
+        self.expected_email = tk.StringVar(value=str(saved.get(role + "_expected_email") or workflows.DEFAULT_EXPECTED_EMAIL))
         audit = latest_audit_report(app, namespace)
         care_dir = getattr(app, "care_home_dir", None)
         documents = getattr(app, "move_dest", None) or care_dir
@@ -363,12 +527,19 @@ class AIWorkflowDialog(_Dialog):
         self.source_var = tk.StringVar(value=str(saved.get("source_root") or (local_repo if local_repo.is_dir() else "")))
         self.ledger_var = tk.StringVar(value=str(saved.get("ledger_path") or workflows.default_ledger_path()))
         self.workspace_var = tk.StringVar(value=str(saved.get("workspace_root") or workflows.default_workspace_root()))
-        self.allow_var = tk.BooleanVar(value=False)
+        # Document corrections default ON (approved); code-change authority is
+        # never implied and must be ticked explicitly for each learning run.
+        self.allow_var = tk.BooleanVar(value=role == "audit-review")
         self.complete_var = tk.BooleanVar(value=bool(audit and getattr(app, "_latest_audit_completed", False)
             and str(audit) == str(getattr(app, "_latest_audit_report", ""))))
-        self._selector("Model and effort", self.model_var, [workflows.MODEL_CHOICES[key]["label"] for key in self.model_keys], self._model_changed)
-        self.account_box = self._selector("Account · identity will be verified before launch", self.account_var, [], self._invalidate)
-        self._field("Expected account email (optional cross-check)", self.expected_email)
+        self.selector = ModelSelector(self, role, model_key=saved.get(role + "_model", workflows.DEFAULT_MODEL[role]),
+                                      effort=saved.get(role + "_effort") or "high", account_id=saved.get(role + "_account"),
+                                      on_change=self._selection_changed)
+        self.accounts = self.selector.accounts
+        self.filtered_accounts = self.selector.filtered_accounts
+        self.model_var, self.account_var, self.effort_var = self.selector.model_var, self.selector.account_var, self.selector.effort_var
+        self.account_box = self.selector.account_box
+        self._field("Expected account email · the verified identity must match this before launch", self.expected_email)
         if role == "audit-review":
             self._field("Completed filename audit · CSV or Excel", self.audit_var, browse=lambda: self._browse_report(self.audit_var))
             self._field("Care-home name", self.care_var)
@@ -382,16 +553,18 @@ class AIWorkflowDialog(_Dialog):
                     browse=lambda: self._browse_folder(self.source_var))
         self._field("Persistent shared-context root · separate memory folder for each review role", self.workspace_var,
                     browse=lambda: self._browse_folder(self.workspace_var))
-        _label(self.body, "Both models for this step receive the same rules, exact request and file-based memory. Their native chat histories remain separate.", small=True).pack(fill="x", pady=(0, 9))
+        _label(self.body, "Every model for this step receives the same rules, exact request and file-based memory. Native chat histories stay separate, and this role's history stays separate from the other role.", small=True).pack(fill="x", pady=(0, 9))
         if role == "audit-review":
-            _check(self.body, "The selected post-run accuracy audit has finished. File existence alone is not confirmation.", self.complete_var).pack(fill="x", pady=3)
-            _check(self.body, "Allow evidence-backed filename corrections. Re-rank every peer in ranked families; use the next free number only for unranked families.", self.allow_var).pack(fill="x", pady=3)
-            _label(self.body, "Every flagged/error row is in scope, including lower-confidence rows. The reviewer cannot edit application code.", small=True).pack(fill="x", pady=(3, 10))
+            _check(self.body, "This exact post-run accuracy audit has finished. File existence alone is not confirmation.", self.complete_var).pack(fill="x", pady=3)
+            _check(self.body, "Apply supported filename corrections. Off records proposals only; on permits evidence-backed, backed-up renames. Ranked families are re-ranked together; unranked collisions take the next free number.", self.allow_var).pack(fill="x", pady=3)
+            _label(self.body, "Every flagged/error row is in scope, including lower-confidence rows. This permission never authorizes application-code changes.", small=True).pack(fill="x", pady=(3, 10))
         else:
-            _check(self.body, "Allow verified source-code changes with regression tests and quality checks. This does not authorize renaming documents, publishing, or installation.", self.allow_var).pack(fill="x", pady=3)
+            _check(self.body, "Implement justified software changes, with regression tests and quality checks. This does not authorize renaming documents, publishing, or installation.", self.allow_var).pack(fill="x", pady=3)
+        _label(self.body, "Manual path: Open native AI terminal starts the provider's own interactive session with the request prefilled; closing that window ends that session. "
+                          "The automatic review after processing instead runs supervised, with a read-only live output window.", small=True).pack(fill="x", pady=(6, 10))
         self.prepare_button = _button(self.footer, "Verify & prepare", self._prepare, primary=True)
         self.prepare_button.pack(side="right", padx=(8, 0))
-        self.launch_button = _button(self.footer, "Open selected AI", self._launch)
+        self.launch_button = _button(self.footer, "Open native AI terminal", self._launch)
         self.launch_button.pack(side="right", padx=(8, 0))
         self.launch_button.configure(state="disabled")
         self.copy_button = _button(self.footer, "Copy command", self._copy)
@@ -402,28 +575,11 @@ class AIWorkflowDialog(_Dialog):
                          self.source_var, self.ledger_var, self.workspace_var, self.allow_var, self.complete_var):
             variable.trace_add("write", lambda *_: self._invalidate())
         self.audit_var.trace_add("write", self._audit_changed)
-        self.status.set("Choose a model and account, check the exact report and scope, then verify. No AI task is running yet.")
+        self.status.set("Choose a model, account and effort, check the exact report and scope, then verify. No AI task is running yet.")
         self._load_accounts()
 
-    def _selector(self, label, variable, values, callback):
-        row = tk.Frame(self.body, bg=BG)
-        row.pack(fill="x", pady=(0, 10))
-        _label(row, label, small=True).pack(anchor="w", pady=(0, 4))
-        style = ttk.Style(self)
-        style.configure("Stage2Workflow.TCombobox", fieldbackground=PANEL, background=RAISED,
-                        foreground=FG, arrowcolor=FG, bordercolor=BORDER, padding=7)
-        style.map("Stage2Workflow.TCombobox", fieldbackground=[("readonly", PANEL)],
-                  foreground=[("readonly", FG)], selectbackground=[("readonly", PANEL)], selectforeground=[("readonly", FG)])
-        self.option_add("*TCombobox*Listbox.background", PANEL)
-        self.option_add("*TCombobox*Listbox.foreground", FG)
-        box = ttk.Combobox(row, textvariable=variable, values=values, state="readonly",
-                           style="Stage2Workflow.TCombobox", font=("Segoe UI", 10))
-        box.pack(fill="x")
-        box.bind("<<ComboboxSelected>>", lambda _event: callback())
-        return box
-
     def _model_key(self):
-        return next(key for key in self.model_keys if workflows.MODEL_CHOICES[key]["label"] == self.model_var.get())
+        return self.selector.model_key()
 
     def _load_accounts(self):
         # Metadata-only discovery is still off the UI thread in case a registered
@@ -433,23 +589,32 @@ class AIWorkflowDialog(_Dialog):
                          self._accounts_loaded, "Reading registered account profiles…")
 
     def _accounts_loaded(self, accounts):
-        self.accounts = accounts
-        self._filter_accounts()
+        self.selector.set_accounts(accounts)
+        self.accounts = self.selector.accounts
+        self.filtered_accounts = self.selector.filtered_accounts
         self.prepare_button.configure(state="normal")
-        self.status.set("Profiles loaded. Identity and model availability will be checked during preparation; no AI task has started.")
+        self.status.set("Profiles loaded. Identity, model and effort availability are checked during preparation; no AI task has started.")
 
     def _filter_accounts(self):
-        provider = workflows.MODEL_CHOICES[self._model_key()]["provider"]
-        self.filtered_accounts = [account for account in self.accounts if account.provider == provider]
-        labels = [account.label + " [" + account.id[-8:] + "]" for account in self.filtered_accounts]
-        self.account_box.configure(values=labels)
-        saved_id = self._saved.get(self.role + "_account")
-        selected = next((i for i, account in enumerate(self.filtered_accounts) if account.id == saved_id), 0)
-        self.account_var.set(labels[selected] if labels else "No registered account for this provider")
+        self.selector._sync()
+        self.filtered_accounts = self.selector.filtered_accounts
 
     def _model_changed(self):
-        self._filter_accounts()
+        self.selector._model_changed()
+
+    def _selection_changed(self, what):
+        self.filtered_accounts = self.selector.filtered_accounts
+        if what == "account":
+            account = self.selector.account()
+            if account is not None and account.email:
+                self.expected_email.set(account.email)
         self._invalidate()
+        choice = self.selector.choice()
+        account = self.selector.account()
+        if account is None:
+            self.status.set(f"{choice['family']} runs on {choice['provider_label']}. Choose a compatible account before verifying.")
+        else:
+            self.status.set(f"Selected {choice['family']} · {choice['provider_label']} · {choice['effort_label']} effort. Verify & prepare to check identity and availability.")
 
     def _invalidate(self):
         self._revision += 1
@@ -473,16 +638,16 @@ class AIWorkflowDialog(_Dialog):
             variable.set(result)
 
     def _collect(self):
-        index = self.account_box.current()
-        if index < 0 or index >= len(self.filtered_accounts):
-            raise workflows.WorkflowError("Choose a registered account for this model. Add/sign in to an account through AI Account Manager first.")
+        account = self.selector.account()
+        if account is None:
+            raise workflows.WorkflowError("Choose a registered account for this model's provider. Add/sign in to an account through AI Account Manager first.")
         if self.role == "audit-review" and not self.complete_var.get():
             raise workflows.WorkflowError("Confirm that this exact post-run accuracy audit finished before preparing its review.")
         if self.role == "audit-review" and self.allow_var.get() and (
                 not self.processing_var.get().strip() or not Path(self.processing_var.get()).is_dir()):
             raise workflows.WorkflowError("Choose the original Files folder so document corrections can be locked against another processing run.")
         assets = self.namespace.get("bundled_resource", lambda *parts: Path(__file__).resolve().parent.parent.joinpath(*parts))("docs", "ai-review")
-        return dict(role=self.role, account=self.filtered_accounts[index], model_key=self._model_key(),
+        return dict(role=self.role, account=account, model_key=self.selector.model_key(), effort=self.selector.effort(),
                     audit_report=self.audit_var.get() or None if self.role == "audit-review" else None,
                     document_root=self.documents_var.get() or None if self.role == "audit-review" else None,
                     processing_root=self.processing_var.get() or None if self.role == "audit-review" else None,
@@ -510,7 +675,7 @@ class AIWorkflowDialog(_Dialog):
         self.copy_button.configure(state="disabled")
         self._background(lambda: workflows.prepare_workflow(**values),
                          lambda result: self._prepared(result, revision, values),
-                         "Verifying the selected account and model, then preparing the exact shared-context request. No AI review is running yet…")
+                         "Verifying the selected account, model and effort, then preparing the exact shared-context request. No AI review is running yet…")
 
     def _prepared(self, prepared, revision, values):
         self.prepare_button.configure(state="normal")
@@ -522,6 +687,7 @@ class AIWorkflowDialog(_Dialog):
         self.copy_button.configure(state="normal")
         saved = dict(self.app.cfg.get("ai_workflows") or {})
         saved.update({self.role + "_model": values["model_key"], self.role + "_account": values["account"].id,
+                      self.role + "_effort": values["effort"],
                       self.role + "_expected_email": prepared.preflight.get("email", ""),
                       "source_root": self.source_var.get(), "ledger_path": self.ledger_var.get(),
                       "workspace_root": self.workspace_var.get(), "care_home": self.care_var.get(),
@@ -530,7 +696,7 @@ class AIWorkflowDialog(_Dialog):
         persisted = self.namespace.get("save_config", lambda _config: True)(self.app.cfg)
         verified = prepared.preflight
         self.status.set(f"Verified: {verified.get('email', 'account')} · {verified.get('model', '')} · {verified.get('effort', '')} effort. "
-                        "Request prepared, not launched. Open selected AI to continue." + (" Preferences could not be saved." if not persisted else ""))
+                        "Request prepared, not launched. Open native AI terminal to continue." + (" Preferences could not be saved." if not persisted else ""))
 
     def _launch(self):
         if not self.prepared:
@@ -542,7 +708,7 @@ class AIWorkflowDialog(_Dialog):
         self.prepare_button.configure(state="disabled")
         self.launch_button.configure(state="disabled")
         self._background(lambda: workflows.launch_workflow(prepared), lambda proc: self._launched(prepared, proc),
-                         "Rechecking account identity and opening the account-isolated AI terminal…")
+                         "Rechecking account identity, model and effort, then opening the account-isolated native AI terminal…")
 
     def _launched(self, prepared, _process):
         self.prepare_button.configure(state="normal")
@@ -568,6 +734,169 @@ class AIWorkflowDialog(_Dialog):
     def _open_context(self):
         path = self.prepared.workspace if self.prepared else Path(self.workspace_var.get()) / self.role
         _open_path(self, path)
+
+
+class AutoReviewSettingsDialog(_Dialog):
+    """Configure the automatic AI Document Review BEFORE any report exists.
+
+    Saving stores defaults under cfg['ai_workflows']['auto_review']; nothing
+    verifies or runs unless the optional read-only account check is pressed.
+    A run already in progress keeps its captured snapshot; saved changes apply
+    to the next run only.
+    """
+
+    def __init__(self, app, namespace):
+        super().__init__(app, namespace, "Review after processing",
+                         "Defaults for the automatic AI Document Review that follows a completed accuracy audit. "
+                         "Nothing starts from this dialog; the snapshot is captured at Start of the next run.")
+        values = workflows.auto_review_defaults(app.cfg)
+        self._values = values
+        self.enabled_var = tk.BooleanVar(value=values["enabled"])
+        self.expected_email = tk.StringVar(value=values["expected_email"])
+        self.allow_var = tk.BooleanVar(value=values["allow_document_changes"])
+        self.all_flags_var = tk.BooleanVar(value=values["review_all_flags"])
+        self.source_var = tk.StringVar(value=values["source_root"])
+        self.workspace_var = tk.StringVar(value=values["workspace_root"] or str(workflows.default_workspace_root()))
+        self.ledger_var = tk.StringVar(value=values["ledger_path"] or str(workflows.default_ledger_path()))
+        _check(self.body, "Run AI Document Review automatically after the accuracy audit completes", self.enabled_var, command=self._toggled).pack(fill="x", pady=(0, 8))
+        audit_on = bool(app.cfg.get("post_run_audit", False))
+        self.dependency_label = _label(self.body, "", small=True)
+        self.dependency_label.pack(fill="x", pady=(0, 10))
+        self._dependency_text(audit_on)
+        self.selector = ModelSelector(self, "audit-review", model_key=values["model_key"], effort=values["effort"],
+                                      account_id=values["account_id"], on_change=self._selection_changed)
+        self._field("Expected account email · the run is blocked, not switched, if the signed-in identity differs", self.expected_email)
+        _check(self.body, "Apply supported filename corrections. Off records proposals only; on permits evidence-backed, backed-up renames.", self.allow_var).pack(fill="x", pady=3)
+        _check(self.body, "Review every flagged/error row, including lower-confidence rows", self.all_flags_var).pack(fill="x", pady=3)
+        _label(self.body, "These permissions never authorize application-code changes. Improve Stage 2 remains separate and manual.", small=True).pack(fill="x", pady=(3, 10))
+        self._field("Stage 2 source checkout · required for queue preparation and records", self.source_var,
+                    browse=lambda: self._browse_folder(self.source_var))
+        self._field("Master AI review ledger", self.ledger_var, browse=lambda: self._browse_ledger())
+        self._field("Persistent shared-context root", self.workspace_var, browse=lambda: self._browse_folder(self.workspace_var))
+        if is_processing_busy(app):
+            _label(self.body, "A run is in progress. It keeps the review setup captured at its Start; anything saved here applies to the next run only.", small=True).pack(fill="x", pady=(0, 8))
+        self.save_button = _button(self.footer, "Save defaults", self._save, primary=True)
+        self.save_button.pack(side="right", padx=(8, 0))
+        self.verify_button = _button(self.footer, "Check account now", self._verify)
+        self.verify_button.pack(side="right")
+        _button(self.footer, "Close", self._close).pack(side="left")
+        self.status.set("Changes are not saved until Save defaults. Checking the account is read-only and optional; identity is re-verified at launch.")
+        self.save_button.configure(state="disabled")
+        self._background(lambda: workflows.discover_accounts(codex_homes=(app.cfg.get("ai_workflows") or {}).get("codex_homes", [])),
+                         self._accounts_loaded, "Reading registered account profiles…")
+
+    def _dependency_text(self, audit_on):
+        if self.enabled_var.get():
+            self.dependency_label.configure(text=("Requires the automatic accuracy audit. It is currently on." if audit_on else
+                                                  "Requires the automatic accuracy audit, which is currently OFF. Saving with review enabled turns the audit on as well."))
+        else:
+            self.dependency_label.configure(text="Off: the accuracy audit still runs if enabled in Settings; no AI review starts and no documents are renamed.")
+
+    def _toggled(self):
+        self._dependency_text(bool(self.app.cfg.get("post_run_audit", False)))
+        self.selector.set_enabled(self.enabled_var.get())
+
+    def _accounts_loaded(self, accounts):
+        self.selector.set_accounts(accounts)
+        self.selector.set_enabled(self.enabled_var.get())
+        self.save_button.configure(state="normal")
+        account = self.selector.account()
+        if account is not None and not account.email:
+            self.status.set("Profiles loaded. The current Codex login has no saved email metadata; its identity is verified at launch, not assumed absent.")
+        else:
+            self.status.set("Profiles loaded. Save defaults to store them; nothing runs from here.")
+
+    def _selection_changed(self, what):
+        if what == "account":
+            account = self.selector.account()
+            if account is not None and account.email:
+                self.expected_email.set(account.email)
+        choice = self.selector.choice()
+        self.status.set(f"{choice['family']} · {choice['provider_label']} · {choice['effort_label']} effort selected. Not saved yet.")
+
+    def _browse_folder(self, variable):
+        result = filedialog.askdirectory(parent=self, title="Choose the exact folder", initialdir=variable.get() or None)
+        if result:
+            variable.set(result)
+
+    def _browse_ledger(self):
+        result = filedialog.asksaveasfilename(parent=self, title="Select the master ledger", defaultextension=".xlsx",
+                                              filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
+        if result:
+            self.ledger_var.set(result)
+
+    def _collect(self):
+        enabled = bool(self.enabled_var.get())
+        account = self.selector.account()
+        choice = self.selector.choice()
+        source = self.source_var.get().strip()
+        if enabled:
+            if account is None:
+                raise workflows.WorkflowError("Choose a registered account for this model's provider before enabling automatic review.")
+            if not source or not all((Path(source) / "src" / name).is_file() for name in ("ai_review.py", "Stage2_Processing.pyw")):
+                raise workflows.WorkflowError("Choose the current Stage 2 source checkout (with src/ai_review.py and Stage2_Processing.pyw). It is required for queue preparation and records; none is guessed.")
+        return {"enabled": enabled, "model_key": choice["key"], "effort": choice["effort"],
+                "account_id": account.id if account else "", "expected_email": self.expected_email.get().strip(),
+                "allow_document_changes": bool(self.allow_var.get()), "review_all_flags": bool(self.all_flags_var.get()),
+                "source_root": source, "workspace_root": self.workspace_var.get().strip(),
+                "ledger_path": self.ledger_var.get().strip(), "misnaming_path": self._values.get("misnaming_path", "")}
+
+    def _verify(self):
+        account = self.selector.account()
+        if account is None:
+            self.status.set("Choose an account to check.")
+            return
+        choice = self.selector.choice()
+        expected = self.expected_email.get().strip() or None
+        self.verify_button.configure(state="disabled")
+        self._background(lambda: workflows.validate_selection(account, choice["key"], expected, effort=choice["effort"], role="audit-review"),
+                         self._verified, "Read-only account, model and effort check. No AI task is started…")
+
+    def _verified(self, result):
+        self.verify_button.configure(state="normal")
+        self.status.set(f"Verified now: {result.get('email')} · {result.get('model')} · {result.get('effort')} effort ({result.get('status')}). "
+                        "This is re-checked at launch; save to keep these defaults.")
+
+    def _save(self):
+        try:
+            values = self._collect()
+        except workflows.WorkflowError as exc:
+            self.status.set(str(exc))
+            return
+        saved = dict(self.app.cfg.get("ai_workflows") or {})
+        previous = saved.get("auto_review")
+        previous_audit = self.app.cfg.get("post_run_audit")
+        saved["auto_review"] = values
+        self.app.cfg["ai_workflows"] = saved
+        note = ""
+        if values["enabled"] and not bool(self.app.cfg.get("post_run_audit", False)):
+            self.app.cfg["post_run_audit"] = True
+            note = " The automatic accuracy audit was turned on because automatic review depends on it."
+        persisted = self.namespace.get("save_config", lambda _config: True)(self.app.cfg)
+        if not persisted:
+            if previous is None:
+                saved.pop("auto_review", None)
+            else:
+                saved["auto_review"] = previous
+            if previous_audit is None:
+                self.app.cfg.pop("post_run_audit", None)
+            else:
+                self.app.cfg["post_run_audit"] = previous_audit
+            self.status.set("Defaults could not be saved. Nothing changed.")
+            return
+        refresh = getattr(self.app, "_refresh_ai_review_summary", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
+        self._dependency_text(bool(self.app.cfg.get("post_run_audit", False)))
+        self.status.set(("Saved. " + workflows.auto_review_summary(self.app.cfg) + note +
+                         (" The current run keeps its captured setup; these apply to the next run." if is_processing_busy(self.app) else "")))
+
+    def _on_error(self):
+        self.verify_button.configure(state="normal")
+        self.save_button.configure(state="normal")
 
 
 class NotificationSettingsDialog(_Dialog):
@@ -700,15 +1029,15 @@ class NotificationSettingsDialog(_Dialog):
 
 class ReportsMenuDialog(_Dialog):
     def __init__(self, app, namespace):
-        super().__init__(app, namespace, "Which report would you like?", "The automatic audit and the AI review record serve different purposes.", width=690, height=490)
-        _label(self.body, "1 · Post-run filename audit", bold=True).pack(fill="x", pady=(4, 5))
-        _label(self.body, "The report generated by Stage 2's accuracy check. Browse the exact care home and run before opening it.", small=True).pack(fill="x")
-        _button(self.body, "Browse audit reports", self._audits, primary=True).pack(anchor="w", pady=(9, 20))
-        _label(self.body, "2 · AI review / correction ledger", bold=True).pack(fill="x", pady=(0, 5))
-        _label(self.body, "The master spreadsheet that Opus or Luna updates with checked cases, corrected names, evidence and unresolved decisions. Fable or Sol uses this to assess software improvements.", small=True).pack(fill="x")
+        super().__init__(app, namespace, "Which report would you like?", "The accuracy audit report and the AI review/correction ledger serve different purposes. Opening either never starts a check or a review.", width=740, height=670)
+        _label(self.body, "1 · Audit report", bold=True).pack(fill="x", pady=(4, 5))
+        _label(self.body, "Written by Stage 2's automatic accuracy audit after processing: it flags possible misnaming but corrects nothing. Browse the exact care home and run before opening it.", small=True).pack(fill="x")
+        _button(self.body, "View Audit Report", self._audits, primary=True).pack(anchor="w", pady=(9, 20))
+        _label(self.body, "2 · Review / Correction Ledger", bold=True).pack(fill="x", pady=(0, 5))
+        _label(self.body, "The master spreadsheet the AI Document Review updates with checked cases, Keep / Rename / Defer decisions, corrected names, evidence and unresolved items. Improve Stage 2 reads it to assess software changes.", small=True).pack(fill="x")
         saved = app.cfg.get("ai_workflows") or {}
         self.ledger = Path(saved.get("ledger_path") or workflows.default_ledger_path())
-        _button(self.body, "Open AI review ledger", lambda: _open_path(self, self.ledger)).pack(anchor="w", pady=(9, 12))
+        _button(self.body, "Open Review / Correction Ledger", lambda: _open_path(self, self.ledger)).pack(anchor="w", pady=(9, 12))
         _label(self.body, str(self.ledger), small=True).pack(fill="x")
         legacy = Path(namespace.get("APP_DIR", workflows.default_misnaming_path().parent)) / "Misnaming Record.xlsx"
         if legacy.is_file():
@@ -726,7 +1055,7 @@ class ReportsMenuDialog(_Dialog):
 
 def open_ai_workflow(app, namespace, role):
     if is_processing_busy(app):
-        messagebox.showinfo("Stage 2 is busy", "Wait for document processing, recovery or scanning to finish before launching an AI review. The current run has not been interrupted.", parent=app)
+        messagebox.showinfo("Stage 2 is busy", "Wait for processing, recovery, scanning or the active AI Document Review to finish before launching another review. Use View AI session to watch the current review. The current run has not been interrupted.", parent=app)
         return None
     return _open_single_dialog(app, "ai-" + role, lambda: AIWorkflowDialog(app, namespace, role))
 
@@ -737,6 +1066,49 @@ def open_notification_settings(app, namespace):
 
 def open_reports_menu(app, namespace):
     return _open_single_dialog(app, "reports", lambda: ReportsMenuDialog(app, namespace))
+
+
+def configure_auto_review(app, namespace):
+    """Pre-run automatic review setup. Usable from Settings or the main window.
+
+    Never starts AI work. Saves cfg['ai_workflows']['auto_review'] through
+    namespace['save_config'] and refreshes app._refresh_ai_review_summary when present.
+    """
+    return _open_single_dialog(app, "auto-review", lambda: AutoReviewSettingsDialog(app, namespace))
+
+
+def current_ai_request_dir(app, namespace=None):
+    """The request folder of the run the View AI session button should show, if any."""
+    for name in ("_ai_review_request_dir", "_latest_ai_request_dir", "ai_review_request_dir"):
+        value = getattr(app, name, None)
+        if callable(value):
+            value = value()
+        if value:
+            return Path(value)
+    getter = (namespace or {}).get("current_ai_request_dir")
+    if callable(getter):
+        value = getter()
+        if value:
+            return Path(value)
+    return None
+
+
+def open_ai_session(app, namespace, request_dir=None):
+    """Show the existing supervised run's live output; never start a second run.
+
+    Returns the viewer process or None. The viewer is read-only and can be
+    reopened any number of times for a saved run; closing it does not cancel
+    the provider process.
+    """
+    target = Path(request_dir) if request_dir else current_ai_request_dir(app, namespace)
+    if target is None:
+        messagebox.showinfo("No AI session", "No supervised AI review has been launched for this run yet. Configure automatic review before Start; it launches after the completed accuracy audit. Opening this viewer does not start one.", parent=app)
+        return None
+    try:
+        return live_output.open_live_output(target)
+    except workflows.WorkflowError as exc:
+        messagebox.showerror("Could not open the AI session", str(exc), parent=app)
+        return None
 
 
 def _open_single_dialog(app, key, factory):

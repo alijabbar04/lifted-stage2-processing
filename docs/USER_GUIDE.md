@@ -1,8 +1,8 @@
 # Stage 2 - Processing
 
-## User guide | v1.4.1
+## User guide | v1.5.0 Obsidian / Jade
 
-Obsidian Compact edition. A practical guide to processing documents, checking the result, and turning verified corrections into better software.
+Obsidian / Jade edition. A practical guide to processing documents, checking the result, and turning verified corrections into better software.
 
 Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Stage 3 uploads the prepared folders. Completing Stage 2 does not itself upload anything.
 
@@ -13,9 +13,9 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 1. Choose the care home's **[Files]** folder and confirm the **[Processed]** destination.
 2. Check Settings, start processing, and review the run estimate.
 3. Let processing and any pending batch follow-up finish.
-4. Let the optional post-run accuracy audit finish, then open **Reports**.
-5. Use **Review audit...** to have Luna or Opus check the real documents and record decisions.
-6. Use **Learn from corrections...** to have Fable or Sol assess justified software improvements.
+4. Let the optional **Accuracy Audit** finish, then open **Reports**.
+5. Use **AI Document Review** to have the selected model check the real documents and record decisions.
+6. Use **Improve Stage 2** to have the selected learning model assess justified software improvements.
 
 ### Find the right page
 
@@ -39,7 +39,9 @@ Edition: 7 September 2026. Examples are generic. This guide contains no account 
 
 ## 1. The Obsidian Compact workspace
 
-The main screen keeps the essentials visible: the selected care home, the current phase, work completed, the current document, recent activity and three headline figures. Detailed information is still available when you need it.
+The idle view stays clean. Once a run starts, progressive panels reveal the
+phase, progress, current document and activity; errors and deeper details appear
+when relevant.
 
 | Control | What you use it for |
 | --- | --- |
@@ -49,8 +51,13 @@ The main screen keeps the essentials visible: the selected care home, the curren
 | Stop | Request a safe stop. It is not a pause button or a promise of instant interruption. |
 | Preview / Hide preview | Show or hide the current document without crowding the main work area. |
 | Details & full log | Open the full activity log, detailed counters, and Folder & utilities. |
-| Review audit... | Prepare an account-selected Luna or Opus document review. |
-| Learn from corrections... | Prepare a Fable or Sol review of accumulated correction evidence. |
+| AI Document Review | Prepare an account-selected document review. |
+| Improve Stage 2 | Prepare a software-learning review of accumulated correction evidence. |
+
+The v1.5.0 presentation uses Graphite surfaces, restrained Deep Jade accents,
+real buttons and progressive active panels. **Accuracy Audit** finds possible
+mistakes; **AI Document Review** checks pages; **Improve Stage 2** studies the
+ledger for justified software changes. Corrections never grant code authority.
 
 ### The top navigation stays available
 
@@ -64,8 +71,6 @@ The main screen keeps the essentials visible: the selected care home, the curren
 ### Fewer headline numbers, not less information
 
 **Workers complete** counts finished worker folders. **Needs review** counts audit flags, not proven naming errors. **Estimated run cost** is an estimate based on recorded usage and the configured exchange rate, not an account balance.
-
-The app icon appears beside Stage 2. The top ribbon is black. On supported Windows versions, the system caption bar containing minimise, maximise and close is black too; older Windows versions may use the operating system's dark fallback.
 
 > Processing uses the Anthropic API key in Settings. The two external AI-review workflows use the Claude or Codex account you select. These are separate billing and usage contexts.
 
@@ -190,7 +195,7 @@ CSV output can have companion **Summary**, **Orientation** and **Tables** files.
 
 ### 2 - AI review / correction ledger
 
-Choose **Open AI review ledger** to open **Master_Filename_Review_Ledger.xlsx**. Luna or Opus records what it actually checked, what it kept or changed, what remains uncertain, and the evidence needed for later improvement work.
+Choose **Open AI review ledger** to open **Master_Filename_Review_Ledger.xlsx**. The selected document-review model records what it actually checked, what it kept or changed, what remains uncertain, and the evidence needed for later improvement work.
 
 The ledger is shared across accounts, providers and runs. On an existing setup it remains in the configured Stage 2 Audit Review folder, beside **review_records.jsonl**, the recovery journal. Do not create a blank replacement merely because you switch from Opus to Luna or start another care home.
 
@@ -209,13 +214,17 @@ The ledger is shared across accounts, providers and runs. On an existing setup i
 
 <!-- pagebreak -->
 
-## 6. Review audit... - Luna or Opus
+## 6. AI Document Review
 
-This step independently checks the audit against the real documents. It is not another blind rename pass. The two available choices are **Luna - Codex, high effort** and **Opus - Claude Code, high effort**. These are configured review choices, not performance guarantees.
+Before Start, configure **AI Document Review** as **Model → Account → Effort**;
+the provider is inferred. The default is **Sol - Codex, High**, with
+**Apply supported filename corrections** on and automatic review after a
+complete Accuracy Audit. This step then checks the audit against real
+documents; it is not another blind rename pass.
 
 ### Prepare the handoff
 
-1. Wait until Stage 2 and the exact post-run accuracy audit finish. Click **Review audit...**.
+1. Wait until Stage 2 and the exact Accuracy Audit finish. Click **AI Document Review**.
 2. Choose the model and a matching provider account. Use **Expected account email** when you want a specific signed-in identity checked.
 3. Confirm the completed main audit, care-home name, audited document folder, original **[Files]** folder, master ledger and Stage 2 source checkout. Every review needs the current helper and naming implementation to prepare its queue and records, even without corrections.
 4. Confirm **The selected post-run accuracy audit has finished**. File existence alone is not confirmation.
@@ -228,6 +237,16 @@ This step independently checks the audit against the real documents. It is not a
 An account-isolated terminal opens in the persistent audit-review workspace. Claude receives the prefilled **/stage2-review-audit** command and the exact request-file path. Codex receives the equivalent request-file prompt. Both are directed to the same role rules, naming rules, records and shared file-based memory.
 
 The launcher does not claim to inject text into an already open VS Code extension. Existing IDE windows can retain a different account environment. The isolated terminal avoids silently using that other account; you may open the same request from a correctly signed-in IDE yourself.
+
+At Start, the selected **Model → Account → Effort** (provider inferred
+read-only: Sol/Terra/Luna/Astra are Codex; Fable/Opus are Claude), scope and
+authority are snapshotted and fixed on resume. The default is **Sol / High**;
+automatic review submits once only after a matching complete audit receipt and
+released locks. Pending/failed audits do not launch and the newest report is
+never guessed. A terminal/log viewer shows live output, not private reasoning
+or interactive chat; **View AI session** reopens the existing stream. Sign-in
+may require the user; no automatic OAuth, VS Code is optional, and CLI billing
+is separate from processing API billing.
 
 ### What the reviewer must do
 
@@ -274,16 +293,16 @@ Look for a review summary, recorded decisions, applied-change evidence where app
 
 <!-- pagebreak -->
 
-## 8. Learn from corrections... - Fable or Sol
+## 8. Improve Stage 2
 
 This is a separate reviewer with a different job: critically inspect the accumulated review evidence and decide whether a general software change is warranted. It may find that a previous correction was wrong, too specific to generalise, or not caused by a code defect.
 
-The available choices are **Fable - Claude Code, xhigh effort** and **Sol - Codex, xhigh effort**. The launcher checks the chosen account and supported configuration. It never silently replaces an unavailable model or account.
+This separate software-learning role recommends **Fable 5.1 - Claude Code, High** for codebase-wide investigation or **Sol - Codex, High** for routine bounded learning; **Astra - Codex, Medium** is a provisional complex-case alternative. The launcher checks the chosen account and supported configuration. It never silently replaces an unavailable model or account, and filename corrections never authorize automatic code changes.
 
 ### Launch the learning review
 
 1. Finish and reconcile the document review first. Do not send an unfinished spreadsheet as settled evidence.
-2. Click **Learn from corrections...** and choose the model and provider account.
+2. Click **Improve Stage 2** and choose Model → Account → Effort.
 3. Confirm the existing master ledger and the actual Stage 2 **Git source checkout**, not the installed application folder.
 4. Keep the same persistent shared-context root unless you deliberately want a new context location.
 5. Leave code-change permission unticked for a recommendation-only review, or allow verified source-code changes with regression tests and quality checks.
@@ -301,7 +320,11 @@ The available choices are **Fable - Claude Code, xhigh effort** and **Sol - Code
 
 ### Context is shared deliberately
 
-Opus and Luna share the **audit-review** role folder. Fable and Sol share a separate **code-learning** role folder. Each role has **MEMORY.md** plus an exact request folder containing rule snapshots and manifests. Both providers read those files; their native chat histories remain separate.
+The selected document-review models share the **audit-review** role folder.
+Fable/Sol (and any explicitly selected Astra alternative) use the separate
+**code-learning** role folder. Each role has **MEMORY.md** plus an exact request
+folder containing rule snapshots and manifests. Providers read those files;
+their native chat histories remain separate.
 
 Changing accounts does not erase the ledger or role memory. Changing roles does not give the learning reviewer permission to rename care-home documents. The button does not authorize publishing a GitHub release or installing a new desktop build; those are separate, explicitly managed release steps.
 
@@ -309,7 +332,10 @@ Changing accounts does not erase the ledger or role memory. Changing roles does 
 
 ## 9. Settings and API Usage
 
-Processing settings affect the main document-processing engine. Choosing Luna, Opus, Fable or Sol in an external-review dialog does not change the engine's classification model.
+Processing settings affect the main engine; review-model choices do not change
+classification. Theme choices are **A · Deep jade**, **B · Graphite**, and
+**C · Graphite + jade** (default). Preview changes live; **Save** applies and
+**Cancel** restores the previous settings.
 
 | Setting | Practical effect |
 | --- | --- |
@@ -329,11 +355,11 @@ Processing settings affect the main document-processing engine. Choosing Luna, O
 
 ### Understanding API Usage
 
-Open **API Usage** from the top navigation. The combined view includes Stage 2 processing and its integrated workflow tools, with scope controls for the included tools. Other pipeline applications have their own usage pages.
+Open **API Usage** from the top navigation to inspect Stage 2 and included
+workflow-tool usage. Other pipeline applications have separate usage pages.
 
-Use the tracker to inspect recorded usage over time and by the available scopes/models. The main screen's run estimate is a convenient summary, not a provider invoice, prepaid balance or proof that every external subscription session was captured.
-
-Claude Code and Codex review sessions use the selected subscription/account. Their account quotas and session limits are separate from the processing API key. Check AI Account Manager or the provider's own account view for those limits; do not assume the Stage 2 API cost figure includes them.
+Use the tracker by scope/model and over time. The run estimate is a summary,
+not an invoice, prepaid balance or record of external subscription sessions.
 
 <!-- pagebreak -->
 

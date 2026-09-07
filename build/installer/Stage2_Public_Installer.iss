@@ -3,7 +3,7 @@
 ; Windows Credential Manager. Never add a key or apikey.dat to this script.
 
 #define MyAppName "Stage 2 - Processing"
-#define MyAppVersion "1.4.1"
+#define MyAppVersion "1.5.0"
 #define MyAppPublisher "Lifted"
 #define MyAppExeName "Stage 2 - Processing.exe"
 #define SrcExe "..\..\dist\Stage 2 - Processing.exe"
