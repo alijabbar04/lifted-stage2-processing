@@ -27,6 +27,9 @@ MAX_ATTEMPTS = 3
 REQUEST_TIMEOUT = 15
 PHASES = {
     "preparing": "Preparing documents", "processing": "Processing documents",
+    "scanning": "Local document scanning and orientation checks",
+    "followup_plan": "Stronger-model follow-up planning",
+    "followup_upload": "Stronger-model follow-up preparation and submission",
     "organising": "Organising processed files", "audit": "Post-run accuracy audit",
     "audit_review": "AI audit review", "improvement_review": "AI change review",
     "tests": "Tests", "build": "Desktop build", "batch": "Overnight batch",
@@ -179,7 +182,7 @@ def format_event(event: str, **data) -> str:
         "batch_submitted": f"Overnight batch submitted: {documents:,} document request(s) across {batches:,} batch(es). Waiting for the provider; this is not a completed run.",
         "followup_submitted": f"Follow-up batch submitted: {documents:,} request(s) across {batches:,} batch(es). The same run will continue when results are ready.",
         "batch_waiting": "The provider is still processing the overnight batch. No resubmission is needed. This update does not mean the batch is stuck.",
-        "long_wait": f"{phase}: still waiting after {_integer(data.get('wait_seconds')) // 60:,} minute(s). Completed work is retained. Check Stage 2 for the current operation; waiting alone is not a failure.",
+        "long_wait": f"{phase}: no new progress reported for {_integer(data.get('wait_seconds')) // 60:,} minute(s). The current operation may still be working. Check Stage 2 for details; elapsed time alone is not a failure.",
         "audit_started": f"Post-run accuracy audit started: {total:,} document(s) to check. This re-checks filenames; it does not rename files.",
         "audit_complete": f"Post-run accuracy audit finished: {audit_count}; {review:,} flagged for review. The audit is AI evidence, not a guarantee. Open Reports to review it.",
         "audit_skipped": "The post-run accuracy audit was not run. Open Stage 2 for the reason; processing completion does not imply that filenames were audited.",

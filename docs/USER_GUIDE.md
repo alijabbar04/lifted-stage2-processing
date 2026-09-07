@@ -1,6 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.4.0
+## User guide | v1.4.1
 
 Obsidian Compact edition. A practical guide to processing documents, checking the result, and turning verified corrections into better software.
 
@@ -33,7 +33,7 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 | Discord and Telegram updates | 11 |
 | Troubleshooting and completion checklist | 12 |
 
-Edition: 6 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
+Edition: 7 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
 
 <!-- pagebreak -->
 
@@ -73,7 +73,7 @@ The app icon appears beside Stage 2. The top ribbon is black. On supported Windo
 
 ## 2. Folder setup and your first run
 
-Choose the care-home folder, not an individual worker folder and not the parent containing several care homes. Files stored only in the cloud must be downloaded before processing.
+Choose the care home's **[Files]** folder, not a worker folder or a parent containing several care homes. Download cloud-only files first.
 
 ```text
 Care Home/
@@ -85,22 +85,25 @@ Care Home/
 
 ### Before starting
 
-1. Open **Settings** and confirm an Anthropic API key is available. Keep the existing classification model unless you intend to change processing behaviour.
-2. Check the worker, file, spend and maximum-file-size limits. The estimate screen explains what will be sent, skipped or deferred.
-3. For normal handover, enable **Move processed workers to a destination folder** under File movement, then choose the separate **[Processed]** destination when prompted.
-4. Keep PDF conversion enabled when appropriate. LibreOffice is needed to preserve Office-document layout in full PDF conversion. Without it, Word may fall back to text-only conversion and other Office files may remain unconverted.
-5. Enable **Accuracy audit after processing** under Post-run checks if you want the automatic naming check at the end. This consumes additional API usage and must fit the run budget.
-6. Choose the **[Files]** folder, wait for its scan, and press **Start processing**. Review the mode, scope, warnings and estimated cost before confirming.
+1. In **Settings**, confirm the Anthropic API key, classification model, worker/file/spend limits and maximum file size.
+2. For normal handover, enable **Move processed workers to a destination folder** under File movement and select the separate **[Processed]** destination.
+3. Enable PDF conversion as needed. LibreOffice supports Office-to-PDF conversion; without it, Word may become text-only and other Office files may remain unconverted. Neither route guarantees fidelity.
+4. Enable **Accuracy audit after processing** under Post-run checks if wanted. Its additional API usage must fit the budget.
+5. Choose **[Files]**, wait for the scan, then **Start processing**. Before confirming, check the mode, scope, warnings and estimate, including skipped or deferred files.
 
 ### What happens to the documents
 
-Stage 2 converts supported files, classifies them against its controlled names, performs its worker-level checks and organises the results. Typical finished folders contain **Overwrite Documents** and **Bulk**, with numbered bulk batches for upload. The controlled routing rules decide which documents belong where.
+Stage 2 converts, classifies, checks and organises documents using its controlled naming/routing rules. Finished folders normally contain **Overwrite Documents** and **Bulk**, with numbered upload batches.
 
-With Move mode enabled, a worker moves only after its processing is finalised. A worker already present at the destination is treated as already done; do not assume it will be silently replaced. With Move mode disabled, changes happen in the selected source folder.
+Move mode moves a worker only after finalisation. An existing destination worker is treated as already done, not silently replaced. With Move mode off, the selected source folder is changed in place.
+
+### Conversion is not a fidelity check
+
+Preserve originals and compare important source pages/sheets with their PDFs. Conversion can lose ink/signatures, images, cells or fields, or misalign answers and labels. Fixed-height source rows may already hide content; splitting PDFs can lose form-widget appearances. Successful conversion/naming does not prove completeness. Repairing one file does not prove the general converter is fixed.
 
 ### Flattening is a utility, not a prerequisite
 
-**Details & full log > Folder & utilities > Flatten folders only** brings nested files into the worker folder without calling the AI. It still changes folder organisation. Normal processing handles its own preparation, so do not flatten a pending run or repeat it merely because a run is waiting.
+**Details & full log > Folder & utilities > Flatten folders only** moves nested files into the worker folder without AI calls. It changes organisation. Normal processing prepares its own files; do not flatten a pending run or repeat this utility just because it is waiting.
 
 > Keep a recoverable copy of your original source set. Do not manually move, rename or replace files belonging to a pending batch or an active review.
 
@@ -151,7 +154,7 @@ When enabled and affordable within the remaining run budget, it re-examines the 
 
 | Display | How to read it |
 | --- | --- |
-| 384 of 600 documents checked | The current audit has settled 384 document outcomes. This example is illustrative, not a live count. |
+| 384 of 600 documents checked | The audit has recorded 384 outcomes, which can include errors. This is an illustrative count, not proof that every file was readable. |
 | 64% | Work completed in that audit, not 64% naming accuracy. |
 | Current document / current check | The document and step being worked on, including rendering or waiting for an AI response. |
 | Elapsed waiting time | Time spent in the current wait. It explains a stationary bar without inventing progress. |
@@ -161,7 +164,7 @@ When enabled and affordable within the remaining run budget, it re-examines the 
 
 ### Completion, skipping and interruption
 
-**Audit complete** means the report was written after the audit reached completion. Open **Reports** to inspect it. A complete report still contains AI judgements that can be wrong.
+**Audit complete** means the audit finished its attempts and wrote the report. It can still contain errors, unreadable inputs or incorrect AI judgements. Open **Reports** and check statuses and Notes; do not treat completion as a passed accuracy test. The naming audit examines resulting documents, not a complete source-to-output fidelity comparison.
 
 **Audit skipped** means it did not run, for example because it was disabled or the remaining budget was insufficient. Completed processing is not undone. Do not describe a skipped audit as passed.
 
@@ -228,7 +231,7 @@ The launcher does not claim to inject text into an already open VS Code extensio
 
 ### What the reviewer must do
 
-The desktop handoff includes all flagged/error rows, including lower-confidence cases. The reviewer must inspect the actual evidence, keep correct names, correct only justified cases when allowed, and defer unresolved cases honestly. It must use the supplied helper to plan and apply changes, maintain the master ledger and journal, and reconcile outputs before reporting completion.
+The desktop handoff includes all flagged/error rows, including lower-confidence cases. The reviewer must inspect the actual evidence, keep correct names, correct only justified cases when allowed, and defer unresolved cases honestly. Encrypted, blank or incomplete evidence must not receive invented scores, dates, signature claims or a successful-review label. A file's name or a confident earlier judgement is not proof it was readable. Use the supplied helper to plan/apply changes, maintain the ledger/journal and reconcile outputs.
 
 The older manual command may use a confidence-greater-than-80 queue. Follow the scope written in this exact request, not an assumption from an older session. Neither a launch notification nor a terminal opening proves the review finished.
 
@@ -319,7 +322,7 @@ Processing settings affect the main document-processing engine. Choosing Luna, O
 | Skip API when clearly identified | Uses a shortcut when filename/text appears sufficient. Understand the accuracy tradeoff before enabling it. |
 | Auto-file unrecognised as Other | Avoids live definition prompts; unresolved documents still need attention. |
 | Local page orientation | Off, audit-only/shadow mode, or optional high-confidence correction. An orientation flag is not itself a proven rotation error. |
-| PDF conversion | Converts supported formats; full Office conversion needs LibreOffice. |
+| PDF conversion | Converts supported formats; LibreOffice enables supported full Office conversion, but does not guarantee content/layout fidelity. |
 | File movement | Moves finished workers to the chosen destination, or processes in place when disabled. |
 | Accuracy audit after processing | Runs the optional report-only check, subject to remaining budget and successful completion. |
 | Notifications... | Opens Discord and Telegram delivery settings. |
@@ -372,14 +375,14 @@ Delivery is best-effort. A channel failure does not stop document processing or 
 
 | What you see | What to do |
 | --- | --- |
-| A pending batch on this folder | Use Check batch status for the same saved run. Do not start a duplicate submission. |
+| A pending batch on this folder | Check batch status for this saved run; do not submit it again. |
 | Ambiguous batch submission | Reconcile saved state with provider jobs through recovery. Keep the state files and original inputs intact. |
 | A limit or insufficient remaining budget | Read the estimate/status and decide whether to change the relevant limit. A skipped audit is not a passed audit. |
 | Cloud-only or missing files | Make the files available locally, then retry the appropriate unfinished work. |
 | A file was changed or moved after submission | Restore/reconcile it before recovery or review. Do not force a stale plan to apply. |
 | Review cannot open while Stage 2 is busy | Wait for processing, recovery and scanning to finish. The current run has not been interrupted. |
 | Wrong account, unavailable model or unsupported effort | Open the intended account in AI Account Manager/provider, verify sign-in and select explicitly. No fallback is chosen for you. |
-| Review requires a source checkout | Select the current Stage 2 source folder containing the transaction helper and naming implementation. |
+| Review requires a source checkout | Select current Stage 2 source: the transaction helper and naming code. |
 | Workbook is open / records could not save | Close the workbook, then reconcile the retained journal and outputs. Do not overwrite the ledger. |
 | No notification arrives | Check enabled channels, destination, credential reference and the actual test result. Processing may still be succeeding. |
 
@@ -387,16 +390,17 @@ Delivery is best-effort. A channel failure does not stop document processing or 
 
 - Confirm all intended worker folders completed, including any follow-up work.
 - Review skipped, unknown, unconverted and error cases in **Details & full log**.
+- Compare key source/output content; preserve originals and escalate loss. Renaming cannot fix conversion damage.
 - Confirm whether the optional accuracy audit completed; do not infer it from a full processing bar.
 - Check and reconcile the external document-review result if you launched one.
-- Confirm the intended processed folder and handover roster are the ones Stage 3 will use. Roster-refresh warnings need attention; folder completion alone is not proof of matching/upload readiness.
+- Confirm Stage 3's processed folder and roster; resolve roster-refresh warnings before assuming upload readiness.
 
 ### Before calling a software improvement finished
 
-Check the learning report, evidence, tests and remaining uncertainties. A code edit or successful terminal exit does not update the installed app. Verify the build, installer, installed executable, shortcut and GitHub release separately.
+Check the learning report, evidence, tests and uncertainties. Code edits or terminal success do not update the desktop app: verify the build, installer, installed executable, shortcut and GitHub release separately.
 
 ### Further reference
 
-The source checkout includes **docs/ai-review/WORKFLOW_GUIDE.md**, the review/naming/learning rules, **docs/TROUBLESHOOTING.md**, **docs/NOTIFICATIONS.md** and **docs/AI_WORKFLOW_INTEGRATION.md**. Advanced vocabulary changes should start with **docs/VOCABULARY_GUIDE.md**.
+In the source checkout, see **docs/ai-review/WORKFLOW_GUIDE.md**, its review/naming/learning rules, **docs/TROUBLESHOOTING.md**, **docs/NOTIFICATIONS.md**, **docs/AI_WORKFLOW_INTEGRATION.md** and, for vocabulary changes, **docs/VOCABULARY_GUIDE.md**.
 
-Maintainers: update **docs/USER_GUIDE.md**, then run **tools/build_user_guide.py**. Release both source and PDF.
+Update **docs/USER_GUIDE.md**; run **tools/build_user_guide.py** and check pages/contents. Builds only bundle the PDF: release both. **docs/INSTALL.md** lists tests and four checksum artifacts.

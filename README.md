@@ -1,6 +1,6 @@
 # Stage 2 — Processing
 
-## v1.4.0 — Obsidian Compact
+## v1.4.1 — Obsidian Compact
 
 The compact near-black UI keeps the three key run measures visible and moves
 the detailed counters/log into **Details**. The real app icon and black Windows
@@ -38,13 +38,15 @@ The earlier pipeline and restart-safe batch recovery work is included in this re
 documents.**
 
 Stage 2 takes the folders of downloaded, merged worker documents that Stage 1
-produced and, worker by worker, converts everything to PDF, sends each page to
-the Claude API to work out *what the document actually is*, renames it to a name
+produced and, worker by worker, converts supported formats to PDF, sends the
+configured page evidence to the Claude API to identify the document, names it
 from a fixed **controlled vocabulary** (`BRP`, `DBS Document`, `Certificate of
 Sponsorship`, …), removes duplicates, ranks the remaining copies so the best one
 is obvious, and files everything into the two folder shapes Stage 3 needs to
-upload. It is fully automatic — you point it at a care-home folder and it
-processes every document in it.
+upload. You select a care-home folder and the app works through it, reporting
+skipped, unresolved and failed cases. Conversion completion and a naming audit
+do not prove that every source element survived; preserve originals and review
+uncertain or unreadable documents before uploading.
 
 ```
 Stage 1 — Download & Merger  →  Stage 2 — Processing  →  Stage 3 — Uploading
@@ -88,52 +90,36 @@ This gives you the app with Desktop and Start Menu shortcuts, plus the user
 guide wired up to the in-app **Guide** button. No admin rights and no Python
 needed.
 
-**You need:** a Windows 10/11 PC and a GitHub account. The repository is public;
-the GitHub CLI is only used to make downloading and updating the release reliable.
+**You need:** a Windows 10/11 PC. The normal public setup does not require a
+GitHub account, repository invitation, GitHub CLI or Python.
 
-Open **PowerShell** (press the Windows key, type `powershell`, press Enter) and
-run these steps:
+1. Open the public [Releases page](https://github.com/alijabbar04/lifted-stage2-processing/releases)
+   and select the intended release.
+2. Download **Stage2_Processing_Setup.exe** and **SHA256SUMS.txt** from that same
+   release. Compare the setup file's SHA-256 with its exact manifest entry:
 
-**Step 1 — install the GitHub CLI** (one time; it's how the download
-downloads the matching release asset):
+   ```powershell
+   Get-FileHash -Algorithm SHA256 .\Stage2_Processing_Setup.exe
+   Get-Content .\SHA256SUMS.txt
+   ```
 
-```powershell
-winget install --id GitHub.cli -e
-```
-
-Then **close PowerShell and open a new window** so the `gh` command is found.
-
-**Step 2 — sign in to GitHub** (one time; a browser window opens — use the
-invited account):
-
-```powershell
-gh auth login --web
-```
-
-**Step 3 — download and run the installer:**
-
-```powershell
-gh release download v1.4.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
-```
-
-That downloads the app (~75 MB) and `SHA256SUMS.txt`, verifies the executable
-before copying it anywhere, then installs it and creates the shortcuts:
+3. If the hashes match, run the setup wizard. It installs the app, Desktop and
+   Start Menu shortcuts, and the guide. Do not run a mismatched download.
 
 | Installed | Where |
 |---|---|
 | App + Desktop/Start Menu shortcuts | `%LOCALAPPDATA%\Programs\Stage 2 - Processing\` |
 | User guide (in-app **Guide** button) | `%LOCALAPPDATA%\Lifted\Guides\` |
 
-> Prefer a normal Windows setup wizard? Download `Stage2_Processing_Setup.exe`
-> from the same release. It installs the app, shortcuts and guide. Alternatively,
-> download `Stage2_Processing.exe` from the
-> [Releases](https://github.com/alijabbar04/lifted-stage2-processing/releases)
-> page for a self-contained portable file. It includes the in-app guide and AI
-> workflow rules; automatic shortcuts are provided by the installer.
+The public setup also installs guide copies in the app's `Guides` directory and
+`Documents\Lifted\Guides`. It contains no preconfigured API key or bot tokens
+and does not silently install LibreOffice.
 
-For a manual download, compare `Get-FileHash -Algorithm SHA256` for the portable
-app or setup executable with its exact entry in the release's
-`SHA256SUMS.txt`. A mismatch means the file must not be run.
+For a portable option, download **Stage2_Processing.exe** and verify its own
+manifest entry. It includes the guide and AI workflow rules, but does not create
+shortcuts. The older optional `install.ps1` bootstrap uses the GitHub CLI and
+currently asks for GitHub sign-in; that is a script requirement, not a condition
+of downloading the public setup. Developer checkout instructions are below.
 
 ### First run
 
@@ -142,8 +128,9 @@ app or setup executable with its exact entry in the release's
 2. Launch **Stage 2 - Processing**, then **cog (⚙) → API key** → paste → save.
    It goes into the **Windows Credential Manager**, not a file, and you only do
    this once.
-3. Install LibreOffice if `install.ps1` said it was missing — without it,
-   Word/Excel/PowerPoint files convert as text only, which classifies badly:
+3. Install LibreOffice for supported Office-to-PDF conversion. Without it,
+   some formats use a text-only fallback or remain unconverted. Even with it,
+   verify important source content such as signatures and spreadsheet cells:
    ```powershell
    winget install --id TheDocumentFoundation.LibreOffice -e
    ```
@@ -165,13 +152,11 @@ batch records first, then shows a recovery plan before asking to submit any
 verified remaining requests. Start processing and Flatten stay unavailable
 while saved batch work remains. Keep the hidden batch-state file in place.
 
-> There is also a private installer named
-> `Stage2_Processing_Preconfigured_Setup.exe` that pre-configures the API key, so
-> there is nothing to paste. It is deliberately **not** published here because
-> the key is compiled into it — ask Ali for that one directly if you would rather
-> not handle a key.
+> Legacy tooling can produce `Stage2_Processing_Preconfigured_Setup.exe` with
+> a preconfigured API key. That private artifact is not the public setup and
+> must not be published. Normal installation uses the public setup above.
 
-Full walkthrough with screenshots: **[docs/USER_GUIDE.pdf](docs/USER_GUIDE.pdf)**
+Full walkthrough: **[docs/USER_GUIDE.pdf](docs/USER_GUIDE.pdf)**
 (also on the **Guide** button inside the app). Step-by-step install for a
 non-technical colleague: **[docs/INSTALL.md](docs/INSTALL.md)**.
 
@@ -298,7 +283,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for v1.4.0. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for v1.4.1. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 
@@ -336,16 +321,31 @@ builds the credential-free public installer.
    only, never a filename.
 3. **Regenerate the vocabulary mirror** so the diff is reviewable:
    `python vocabulary\export_vocabulary.py`
-4. **Test locally:** `python src\Stage2_Processing.pyw` on a small folder, and
-   for classification changes run the regression harness
+4. **Verify offline:** run the appropriate `tests/` regression suite and
+   `python tests\run_gui_isolated.py` from the repo root. The GUI runner gives
+   each case a fresh process; skips, timeouts or shared-interpreter Tk failures
+   are not passing runtime checks. Record the source commit and actual results.
+   For classification changes, separately consider the regression harness
    (`python src\eval_classifier.py --tag my-fix` — needs a local ground-truth
    copy via `STAGE2_GT_ROOT`; costs real API money and asks first).
-5. **Rebuild the exe:** `.\build\build.ps1`
-6. **Build the public installer and final checksum manifest:**
+5. **Refresh the guide before freezing:** update `docs\USER_GUIDE.md`, then run
+   `python tools\build_user_guide.py --render-dir <guide-QA-folder>` with a
+   working Poppler executable (use `--pdftoppm <path>` if needed). Inspect every
+   rendered page, contents-page references and page breaks. The page count is
+   not fixed; update pagebreak markers/contents when content changes.
+6. **Rebuild the exe:** `.\build\build.ps1`. It bundles the existing PDF; it
+   does not regenerate the guide or establish Markdown/PDF freshness.
+7. **Build the public installer and final checksum manifest:**
    `.\build\build_public_installer.ps1`. This writes `dist\SHA256SUMS.txt`
-   only after the app, public setup executable and bundled ONNX asset exist.
-7. **Open a PR.** Say what changed in the vocabulary, and either paste the
-   harness result or say why it was not run.
+   after all four inputs exist: application, public setup, guide PDF and ONNX
+   model. Check the four entries against the final artifacts.
+8. **Check the frozen UI and deployment without processing worker documents.**
+   Exercise Reports, Guide, API Usage and the review/notification dialogs, not
+   just startup. When no active work will be disrupted, verify installed app and
+   guide hashes plus Desktop/Start Menu shortcut targets. Publish only the
+   reviewed final source/assets and compare the downloaded release hashes.
+9. **Open a PR.** Explain the change, tests, guide review and any unrun paid
+   evaluation. Do not reuse test counts from an earlier source state.
 
 If a colleague runs the packaged app, remember the exe/installer must be
 **rebuilt and redeployed** for them to get your change — editing the source does
@@ -353,14 +353,16 @@ not update anyone's installed copy.
 
 ### The end-user installer
 
-[`build/installer/`](build/installer/) holds the Inno Setup project that produces
-the colleague-facing setup (app + API key pre-configured into the Credential
-Manager + silent LibreOffice download + the guides/tools payload).
+The normal release uses `build\build_public_installer.ps1` and
+`build\installer\Stage2_Public_Installer.iss`. It produces
+**Stage2_Processing_Setup.exe**, containing the app, icon, shortcuts and guide.
+This credential-free artifact is intended for public Releases; users configure
+their own processing key and optional notification credentials locally.
 
-**Its output is deliberately never published to this repository or its Releases,
-because the API key is compiled into it.** The key is read at build time from
-`ANTHROPIC_API_KEY` or a git-ignored `.installer_secrets` file — never from
-anything tracked here. Treat any built installer as a secret.
+The same tooling directory also contains a **legacy private** preconfigured
+installer route. It reads a key at build time and can bundle that key into its
+output. Such credential-bearing artifacts must never be published. Do not
+confuse that private output with the normal public setup or its checksums.
 
 ---
 

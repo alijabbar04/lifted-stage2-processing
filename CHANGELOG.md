@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.4.1 — 2026-09-07 — Obsidian Compact progress and evidence handling
+
+- Make preparation, scanning, batching, follow-up and recovery progress report
+  the current operation and distinguish prepared, accepted, attention and
+  incomplete states. A completed pass does not claim every conversion or
+  submission succeeded.
+- Preserve honest recovery state and original inputs when a submission is
+  interrupted or a local conversion fails; do not imply 100% completion or
+  retry an ambiguous paid submission automatically.
+- Keep unreadable or empty evidence explicit and reviewable instead of inventing
+  pages, scores or classifications; validate page references, peer semantics
+  and review decisions against the available evidence.
+- Isolate supported Office conversion output from same-stem files and bound
+  read-timeout retries, while retaining the existing no-secret public installer
+  and user-configured API credentials.
+- Require the matching standalone guide before the optional bootstrap changes
+  installed files; verify its checksum and test missing/mismatched guide cases.
+
 ## v1.4.0 — 2026-09-06 — Obsidian Compact and evidence-led AI review
 
 - Implement the compact near-black/silver layout, black native Windows caption

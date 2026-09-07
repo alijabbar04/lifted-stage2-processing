@@ -21,7 +21,7 @@
 # ============================================================================
 $ErrorActionPreference = "Stop"
 $Repo      = "alijabbar04/lifted-stage2-processing"
-$Tag       = "v1.4.0"
+$Tag       = "v1.4.1"
 $AppAsset  = "Stage2_Processing.exe"
 $ChecksumAsset = "SHA256SUMS.txt"
 $GuideAsset = "Stage2_Guide_AI_Processing.pdf"
@@ -33,6 +33,32 @@ $GuideName = "Stage 2 Guide - AI Processing.pdf"
 
 $AppDir   = Join-Path $env:LOCALAPPDATA "Programs\Stage 2 - Processing"
 $GuideDir = Join-Path $env:LOCALAPPDATA "Lifted\Guides"
+
+function Get-VerifiedReleaseAssetHash {
+    param(
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [Parameter(Mandatory)][string]$AssetPath,
+        [Parameter(Mandatory)][string]$AssetName
+    )
+    if (-not (Test-Path -LiteralPath $AssetPath -PathType Leaf)) {
+        throw "Downloaded release asset is missing: $AssetName."
+    }
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Checksum manifest is missing: $ManifestPath."
+    }
+    $pattern = '^([0-9A-Fa-f]{64}) \*' + [regex]::Escape($AssetName) + '$'
+    $entries = @(Get-Content -LiteralPath $ManifestPath |
+        Where-Object { $_ -match $pattern })
+    if ($entries.Count -ne 1) {
+        throw "Checksum manifest must contain exactly one entry for $AssetName (found $($entries.Count))."
+    }
+    $expected = ([regex]::Match($entries[0], $pattern)).Groups[1].Value.ToUpperInvariant()
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $AssetPath).Hash.ToUpperInvariant()
+    if ($actual -ine $expected) {
+        throw "Checksum mismatch for $AssetName. Expected $expected; actual $actual."
+    }
+    return $actual
+}
 
 function Find-Gh {
     $cmd = Get-Command gh -ErrorAction SilentlyContinue
@@ -120,29 +146,38 @@ if ((Invoke-Native $gh @("release","download",$Tag,"--repo",$Repo,
 
 $DownloadedApp = Join-Path $dl $AppAsset
 $ChecksumPath = Join-Path $dl $ChecksumAsset
-$ChecksumPattern = '^([0-9A-Fa-f]{64}) \*' + [regex]::Escape($AppAsset) + '$'
-$ChecksumLines = @(Get-Content -LiteralPath $ChecksumPath |
-    Where-Object { $_ -match $ChecksumPattern })
-if ($ChecksumLines.Count -ne 1) {
-    Write-Host "Checksum manifest is invalid; the app has NOT been installed." -ForegroundColor Red
-    exit 1
-}
-$ExpectedHash = ([regex]::Match($ChecksumLines[0], $ChecksumPattern)).Groups[1].Value
-$ActualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $DownloadedApp).Hash
-if ($ActualHash -ine $ExpectedHash) {
-    Write-Host "SECURITY ERROR: downloaded app checksum does not match release $Tag." -ForegroundColor Red
-    Write-Host "Expected: $ExpectedHash"
-    Write-Host "Actual:   $ActualHash"
+$DownloadedGuide = Join-Path $dl $GuideAsset
+try {
+    $ActualHash = Get-VerifiedReleaseAssetHash -ManifestPath $ChecksumPath `
+        -AssetPath $DownloadedApp -AssetName $AppAsset
+} catch {
+    Write-Host "SECURITY ERROR: $($_.Exception.Message)" -ForegroundColor Red
     Remove-Item -LiteralPath $DownloadedApp -Force -ErrorAction SilentlyContinue
     Write-Host "The unverified executable was removed and nothing was installed." -ForegroundColor Red
     exit 1
 }
 Write-Host "  SHA-256 verified: $ActualHash" -ForegroundColor Green
 
-# The user guide is a separate, small asset. Not fatal if it is missing.
-$guideOk = (Invoke-Native $gh @("release","download",$Tag,"--repo",$Repo,
-                                "--pattern",$GuideAsset,"--dir",$dl,
-                                "--clobber") -Quiet) -eq 0
+Write-Host "`n[3/5] Downloading the user guide..." -ForegroundColor Cyan
+if ((Invoke-Native $gh @("release","download",$Tag,"--repo",$Repo,
+                         "--pattern",$GuideAsset,"--dir",$dl,
+                         "--clobber")) -ne 0) {
+    Write-Host "Guide download failed for release $Tag; nothing was installed." -ForegroundColor Red
+    Write-Host "Check that $GuideAsset is attached to the release, then run install.ps1 again."
+    exit 1
+}
+try {
+    $GuideHash = Get-VerifiedReleaseAssetHash -ManifestPath $ChecksumPath `
+        -AssetPath $DownloadedGuide -AssetName $GuideAsset
+} catch {
+    Write-Host "SECURITY ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    Remove-Item -LiteralPath $DownloadedGuide -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $DownloadedApp -Force -ErrorAction SilentlyContinue
+    Write-Host "The unverified guide was removed and nothing was installed." -ForegroundColor Red
+    Write-Host "Obtain a matching $ChecksumAsset from release $Tag, then run install.ps1 again."
+    exit 1
+}
+Write-Host "  Guide SHA-256 verified: $GuideHash" -ForegroundColor Green
 
 # --- 4. Install into the user profile (no admin needed) --------------------
 Write-Host "`n[4/5] Installing to $AppDir ..." -ForegroundColor Cyan
@@ -152,11 +187,9 @@ New-Item -ItemType Directory -Force $GuideDir | Out-Null
 $appExe = Join-Path $AppDir "Stage 2 - Processing.exe"
 Copy-Item -LiteralPath $DownloadedApp -Destination $appExe -Force
 
-if ($guideOk) {
-    Copy-Item (Join-Path $dl $GuideAsset) (Join-Path $GuideDir $GuideName) -Force
-    New-Item -ItemType Directory -Force (Join-Path $AppDir "Guides") | Out-Null
-    Copy-Item (Join-Path $dl $GuideAsset) (Join-Path $AppDir "Guides\$GuideName") -Force
-}
+New-Item -ItemType Directory -Force (Join-Path $AppDir "Guides") | Out-Null
+Copy-Item -LiteralPath $DownloadedGuide -Destination (Join-Path $GuideDir $GuideName) -Force
+Copy-Item -LiteralPath $DownloadedGuide -Destination (Join-Path $AppDir "Guides\$GuideName") -Force
 
 # Desktop + Start Menu shortcuts
 $shell = New-Object -ComObject WScript.Shell

@@ -1,5 +1,7 @@
 # Installing Stage 2 — Processing
 
+This guide applies to the v1.4.1 Obsidian Compact release.
+
 This guide assumes no technical knowledge. Follow it top to bottom.
 
 There are **two ways** to get Stage 2. Pick one.
@@ -12,72 +14,44 @@ You do not need Python, this repository, or any developer tools.
 
 ## 1. Install it
 
-**You need** a Windows 10/11 PC and a GitHub account. This repository is public.
+**You need** a Windows 10/11 PC. The public setup does not require a GitHub
+account, invitation, GitHub CLI or Python.
 
-Open **PowerShell**: press the Windows key, type `powershell`, press Enter.
+1. Open the public [Releases page](https://github.com/alijabbar04/lifted-stage2-processing/releases)
+   and select the release you intend to install.
+2. Download **Stage2_Processing_Setup.exe** and **SHA256SUMS.txt** from the same
+   release. Before running the setup, open PowerShell in your download folder:
 
-**Step 1 — install the GitHub CLI.** This is how the download proves who you are,
-and makes repeatable release downloads easy. One time only:
+   ```powershell
+   Get-FileHash -Algorithm SHA256 .\Stage2_Processing_Setup.exe
+   Get-Content .\SHA256SUMS.txt
+   ```
 
-```powershell
-winget install --id GitHub.cli -e
-```
-
-Now **close PowerShell and open a new window**, or the next step will not find
-the `gh` command. This trips everyone up once.
-
-**Step 2 — sign in to GitHub.** A browser window opens; sign in with the account
-that was invited. One time only:
-
-```powershell
-gh auth login --web
-```
-
-**Step 3 — download and run the installer.** Copy this whole line:
-
-```powershell
-gh release download v1.4.0 --repo alijabbar04/lifted-stage2-processing --pattern install.ps1 --dir $env:TEMP --clobber; & $env:TEMP\install.ps1
-```
-
-It downloads the app (about 75 MB) plus `SHA256SUMS.txt`, verifies the
-executable before installing it, makes a Desktop and Start Menu shortcut,
-installs the user guide so the in-app **Guide** button works, and then lists
-what it installed so you can see it worked:
+3. Compare the printed hash with the exact `Stage2_Processing_Setup.exe` entry
+   in the manifest. Do not run the file if they differ.
+4. Run the setup wizard. It installs the app, Desktop and Start Menu shortcuts,
+   and the user guide for the in-app **Guide** button.
 
 | Installed | Where |
 |---|---|
 | App + shortcuts | `%LOCALAPPDATA%\Programs\Stage 2 - Processing\` |
 | User guide | `%LOCALAPPDATA%\Lifted\Guides\` |
 
-Nothing needs admin rights, and Python is not involved.
+The setup runs per user without admin rights. It also places guide copies in
+the app's `Guides` folder and `Documents\Lifted\Guides`. It does not configure
+an API key or silently install LibreOffice.
 
-> **"Download failed"?** Almost always means your GitHub account has not been
-> invited to the repository yet, or you have not accepted the invitation email.
-> Sort that out and run step 3 again.
->
-> **"running scripts is disabled on this system"?** Allow local scripts for your
-> own account once, then re-run step 3:
-> ```powershell
-> Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-> ```
+### Other download routes
 
-### Or download it by hand
+**Stage2_Processing.exe** is the portable app. Verify its own entry in the
+same release's checksum file; it includes the guide/rules but creates no
+shortcuts. **Stage2_Guide_AI_Processing.pdf** is the standalone guide download.
 
-If you would rather not use PowerShell: go to the repository's **Releases** page
-and download **`Stage2_Processing_Setup.exe`**. Double-click it to install the
-app, shortcuts and guide. The portable **`Stage2_Processing.exe`** is also
-available if you do not want a normal installation.
-
-Download `SHA256SUMS.txt` from the same release and compare it before running a
-manually downloaded file:
-
-```powershell
-Get-FileHash -Algorithm SHA256 .\Stage2_Processing_Setup.exe
-Get-Content .\SHA256SUMS.txt
-```
-
-The hash printed for `Stage2_Processing_Setup.exe` must exactly match its line
-in the manifest. Do not run the file if it differs.
+The older optional **install.ps1** bootstrap uses the GitHub CLI and currently
+asks for GitHub sign-in. That is a requirement of the script, not the public
+setup. A failed public download does not imply a missing repository invitation:
+check the selected release, filename and connection. Developer checkout is
+covered separately in Option B.
 
 > Windows may warn that the file is "not commonly downloaded" because it is not
 > code-signed. Choose **Keep**, then if SmartScreen appears, **More info → Run
@@ -110,10 +84,14 @@ once; it is remembered for every future run.
 
 ## 4. Install LibreOffice (optional but recommended)
 
-LibreOffice converts Word / Excel / PowerPoint documents to PDF. Stage 2 works
-without it, but those files convert as **text only**, which loses stamps,
-signatures and layout — and the classifier reads pages as images, so a
-text-only conversion classifies badly.
+LibreOffice provides Office-to-PDF conversion for supported formats. Without
+it, some formats fall back to text-only output and others can remain
+unconverted. Text-only output cannot preserve all images, signatures or layout.
+
+Even a completed full conversion can omit visible source elements or reproduce
+clipping already in the source. Preserve original documents and check important
+content before upload; the filename audit is not a source-to-output fidelity
+comparison. See the user guide's conversion and audit limits.
 
 Get it free from <https://www.libreoffice.org/download>. Stage 2 finds it
 automatically afterwards; there is nothing to configure.
@@ -181,7 +159,7 @@ the follow-up reserve and the optional audit separately. An enabled audit shows
 its expected cost before it starts and is skipped—without undoing completed
 processing—when the remaining cumulative budget is insufficient.
 
-Read **`docs/USER_GUIDE.pdf`** for the full walkthrough with screenshots. It is
+Read **`docs/USER_GUIDE.pdf`** for the full walkthrough. It is
 also available inside the app from the **Guide** button.
 
 If something goes wrong, see **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**.
@@ -225,9 +203,10 @@ on your local Git configuration.
 .\setup.ps1
 ```
 
-This checks your Python version, installs the five packages Stage 2 needs
-(`pymupdf`, `pillow`, `onnxruntime`, `openpyxl`, `keyring`), checks for
-LibreOffice, and then
+This checks your Python version and installs the dependencies in
+`requirements.txt`: `pymupdf`, `pillow`, `onnxruntime`, `openpyxl`, `keyring`,
+plus `pywin32==312` when `sys_platform == "win32"`. The Windows dependency
+supports native WinHTTP batch transport. Setup also checks for LibreOffice and
 offers to store your Anthropic API key in the Windows Credential Manager.
 
 When it asks for the key, paste it and press Enter — the typing is hidden. Press
@@ -253,25 +232,66 @@ python src\Stage2_Processing.pyw
 
 Use `pythonw` instead of `python` to run it without a console window behind it.
 
-## 6. Rebuild the exe after a change
+## 6. Verify and rebuild after a change
+
+Run the appropriate offline regression suite under `tests/` and the isolated
+GUI runner from the repository root:
+
+```powershell
+python tests\run_gui_isolated.py
+./tools/test_install_bootstrap.ps1
+```
+
+Each GUI case runs in a fresh process. A skip, timeout or shared-interpreter Tk
+failure is not a passing runtime check. Record the final source commit, actual
+results and unverified cases. A startup smoke alone does not exercise dialogs.
+Paid classification evaluation is separate and must be deliberately authorized.
+The bootstrap check exercises only extracted checksum logic and synthetic files;
+it never starts an installation, downloads assets or changes shortcuts.
+
+Update `docs\USER_GUIDE.md`, then regenerate the guide before the application
+is frozen. The guide builder needs ReportLab and pypdf in the chosen Python
+environment and Poppler for visual QA:
+
+```powershell
+python tools\build_user_guide.py --render-dir <guide-QA-folder> --pdftoppm <pdftoppm-path>
+```
+
+Replace the angle-bracket paths with real local paths. Inspect every rendered
+page for missing text, overflow and readability; recheck the contents page and
+page-break markers. Page count may change. `build\build.ps1` bundles the
+existing PDF and does not verify that it matches the Markdown.
+
+Then build the app and credential-free public setup:
 
 ```powershell
 .\build\build.ps1
-```
-
-Takes a few minutes and writes `dist\Stage 2 - Processing.exe`. Back up the old
-exe before replacing it.
-
-After building the public installer, generate the final three-artifact checksum
-manifest with:
-
-```powershell
 .\build\build_public_installer.ps1
 ```
 
-This writes `dist\SHA256SUMS.txt` with SHA-256 hashes for the app, public setup
-executable and bundled ONNX model. It is intentionally generated last and does
-not attempt to include a hash of itself.
+The app is written to `dist\Stage 2 - Processing.exe`; the setup to
+`build\installer\Output\Stage2_Processing_Setup.exe`. The public build then
+writes `dist\SHA256SUMS.txt` with **four** entries:
+
+| Release entry | Local input |
+| --- | --- |
+| Stage2_Processing.exe | dist\Stage 2 - Processing.exe |
+| Stage2_Processing_Setup.exe | build\installer\Output\Stage2_Processing_Setup.exe |
+| Stage2_Guide_AI_Processing.pdf | docs\USER_GUIDE.pdf |
+| inference.onnx | assets\orientation\inference.onnx |
+
+Generate the manifest only after those artifacts are final. It does not contain
+a hash of itself. Verify all four entries rather than checking the app alone.
+
+Exercise the actual frozen UI without processing worker documents: Reports,
+Guide, API Usage, review/notification dialogs, normal/minimum window sizes and
+relevant display scaling. When no active work will be interrupted, install the
+final setup and check executable/guide hashes and Desktop/Start Menu targets.
+After release publication, compare the downloaded assets with those same final
+hashes. Source changes alone do not update the installed application.
+
+Legacy private preconfigured-installer tooling is separate from this public
+build. Its credential-bearing output must not be placed in a public release.
 
 The 7 MB `PP-LCNet_x1_0_doc_ori` ONNX model is included in the executable. It
 is CPU-only and is never downloaded at runtime. Its pinned revision, Apache-2.0

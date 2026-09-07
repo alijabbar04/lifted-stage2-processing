@@ -1338,8 +1338,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.4.0"
-APP_BUILD = "2026.09.06-obsidian1"
+APP_VERSION = "1.4.1"
+APP_BUILD = "2026.09.07-obsidian2"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -2246,16 +2246,23 @@ class PdfConverter:
                 if txt.strip():
                     ok = PdfConverter._text_to_pdf(txt, dest, title=src.name)
             elif ext in OFFICE_EXT:
-                produced = PdfConverter._office_to_pdf(src, src.parent, log)
-                if produced and produced.exists():
-                    # LibreOffice names it <stem>.pdf; move to our unique dest
-                    if produced != dest:
-                        try:
-                            if dest.exists():
-                                dest.unlink()
-                            produced.rename(dest)
-                        except Exception:
-                            dest = produced   # use whatever LO produced
+                # Convert into a FRESH private directory, never src.parent:
+                # LibreOffice always writes <stem>.pdf and silently overwrites
+                # an existing file, so converting in place destroyed a
+                # pre-existing same-stem PDF (a nine-page signed contract was
+                # lost exactly this way) - and when a conversion failed, that
+                # pre-existing <stem>.pdf could masquerade as fresh output.
+                # An empty out_dir makes 'produced exists' proof of NEW bytes.
+                produced = None
+                with tempfile.TemporaryDirectory(
+                        prefix="lifted-convert-") as td:
+                    made = PdfConverter._office_to_pdf(src, Path(td), log)
+                    if made and made.exists() and made.stat().st_size:
+                        if dest.exists():   # appeared since dest was chosen
+                            dest = unique_path(src.parent, src.stem, ".pdf")
+                        shutil.move(str(made), str(dest))
+                        produced = dest
+                if produced:
                     ok = True
                 elif ext == ".docx":
                     # text-only fallback for Word when LibreOffice unavailable
@@ -2465,6 +2472,41 @@ class DocRender:
                 w, h = im.size
             except Exception:
                 traceback.print_exc()
+                # A supported image extension is not evidence by itself.  Do
+                # not base64 raw bytes that Pillow could not decode: the caller
+                # will surface the existing zero-evidence unreadable outcome.
+                return [], ""
+        elif HAS_FITZ:
+            try:
+                with fitz.open(path) as doc:
+                    if len(doc) != 1:
+                        return [], ""
+                    # In fitz's rendered screen coordinates, positive
+                    # prerotate degrees match this caller's clockwise contract.
+                    mat = fitz.Matrix(zoom, zoom)
+                    if rotate in (90, 180, 270):
+                        mat = mat.prerotate(rotate)
+                    page = doc[0]
+                    cap = DocRender._max_px(zoom)
+                    longest = max(page.rect.width * zoom,
+                                  page.rect.height * zoom)
+                    if longest > cap:
+                        # Pillow normally performs this cap.  Size this matrix
+                        # before rasterizing so the fitz-only fallback never
+                        # creates the oversized pixmap just to shrink it.
+                        scale = (cap - 1) / longest
+                        mat = fitz.Matrix(zoom * scale, zoom * scale)
+                        if rotate in (90, 180, 270):
+                            mat = mat.prerotate(rotate)
+                    pix = page.get_pixmap(matrix=mat, alpha=False)
+                data = pix.tobytes("png")
+                w, h = pix.width, pix.height
+            except Exception:
+                traceback.print_exc()
+                return [], ""
+        else:
+            # Without a local decoder, extension-only bytes are unverifiable.
+            return [], ""
         data, w, h = DocRender._fit_api_limits(data, w, h, path.name, 1)
         if data is None:
             return [], ""
@@ -2584,10 +2626,13 @@ class DocRender:
                 if png is None:
                     continue   # could not bring it under limits - skip this page
                 imgs.append(base64.b64encode(png).decode("ascii"))
-            # always grab text from the first dozen pages for date/signature clues
-            for i in range(min(total, 12)):
-                if i not in idxs:
-                    text.append(doc[i].get_text())
+            # A page-one triage request may only see page-one evidence.  The
+            # later supplemental text remains useful to the full/sample pass,
+            # but must not make a later page look like page 1.
+            if pages != "first":
+                for i in range(min(total, 12)):
+                    if i not in idxs:
+                        text.append(doc[i].get_text())
         finally:
             doc.close()
         return imgs, "\n".join(text)[:12000]
@@ -2949,6 +2994,20 @@ class CreditExhausted(Exception):
         self.detail = detail or "API credit exhausted"
 
 
+class UnreadableDocumentError(Exception):
+    """Raised instead of sending a classification/adjudication request when a
+    document yields NO page images and NO extracted text (encrypted, corrupt,
+    or every page rejected). The provider would otherwise be asked to classify
+    nothing and can invent a plausible type: an encrypted PDF really was named
+    from empty evidence and then hidden behind the audit's 'Custom Name'
+    suppression with 'Pages Examined = 1'. Callers record it as an explicit
+    unreadable/error outcome with zero examined pages."""
+    def __init__(self, reason: str = ""):
+        super().__init__(reason or "document is unreadable (no renderable "
+                         "pages or extractable text)")
+        self.reason = str(self)
+
+
 def _sanitize_api_error(status: int, raw_body: str):
     """Return (label, detail) describing an API error.
     label  : short, safe text mapped from the status code (for the activity log).
@@ -3095,6 +3154,19 @@ class ClaudeAPI:
                     _t.sleep(delay)
                     continue
                 raise APIError(0, f"network error ({getattr(e, 'reason', e)})")
+            except TimeoutError as e:
+                # A timeout DURING resp.read() is raised as a bare
+                # TimeoutError, not URLError, so it used to bypass the retry
+                # above and fail the document outright (a readable DBS result
+                # became an audit's only error row this way). Same bounded
+                # backoff; temperature-0 requests are safe to resend.
+                if attempt < self.MAX_RETRIES:
+                    delay = self.RETRY_BASE_DELAY * (2 ** attempt)
+                    attempt += 1
+                    import time as _t
+                    _t.sleep(delay)
+                    continue
+                raise APIError(0, f"network error ({e or 'read timed out'})")
         usage = payload.get("usage", {})
         if _api_usage:
             _api_usage.record_usage(self.model_id, usage)
@@ -3835,6 +3907,15 @@ class ClaudeAPI:
                     attempt += 1
                     continue
                 raise APIError(0, f"network error ({getattr(e, 'reason', e)})")
+            except TimeoutError as e:
+                # read-phase timeout (see _post); retried only for the same
+                # idempotent-safe requests as URLError - never a batch POST
+                if retry_safe and attempt < self.MAX_RETRIES:
+                    import time as _t
+                    _t.sleep(self.RETRY_BASE_DELAY * (2 ** attempt))
+                    attempt += 1
+                    continue
+                raise APIError(0, f"network error ({e or 'read timed out'})")
 
     def build_batch_request(self, custom_id: str, system: str, blocks: list,
                             max_tokens: int, cache_system: bool = True) -> dict:
@@ -6121,6 +6202,18 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
         return _second_opinion(escalation_api, vocab, path, resolution, out,
                                emit_cost)
 
+    def _require_evidence(o):
+        # NEVER classify from nothing. With no page images and no extracted
+        # text the model can only invent an answer, so the request is refused
+        # before any API call and the caller records an explicit unreadable
+        # outcome instead (encrypted/corrupt files used to come back with a
+        # confident type and 'Pages Examined = 1').
+        if not o["used_imgs"] and not (o["used_text"] or "").strip():
+            raise UnreadableDocumentError(
+                "no renderable pages or extractable text "
+                f"(file reports {total_pages} page(s); possibly encrypted "
+                "or corrupt)")
+
     def _all_idxs():
         # mirror of DocRender's pages='all' sampling policy
         if total_pages <= DocRender.MAX_PAGES:
@@ -6201,6 +6294,7 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
         _render_selected(out)
         if out["segment_view"]:
             out["triage_reason"] = "short file shown in full for bundle safety"
+            _require_evidence(out)
             out["result"] = api.classify(
                 vocab, out["used_imgs"], out["used_text"],
                 page_idxs=out["page_idxs"], total_pages=total_pages,
@@ -6210,20 +6304,27 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
             return _finish(out)
 
     if adaptive_pages and ext in PDF_EXT and total_pages > 1:
-        tri = api.triage(vocab, p1_imgs[0] if p1_imgs else "",
-                         p1_text, total_pages)
-        if emit_cost:
-            emit_cost()
-        out["triaged"] = True
-        enough = bool(tri.get("enough_from_page1"))
-        tconf = tri.get("confidence", 0)
-        tmatch = bool(tri.get("match"))
-        if enough and tmatch and tconf >= 80 and (tri.get("name") or "").strip():
-            out["result"] = tri  # page 1 was sufficient
-            out["page1_only"] = True
-            return _finish(out)
-        out["triage_reason"] = str(tri.get("reason", ""))
+        if p1_imgs or (p1_text or "").strip():
+            tri = api.triage(vocab, p1_imgs[0] if p1_imgs else "",
+                             p1_text, total_pages)
+            if emit_cost:
+                emit_cost()
+            out["triaged"] = True
+            enough = bool(tri.get("enough_from_page1"))
+            tconf = tri.get("confidence", 0)
+            tmatch = bool(tri.get("match"))
+            if enough and tmatch and tconf >= 80 and (tri.get("name") or "").strip():
+                out["result"] = tri  # page 1 was sufficient
+                out["page1_only"] = True
+                return _finish(out)
+            out["triage_reason"] = str(tri.get("reason", ""))
+        else:
+            # page 1 alone gave no evidence (bad first page / oversized
+            # render): skip the triage call - it would be asked about
+            # nothing - and judge readability from the full page selection
+            out["triage_reason"] = "page 1 yielded no image or text"
         _render_selected(out)
+        _require_evidence(out)
         out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"],
                                      page_idxs=out["page_idxs"],
                                      total_pages=total_pages,
@@ -6235,6 +6336,7 @@ def classify_document_core(api, vocab, path, *, resolution, adaptive_pages,
     # (for single-page docs page 1 IS the whole doc)
     if ext in PDF_EXT and total_pages > 1 and not adaptive_pages:
         _render_selected(out)
+    _require_evidence(out)
     out["result"] = api.classify(vocab, out["used_imgs"], out["used_text"],
                                  page_idxs=out["page_idxs"],
                                  total_pages=total_pages,
@@ -6616,6 +6718,15 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
                         f"{adj['reason']}")
         except (StopRequested, LimitReached, CreditExhausted):
             raise
+        except UnreadableDocumentError as e:
+            # An unreadable file must surface as an explicit zero-page error
+            # row - never as 'Custom Name'/'Correct' with invented evidence -
+            # so the all-flags review queue always includes it.
+            row["Review Status"] = "Unable To Determine"
+            row["Pages Examined"] = 0
+            row["Missing Information"] = ("Document could not be read; needs "
+                                          "a readable source or a password.")
+            row["Notes"] = f"error: {e}"
         except Exception as e:
             row["Review Status"] = "Unable To Determine"
             row["Notes"] = f"error: {e}"
@@ -7330,9 +7441,9 @@ class Engine:
             self._announced_phases = seen
             self._activity({"kind":"phase_started", "phase":phase, "label":label})
 
-    def _phase_progress(self, phase, done, total):
+    def _phase_progress(self, phase, done, total, **details):
         self._activity({"kind":"run_progress", "phase":phase, "state":"running",
-                        "completed":done, "total":total})
+                        "completed":done, "total":total, **details})
 
     def _run_post_run_audit(self):
         """When the Settings toggle is on, re-check every processed document
@@ -8777,15 +8888,17 @@ class Engine:
             workers = workers[:total]
 
             # ---- local prep: convert to PDF + flatten (no API) ----
+            self._phase("preparing", "Preparing worker folders")
+            self._phase_progress("preparing", 0, total)
             for idx, w in enumerate(workers, 1):
                 self._check_stop()
-                self._phase_progress("preparing", idx - 1, total)
                 self.set_progress(idx - 1, total)
                 # move mode: a worker already in the destination is done
                 if self.move_mode and (self.move_dest / w.name).exists():
                     self.stats["skipped_done"] += 1
                     self.log(f"\n=== Worker {idx}/{total}: {w.name} — already "
                              f"in destination, skipped ===")
+                    self._phase_progress("preparing", idx, total)
                     continue
                 self.set_status(f"Preparing {idx}/{total}: {w.name}")
                 self.log(f"\n=== Preparing worker {idx}/{total}: {w.name} ===")
@@ -8796,15 +8909,31 @@ class Engine:
                 moved = flatten_worker(w, self.log)
                 if moved:
                     self.log(f"  flattened {moved} file(s)")
+                # A preparation pass finished, not a guarantee every conversion
+                # succeeded. Conversion failures retain their existing counters.
+                self._phase_progress("preparing", idx, total)
+            self._phase_progress("preparing", total, total, state="complete")
 
             # ---- enumerate eligible documents (same skip rules as live) ----
             self.set_status("Scanning documents for the batch…")
+            self._phase("scanning", "Scanning documents and local orientation checks")
+            scanned_workers = scanned_documents = 0
+            self._phase_progress("scanning", 0, total, state="scanning", documents=0)
             eligible = []   # (worker_dir, path, fhash, pages)
-            for w in workers:
+            limit_reached = limit_leaves_scope = False
+            for worker_index, w in enumerate(workers):
                 self._check_stop()
                 if self.move_mode and (self.move_dest / w.name).exists():
+                    scanned_workers += 1
+                    self._phase_progress("scanning", scanned_workers, total,
+                                         state="scanning", documents=scanned_documents)
                     continue
-                for f in list_worker_docs(w):
+                documents = list(list_worker_docs(w))
+                for document_index, f in enumerate(documents):
+                    scanned_documents += 1
+                    self._phase_progress("scanning", scanned_workers, total,
+                                         state="scanning", documents=scanned_documents,
+                                         operation=f"scan:{scanned_documents}")
                     reason = self._batch_skip_file(w, f)
                     if reason:
                         self.log(f"    - {self._redact(f.name)}: skipped ({reason})")
@@ -8819,7 +8948,14 @@ class Engine:
                         self.manifest.seen(
                             fhash, self.api.model_id, self.resolution)
                         if fhash and not self.reprocess else None)
+                    self._phase_progress("scanning", scanned_workers, total,
+                                         state="orienting" if self.orientation_mode != "off" else "scanning",
+                                         documents=scanned_documents,
+                                         operation=f"orientation:{scanned_documents}")
                     orientation = self._orientation_preflight(f)
+                    self._phase_progress("scanning", scanned_workers, total,
+                                         state="scanning", documents=scanned_documents,
+                                         operation=f"scan-returned:{scanned_documents}")
                     if orientation.get("hash"):
                         fhash = orientation["hash"]
                     if orientation.get("changed") \
@@ -8839,11 +8975,30 @@ class Engine:
                         continue
                     eligible.append((w, f, fhash, DocRender.page_count(f)))
                     if self.max_files > 0 and len(eligible) >= self.max_files:
-                        self.log(f"NOTE: file limit reached ({self.max_files}); "
-                                 f"remaining documents are left for a later run.")
+                        limit_reached = True
+                        limit_leaves_scope = (
+                            document_index + 1 < len(documents)
+                            or worker_index + 1 < total)
+                        if limit_leaves_scope:
+                            self.log(f"NOTE: file limit reached ({self.max_files}); "
+                                     f"remaining documents are left for a later run.")
+                        if document_index + 1 == len(documents):
+                            # The allowed final document completed this worker,
+                            # even if a later worker remains outside the limit.
+                            scanned_workers += 1
+                            self._phase_progress("scanning", scanned_workers, total,
+                                                 state="scanning", documents=scanned_documents)
                         break
-                if self.max_files > 0 and len(eligible) >= self.max_files:
+                if limit_reached:
                     break
+                scanned_workers += 1
+                self._phase_progress("scanning", scanned_workers, total,
+                                     state="scanning", documents=scanned_documents)
+            # A configured limit is limited only while input remains unvisited;
+            # retain the original denominator and never manufacture 100%.
+            self._phase_progress("scanning", scanned_workers, total,
+                                 state="limited" if limit_leaves_scope else "complete",
+                                 documents=scanned_documents)
 
             if not eligible:
                 self.log("Nothing to submit - every document is cached, skipped "
@@ -8918,10 +9073,12 @@ class Engine:
             chunk, chunk_bytes = [], 0
             hash_counts = {}
             n_built = 0
+            n_accepted = 0
             chunk_number = 0
+            self._phase("batch", "Preparing and submitting batch requests")
 
             def _submit_chunk():
-                nonlocal chunk_number
+                nonlocal chunk_number, n_accepted
                 if not chunk:
                     return
                 wire_bytes = len(json.dumps({"requests": chunk}).encode("utf-8"))
@@ -8930,6 +9087,9 @@ class Engine:
                                        "recover with smaller chunks before applying")
                 self.set_status(f"Submitting a batch of {len(chunk)} request(s)…")
                 chunk_number += 1
+                self._phase_progress("batch", n_built, len(eligible),
+                                     state="submitting", accepted=n_accepted,
+                                     operation=f"submit:{chunk_number}")
                 chunk_id = f"primary-{chunk_number:04d}"
                 identities = [str(req.get("custom_id") or "")
                               for req in chunk]
@@ -8979,13 +9139,19 @@ class Engine:
                         "resubmission is blocked by the durable started marker")
                 self.log(f"  > submitted batch {bid} with {len(chunk)} request(s)")
                 self.stats["batches"] += 1
+                n_accepted += len(chunk)
+                self._phase_progress("batch", n_built, len(eligible),
+                                     state="submitted", accepted=n_accepted,
+                                     operation=f"accepted:{chunk_number}")
                 chunk.clear()
 
             for i, (w, f, fhash, pages) in enumerate(eligible, 1):
                 self._check_stop()
-                self._phase_progress("batch", n_built, len(eligible))
                 self.set_status(f"Rendering {i}/{len(eligible)}: "
                                 f"{self._redact(f.name)}")
+                self._phase_progress("batch", n_built, len(eligible),
+                                     state="rendering", accepted=n_accepted,
+                                     operation=f"render:{i}")
                 if not f.exists():
                     continue
                 imgs, text, page_idxs, total_pages, segment_view = \
@@ -9018,13 +9184,49 @@ class Engine:
                 chunk.append(req)
                 chunk_bytes += req_bytes
                 n_built += 1
+                self._phase_progress("batch", n_built, len(eligible),
+                                     state="rendering", accepted=n_accepted,
+                                     operation=f"built:{i}")
             _submit_chunk()
+
+            # Eligibility was decided before this bounded rendering pass.  If
+            # every source disappeared or proved unrenderable here, no provider
+            # request exists to wait for or apply.  Do not retain the initial
+            # inventory as an interrupted submission: that would force the
+            # recovery flow to treat a local file problem as a possible billed
+            # upload.  Save a non-pending terminal marker first, so a failed
+            # delete cannot revive the old incomplete state; then remove the
+            # empty batch state and leave the source files untouched for retry.
+            if not n_built:
+                state.data.pop("primary_submission_complete", None)
+                state.data["primary_submission"] = {
+                    "status": "nothing_renderable",
+                    "eligible": len(eligible),
+                }
+                state.data["phase"] = "primary_nothing_renderable"
+                if not state.save():
+                    self.log("*** NOT SUBMITTED: no request was rendered, but "
+                             "the empty batch state could not be cleared. "
+                             "No provider request was sent. ***")
+                    self.on_done(self.stats, "batch_state_write_failed")
+                    return
+                state.delete()
+                self._phase_progress("batch", 0, len(eligible),
+                                     state="attention", accepted=0,
+                                     operation="no-renderable")
+                self.log("\n=== NO BATCH REQUESTS SUBMITTED: every eligible "
+                         "document was missing or could not be rendered; no "
+                         "provider classification result was submitted or applied ===")
+                self.on_done(self.stats,
+                             f"batch_no_renderable:{len(eligible)}")
+                return
 
             state.data["phase"] = "primary_pending"
             state.data["primary_submission_complete"] = True
             state.save()
             self.stats["batch_requests"] = n_built
-            self._phase_progress("batch", n_built, len(eligible))
+            self._phase_progress("batch", n_built, len(eligible),
+                                 state="submitted", accepted=n_accepted)
             self.set_progress(total, total)
             n_batches = len(state.batch_ids())
             self.log(f"\n=== BATCH SUBMITTED: {n_built} document(s) in "
@@ -9216,6 +9418,25 @@ class Engine:
             custom_id, system, blocks, max_tokens)
         return request, estimate_request_input_tokens(system, blocks)
 
+    def _followup_progress(self, phase, done, total, *, state="rendering",
+                           operation="", prepared=0, accepted=0):
+        """Aggregate UI facts only; rendering is not provider acceptance."""
+        if phase == "followup_plan":
+            message = (f"Sizing follow-up requests: {done}/{total} candidates checked; "
+                       f"{prepared} requests sized. Nothing submitted by this planning pass.")
+        else:
+            action = "Sending" if state == "submitting" else "Submitted" if state == "submitted" else "Preparing"
+            message = (f"{action} follow-up requests: {done}/{total} remaining requests prepared; "
+                       f"{accepted} accepted overall. Provider processing is separate.")
+        status_callback = getattr(self, "set_status", None)
+        if status_callback:
+            try:
+                status_callback(message)
+            except Exception:
+                pass  # An optional observer must never change processing.
+        self._phase_progress(phase, done, total, state=state,
+                             operation=operation, prepared=prepared, accepted=accepted)
+
     def _submit_followup_batch(self, state: "BatchState", unresolved: list,
                                vocab: str, primary_actual_gbp: float) -> bool:
         """Persist and submit one discounted request per unresolved document.
@@ -9330,20 +9551,27 @@ class Engine:
         # bounded; the planned request IDs and hashes are the durable contract.
         chunk_plan = followup.get("chunk_plan") or []
         if not chunk_plan:
+            self._phase("followup_plan", "Sizing stronger-model follow-up requests")
+            self.log("Preparing the follow-up chunk plan locally; rendering candidates to measure size and cost. No follow-up request is sent by this pass.")
             sized_requests = []
             actual_requests = {}
             input_tokens = 0
-            for custom_id, meta in list(
-                    followup.get("requests", {}).items()):
+            candidates = list(followup.get("requests", {}).items())
+            for index, (custom_id, meta) in enumerate(candidates, 1):
+                self._followup_progress("followup_plan", index - 1, len(candidates),
+                                        operation=f"size:{index}", prepared=len(actual_requests))
                 built_item = self._build_followup_request(
                     followup_api, vocab, custom_id, meta)
-                if built_item is None:
-                    continue
-                request, request_tokens = built_item
-                sized_requests.append((
-                    custom_id, self._serialized_request_bytes(request)))
-                input_tokens += request_tokens
-                actual_requests[custom_id] = meta
+                if built_item is not None:
+                    request, request_tokens = built_item
+                    sized_requests.append((
+                        custom_id, self._serialized_request_bytes(request)))
+                    input_tokens += request_tokens
+                    actual_requests[custom_id] = meta
+                self._followup_progress("followup_plan", index, len(candidates),
+                                        operation=f"sized:{index}", prepared=len(actual_requests))
+            self._followup_progress("followup_plan", len(candidates), len(candidates),
+                                    state="complete", prepared=len(actual_requests))
 
             chunk_plan, oversized = self._partition_followup_request_ids(
                 sized_requests)
@@ -9406,12 +9634,17 @@ class Engine:
             expected_total = primary_actual_gbp + exact_est + finishing + audit
 
         total_planned = sum(len(chunk) for chunk in chunk_plan)
-        self.log(f"Submitting {total_planned} unresolved document(s) to the "
+        self.log(f"Preparing {total_planned} unresolved document(s) for the "
                  f"discounted {followup_api.model_id} follow-up in "
                  f"{len(chunk_plan)} guarded batch chunk(s); expected follow-up "
                  f"cost ~£{exact_est:.2f}, cumulative enabled estimate "
                  f"~£{expected_total:.2f}.")
 
+        self._phase("followup_upload", "Preparing and submitting stronger-model follow-up")
+        remaining_total = sum(str(cid) not in submitted_ids for chunk in chunk_plan for cid in chunk)
+        prepared_now = attempted_now = 0
+        self._followup_progress("followup_upload", 0, remaining_total,
+                                operation="upload:start", accepted=len(submitted_ids))
         for chunk_index, planned_ids in enumerate(chunk_plan, 1):
             remaining_ids = [str(cid) for cid in planned_ids
                              if str(cid) not in submitted_ids]
@@ -9420,15 +9653,23 @@ class Engine:
             built = []
             actual_ids = []
             for custom_id in remaining_ids:
+                attempted_now += 1
+                self._followup_progress("followup_upload", prepared_now, remaining_total,
+                                        operation=f"render:{attempted_now}", accepted=len(submitted_ids))
                 meta = followup.get("requests", {}).get(custom_id) or {}
                 built_item = self._build_followup_request(
                     followup_api, vocab, custom_id, meta)
                 if built_item is None:
                     followup.get("requests", {}).pop(custom_id, None)
+                    self._followup_progress("followup_upload", prepared_now, remaining_total,
+                                            operation=f"skipped:{attempted_now}", accepted=len(submitted_ids))
                     continue
                 request, _request_tokens = built_item
                 built.append(request)
                 actual_ids.append(custom_id)
+                prepared_now += 1
+                self._followup_progress("followup_upload", prepared_now, remaining_total,
+                                        operation=f"built:{attempted_now}", accepted=len(submitted_ids))
             if not built:
                 continue
             payload_bytes = len(json.dumps(
@@ -9468,6 +9709,9 @@ class Engine:
                 raise RuntimeError(
                     "follow-up submission marker could not be persisted; "
                     "no request sent")
+            self._followup_progress("followup_upload", prepared_now, remaining_total,
+                                    state="submitting", operation=f"submit:{chunk_index}",
+                                    accepted=len(submitted_ids))
             try:
                 created = followup_api.submit_batch(built)
                 batch_id = str(created.get("id") or "").strip()
@@ -9500,6 +9744,9 @@ class Engine:
                 raise RuntimeError(
                     "follow-up batch id could not be persisted; automatic retry "
                     "is blocked by the durable started marker")
+            self._followup_progress("followup_upload", prepared_now, remaining_total,
+                                    state="submitted", operation=f"accepted:{chunk_index}",
+                                    accepted=len(submitted_ids))
             self.log(f"  > submitted follow-up chunk "
                      f"{chunk_index}/{len(chunk_plan)} as {batch_id} with "
                      f"{len(built)} request(s) "
@@ -9510,6 +9757,8 @@ class Engine:
             state.data["phase"] = "followup_ended"
             state.data["followup"] = followup
             state.save()
+            self._followup_progress("followup_upload", prepared_now, remaining_total,
+                                    state="complete", accepted=0)
             return False
         followup["phase"] = "pending"
         followup["submitted_ts"] = datetime.datetime.now().isoformat(
@@ -9523,6 +9772,8 @@ class Engine:
                 "batch ids remain protected by per-chunk markers")
         self.stats["followup_requests"] = len(submitted_ids)
         self.stats["followup_batches"] = len(followup.get("batches", []))
+        self._followup_progress("followup_upload", prepared_now, remaining_total,
+                                state="submitted", accepted=len(submitted_ids))
         self.on_done(
             self.stats,
             f"batch_followup_submitted:{len(submitted_ids)}|"
@@ -9772,6 +10023,7 @@ class Engine:
                                else self.poll_batches(state, "primary"))
             results = self._download_batch_results(self.api, primary_batches)
             self.log(f"Downloaded {len(results)} primary result(s).")
+            self.set_status("Checking primary batch answers for required follow-up…")
 
             vocab = self.kb.vocabulary_block()
             parsed_primary = {
@@ -12754,9 +13006,10 @@ class App(tk.Tk):
     def _poll_notifications(self):
         for status in self.notification_service.drain_statuses():
             CONSOLE.add(str(status), "info")
-        if self.dashboard.progress.phase == "audit" and self.dashboard.is_busy():
+        if (self.dashboard.progress.phase in ("audit", "preparing", "scanning", "batch", "followup_plan", "followup_upload")
+                and self.dashboard.is_busy()):
             progress = self.dashboard.progress
-            self._notify("long_wait", phase="audit", wait_seconds=progress.wait_seconds(),
+            self._notify("long_wait", phase=progress.phase, wait_seconds=progress.wait_seconds(),
                          completed=progress.completed, total=progress.total)
         self.after(1000, self._poll_notifications)
 
@@ -12811,7 +13064,8 @@ class App(tk.Tk):
             self._notify("run_complete", workers=stats.get("workers", 0),
                          needs_review=stats.get("audit_needs_review", stats.get("audit_flagged", 0)),
                          cost_gbp=self._last_cost_gbp, audit_status=stats.get("audit_status", "unknown"))
-        elif kind not in ("batch_none", "batch_empty"):
+        elif kind not in ("batch_none", "batch_empty", "batch_none_pending",
+                          "batch_nothing_to_submit"):
             self._notify("blocked", reason="general")
 
     # ---------------- env / settings ----------------
@@ -13395,6 +13649,9 @@ class App(tk.Tk):
         # keeps the window responsive; results are handed back to
         # _start_after_scan on the Tk thread. The scan is CANCELLABLE via the
         # Stop button (which sets self._scan_cancel).
+        # Discard any previous terminal dashboard state before the first
+        # non-structured preflight status is emitted.
+        self.dashboard.reset()
         self._scan_cancel = threading.Event()
         self._scanning = True
         self.pick_btn.configure(state="disabled")
@@ -13975,6 +14232,17 @@ class App(tk.Tk):
                 "Nothing to submit",
                 "Every eligible document is already processed (cached) or was "
                 "skipped. Nothing was sent.")
+        elif kind == "batch_no_renderable":
+            count = payload or "eligible"
+            self.set_status("Batch needs file attention; nothing was sent.")
+            messagebox.showwarning(
+                "No batch requests submitted",
+                f"No provider request was accepted. {count} eligible document(s) "
+                "were missing or could not be rendered.\n\n"
+                "No provider batch/classification result was submitted or "
+                "applied. Preparation changes, if any, remain. There is no "
+                "submitted provider batch to check or apply. Restore or repair "
+                "the documents, then start the batch again.")
         else:  # batch_submit_failed / batch_apply_failed
             self.set_status("Batch operation failed.")
             messagebox.showerror(

@@ -135,6 +135,151 @@ class TestCompactDashboard(unittest.TestCase):
         self.dashboard.finish({}, "batch_applied")
         self.assertEqual(self.dashboard.state_label.cget("text"), "Complete")
 
+    def test_structured_batch_scan_phase_survives_legacy_status_and_fits(self):
+        self.dashboard.activity_event({"kind": "run_progress", "phase": "scanning",
+            "state": "orienting", "completed": 4, "total": 5, "documents": 1234,
+            "operation": "orientation:1234"})
+        self.dashboard.status_changed("Scanning documents for the batch…")
+        self.assertEqual(self.dashboard.phase_label.cget("text"), "Scanning documents · local orientation preflight")
+        self.assertEqual(self.dashboard.state_label.cget("text"), "Local orientation check")
+        self.dashboard.activity_event({"kind": "run_progress", "phase": "scanning",
+            "state": "limited", "completed": 4, "total": 5, "documents": 1234})
+        for width, height in ((1180, 760), (1000, 640)):
+            for preview in (False, True):
+                with self.subTest(size=(width, height), preview=preview):
+                    self.size(width, height)
+                    self.dashboard.set_preview_visible(preview)
+                    self.app.update_idletasks()
+                    for widget in (self.dashboard.progress_label, self.dashboard.review_btn,
+                                   self.dashboard.learning_btn, self.app.stop_btn):
+                        self.assert_visible_fitted(widget)
+        self.assertEqual(float(self.app.progress["value"]), 4)
+        self.assertEqual(float(self.app.progress["maximum"]), 5)
+
+    def test_zero_renderable_batch_is_attention_not_provider_wait(self):
+        self.dashboard.activity_event({"kind": "run_progress", "phase": "batch",
+            "state": "attention", "completed": 0, "total": 5, "accepted": 0,
+            "operation": "no-renderable"})
+        self.assertEqual(self.dashboard.phase_label.cget("text"), "Batch preparation needs attention")
+        self.assertEqual(self.dashboard.state_label.cget("text"), "Needs attention · nothing sent")
+        self.assertIn("No provider batch/classification result was submitted or applied",
+                      self.dashboard.wait_label.cget("text"))
+
+    def test_terminal_finish_survives_queued_status_after_active_progress(self):
+        active = {"kind": "run_progress", "phase": "batch", "state": "rendering",
+                  "completed": 2, "total": 5, "operation": "render:2"}
+        for status, expected in (
+                ("stopped", "Stopped"),
+                ("batch_error:synthetic", "Needs attention"),
+                ("batch_ambiguous:synthetic", "Needs attention"),
+                ("batch_limit:synthetic", "Needs attention")):
+            with self.subTest(status=status):
+                self.dashboard.activity_event(active)
+                self.dashboard.finish({}, status)
+                self.dashboard.status_changed("Final status after queued callback")
+                self.assertEqual(self.dashboard.state_label.cget("text"), expected)
+                self.assertNotIn("since last progress", self.dashboard.wait_label.cget("text"))
+
+        self.dashboard.activity_event({"kind": "run_progress", "phase": "batch",
+                                       "state": "attention", "completed": 0, "total": 5,
+                                       "operation": "no-renderable"})
+        self.dashboard.finish({}, "batch_no_renderable:5")
+        self.dashboard.status_changed("Nothing renderable; retry after repair")
+        self.assertEqual(self.dashboard.state_label.cget("text"), "Needs attention · nothing sent")
+        self.assertIn("No provider batch/classification result was submitted or applied",
+                      self.dashboard.wait_label.cget("text"))
+
+        self.app.worker_thread = types.SimpleNamespace(is_alive=lambda: True)
+        self.dashboard.activity_event(active)
+        self.dashboard.status_changed("Rendering next request")
+        self.assertEqual(self.dashboard.state_label.cget("text"), "Rendering")
+        self.assertIn("since last progress", self.dashboard.wait_label.cget("text"))
+        self.app.worker_thread = None
+        self.dashboard.activity_event({"kind": "run_progress", "phase": "batch",
+                                       "state": "submitted", "completed": 5, "total": 5,
+                                       "accepted": 5})
+        self.dashboard.finish({}, "batch_submitted:5|3|synthetic")
+        self.dashboard.status_changed("Provider is processing the accepted batch")
+        self.assertEqual(self.dashboard.state_label.cget("text"), "Accepted · processing pending")
+        self.assertIn("still need provider processing", self.dashboard.wait_label.cget("text"))
+
+        self.dashboard.activity_event(active)
+        self.dashboard.finish({}, "batch_applied")
+        self.dashboard.status_changed("Accepted results were applied")
+        self.assertEqual(self.dashboard.state_label.cget("text"), "Phase complete")
+        self.assertNotIn("since last progress", self.dashboard.wait_label.cget("text"))
+
+        for status, expected_wait in (
+                ("batch_nothing_to_submit", "Local scanning finished"),
+                ("batch_none_pending", "Batch preparation finished")):
+            with self.subTest(status=status):
+                phase = "scanning" if status == "batch_nothing_to_submit" else "batch"
+                self.dashboard.activity_event({"kind": "run_progress", "phase": phase,
+                                               "state": "rendering", "completed": 2,
+                                               "total": 5, "operation": "render:2"})
+                self.dashboard.finish({}, status)
+                self.dashboard.status_changed("Benign final status")
+                self.assertEqual(self.dashboard.state_label.cget("text"), "Phase complete")
+                self.assertIn(expected_wait, self.dashboard.wait_label.cget("text"))
+                self.assertNotIn("provider work may still exist", self.dashboard.wait_label.cget("text"))
+
+        for status, expected in (
+                ("batch_none_pending", "No pending batch"),
+                ("batch_nothing_to_submit", "Nothing to submit"),
+                ("batch_pending", "Waiting for provider"),
+                ("batch_submitted:5|3|synthetic", "Waiting for provider"),
+                ("stopped", "Stopped"),
+                ("batch_error:synthetic", "Needs attention"),
+                ("batch_applied", "Complete")):
+            with self.subTest(nonstructured=status):
+                self.dashboard.reset()
+                self.dashboard.finish({}, status)
+                self.dashboard.status_changed("Benign final status")
+                self.assertFalse(self.dashboard.structured_progress)
+                self.assertEqual(self.dashboard.state_label.cget("text"), expected)
+                self.assertEqual(self.dashboard.wait_label.cget("text"), "Benign final status")
+                self.app._scanning = True
+                self.dashboard.status_changed("Scanning input folders")
+                self.assertEqual(self.dashboard.state_label.cget("text"), "Working")
+                self.app._scanning = False
+
+        self.dashboard.activity_event({"kind": "run_progress", "phase": "scanning",
+                                       "state": "rendering", "completed": 2, "total": 5,
+                                       "operation": "render:2"})
+        self.dashboard.finish({}, "batch_nothing_to_submit")
+        self.dashboard.status_changed("Nothing to submit")
+        self.dashboard.reset()
+        self.app._scanning = True
+        self.dashboard.status_changed("Scanning folder (no API calls yet)")
+        self.assertEqual(self.dashboard.state_label.cget("text"), "Working")
+        self.app._scanning = False
+
+    def test_followup_planning_and_upload_are_not_download_or_processing_complete(self):
+        self.dashboard.activity_event({"kind": "run_progress", "phase": "followup_plan",
+            "state": "rendering", "completed": 74, "total": 180, "prepared": 70, "operation": "size:75"})
+        self.dashboard.status_changed("Sizing follow-up requests: 74/180 candidates checked.")
+        self.assertEqual(self.dashboard.phase_label.cget("text"), "Planning stronger-model follow-up")
+        self.assertIn("70 requests sized, not submitted", self.dashboard.progress_label.cget("text"))
+        self.dashboard.activity_event({"kind": "run_progress", "phase": "followup_upload",
+            "state": "submitting", "completed": 35, "total": 80, "accepted": 100, "operation": "submit:3"})
+        self.dashboard.status_changed("Sending follow-up requests…")
+        self.assertEqual(self.dashboard.phase_label.cget("text"), "Submitting stronger-model follow-up")
+        self.assertIn("35 of 80 remaining requests prepared", self.dashboard.progress_label.cget("text"))
+        self.assertIn("100 accepted overall", self.dashboard.progress_label.cget("text"))
+        for width, height in ((1180, 760), (1000, 640)):
+            for preview in (False, True):
+                with self.subTest(size=(width, height), preview=preview):
+                    self.size(width, height)
+                    self.dashboard.set_preview_visible(preview)
+                    self.app.update_idletasks()
+                    for widget in (self.dashboard.progress_label, self.dashboard.phase_label,
+                                   self.dashboard.review_btn, self.dashboard.learning_btn, self.app.stop_btn):
+                        self.assert_visible_fitted(widget)
+        self.dashboard.activity_event({"kind": "run_progress", "phase": "followup_upload",
+            "state": "submitted", "completed": 35, "total": 80, "accepted": 135})
+        self.assertEqual(self.dashboard.state_label.cget("text"), "Accepted · processing pending")
+        self.assertIn("still need provider processing", self.dashboard.wait_label.cget("text"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,10 +6,10 @@
 #  Prerequisite: .\setup.ps1 has been run once (installs pymupdf/pillow/
 #  onnxruntime/openpyxl/keyring).
 #
-#  This builds the APP ONLY. To build the end-user installer (app + API key +
-#  LibreOffice + guides/tools payload) see build\installer\build_installer.py -
-#  that one needs Inno Setup and an API key, and its output must NOT be
-#  published to GitHub because the key is compiled into it.
+#  This builds the APP ONLY. For the credential-free public end-user installer,
+#  run build\build_public_installer.ps1 after building the current user guide.
+#  The separate private build\installer\build_installer.py embeds an API key;
+#  never use its output for a public release or publish it to GitHub.
 # ============================================================================
 $ErrorActionPreference = "Stop"
 $repo = Split-Path $PSScriptRoot -Parent

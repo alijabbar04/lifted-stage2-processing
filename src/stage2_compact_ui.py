@@ -73,6 +73,7 @@ class CompactDashboard:
         self._home_full_name = "No care home selected"
         self._closed = False
         self.structured_progress = False
+        self._terminal_status = ""
         self._build_styles()
         self._build()
         app.bind("<Destroy>", self._destroyed, add="+")
@@ -180,7 +181,8 @@ class CompactDashboard:
         app.progress.pack(fill="both", expand=True)
         meta = tk.Frame(body, bg=BG)
         meta.pack(fill="x")
-        self.progress_label = label(meta, "Choose a care-home folder to begin", dim=True, size=9, anchor="w")
+        self.progress_label = label(meta, "Choose a care-home folder to begin", dim=True, size=9,
+                                    anchor="w", justify="left", wraplength=680)
         self.progress_label.pack(side="left")
         self.eta_label = label(meta, "", dim=True, size=9, anchor="e")
         self.eta_label.pack(side="right")
@@ -304,6 +306,7 @@ class CompactDashboard:
         available = max(250, self.app.winfo_width() - (365 if self._preview_on else 90))
         self.app.preview_name.configure(wraplength=max(200, available - 155))
         self.wait_label.configure(wraplength=available)
+        self.progress_label.configure(wraplength=max(250, self.app.winfo_width()-320))
         self.app.status_lbl.configure(wraplength=max(250, self.app.winfo_width()-60))
         self.app.banner.configure(wraplength=max(250, self.app.winfo_width()-60))
         self._fit_home_name()
@@ -373,10 +376,20 @@ class CompactDashboard:
 
     def activity_event(self, event):
         if event.get("kind") == "run_progress":
+            self._terminal_status = ""
             self.structured_progress = True
             self.progress.observe(event)
             titles = {"preparing":"Preparing worker folders", "batch":"Preparing batch requests",
+                      "scanning":"Scanning documents · local orientation preflight",
+                      "followup_plan":"Planning stronger-model follow-up",
+                      "followup_upload":"Preparing stronger-model follow-up",
                       "recovery":"Recovering primary submission", "processing":"Document processing"}
+            if self.progress.phase == "batch" and self.progress.state in ("submitting", "submitted"):
+                titles["batch"] = "Submitting batch requests"
+            elif self.progress.phase == "batch" and self.progress.state == "attention":
+                titles["batch"] = "Batch preparation needs attention"
+            if self.progress.phase == "followup_upload" and self.progress.state in ("submitting", "submitted"):
+                titles["followup_upload"] = "Submitting stronger-model follow-up"
             self.phase_label.configure(text=titles.get(self.progress.phase, "Document processing"))
             self.app.progress.configure(mode="determinate", maximum=max(self.progress.total, 1), value=self.progress.completed)
             self.state_label.configure(text="Working")
@@ -410,6 +423,35 @@ class CompactDashboard:
         state = self.progress
         self.progress_label.configure(text=state.caption())
         if state.phase != "audit":
+            if state.phase in ("preparing", "scanning", "batch", "followup_plan", "followup_upload"):
+                labels = {"running":"Preparing", "scanning":"Scanning", "orienting":"Local orientation check",
+                          "rendering":"Rendering", "submitting":"Sending to provider",
+                          "submitted":"Accepted · processing pending", "complete":"Phase complete",
+                          "stopped":"Stopped", "failed":"Needs attention",
+                          "limited":"Configured scan limit reached",
+                          "attention":"Needs attention · nothing sent"}
+                self.state_label.configure(text=labels.get(state.state, "Working"))
+                if state.state in ("running", "scanning", "orienting", "rendering", "submitting"):
+                    self.wait_label.configure(text=f"Current operation · {concise_duration(state.wait_seconds())} since last progress")
+                elif state.state == "submitted":
+                    self.wait_label.configure(text="Accepted requests still need provider processing, result application and any enabled audit.")
+                elif state.state == "attention":
+                    self.wait_label.configure(text="No provider batch/classification result was submitted or applied. Preparation changes, if any, remain; repair or restore documents, then retry.")
+                elif state.state == "stopped":
+                    self.wait_label.configure(text="Local work has stopped; a request already sent may still finish. Check saved batch status before retrying.")
+                elif state.state == "failed":
+                    self.wait_label.configure(text="Local work ended with an issue. Submitted provider work may still exist; check saved status and activity before retrying.")
+                elif state.phase == "preparing":
+                    self.wait_label.configure(text="Preparation passes finished, including skips. Check the activity log for conversion failures.")
+                elif state.phase == "followup_plan":
+                    self.wait_label.configure(text="Sizing pass finished. Payloads are rebuilt for submission; no follow-up requests were sent by the sizing pass.")
+                elif state.phase == "followup_upload":
+                    self.wait_label.configure(text="No new follow-up requests could be submitted. Primary results are retained for the normal apply path.")
+                elif state.phase == "batch":
+                    self.wait_label.configure(text="Batch preparation finished. Check saved batch status before starting another batch.")
+                else:
+                    self.wait_label.configure(text="Local scanning finished for this run's selected scope; this is not the post-run accuracy audit.")
+                self.eta_label.configure(text="Time remaining unavailable" if state.wait_seconds() else "")
             return
         labels = {"started":"Starting", "checking":"Checking", "adjudicating":"Second opinion",
                   "document_done":"Checking", "writing_report":"Saving report", "complete":"Complete",
@@ -439,6 +481,7 @@ class CompactDashboard:
     def reset(self):
         self.progress = PhaseProgress()
         self.structured_progress = False
+        self._terminal_status = ""
         self._audit_path, self._preview_path = "", ""
         self._preview_generation += 1
         self.review_var.set("—")
@@ -463,11 +506,24 @@ class CompactDashboard:
     def status_changed(self, msg):
         if self.progress.phase != "audit":
             self.wait_label.configure(text=msg)
-            if "scan" in msg.lower():
-                self.phase_label.configure(text="Checking input folders")
-            elif "batch" in msg.lower():
-                self.phase_label.configure(text="Batch processing")
-            self.state_label.configure(text="Working" if self.is_busy() else "Idle")
+            if getattr(self, "_terminal_status", ""):
+                if self.is_busy():
+                    # A new preflight scan starts before its structured event;
+                    # do not let an old terminal outcome hide it.
+                    self._terminal_status = ""
+                else:
+                    self.add_activity(msg)
+                    return
+            if self.structured_progress and self.progress.phase in ("preparing", "scanning", "batch", "followup_plan", "followup_upload"):
+                # Structured phase facts outrank broad keyword guesses. The
+                # detailed message is still retained in the activity log.
+                self.refresh_progress()
+            else:
+                if "scan" in msg.lower():
+                    self.phase_label.configure(text="Checking input folders")
+                elif "batch" in msg.lower():
+                    self.phase_label.configure(text="Batch processing")
+                self.state_label.configure(text="Working" if self.is_busy() else "Idle")
         self.add_activity(msg)
 
     def is_busy(self):
@@ -492,6 +548,37 @@ class CompactDashboard:
             self.refresh_progress()
         else:
             kind = str(status or "").partition(":")[0]
+            if (self.structured_progress and self.progress.phase in
+                    ("preparing", "scanning", "batch", "followup_plan", "followup_upload")):
+                # _done_main() finishes first, then a queued set_status() can
+                # arrive.  Seal the structured state so that callback cannot
+                # redraw the final UI as the previous active operation.
+                if self.progress.state == "attention":
+                    # The zero-renderable path is deliberately retryable, not
+                    # a provider wait or a generic failure.
+                    self.refresh_progress()
+                    return
+                if kind in ("batch_submitted", "batch_followup_submitted", "batch_pending"):
+                    if self.progress.state != "submitted":
+                        self.progress.observe({"phase": self.progress.phase,
+                                               "state": "submitted"})
+                elif kind in ("", "batch_applied", "batch_audit_complete", "batch_none", "batch_empty",
+                              "batch_none_pending", "batch_nothing_to_submit"):
+                    self.progress.observe({"phase": self.progress.phase,
+                                           "state": "complete"})
+                elif kind == "stopped":
+                    self.progress.observe({"phase": self.progress.phase,
+                                           "state": "stopped"})
+                else:
+                    # Errors, limits and ambiguous provider outcomes require
+                    # attention, but must never inherit an active wait timer.
+                    self.progress.observe({"phase": self.progress.phase,
+                                           "state": "failed"})
+                self.refresh_progress()
+                return
+            # _done_batch queues set_status after every terminal finish.
+            # Preserve the final label while idle; release it for new work.
+            self._terminal_status = kind or "complete"
             if kind in ("batch_submitted", "batch_followup_submitted", "batch_pending"):
                 self.state_label.configure(text="Waiting for provider")
                 self.phase_label.configure(text="Batch processing")
@@ -499,8 +586,12 @@ class CompactDashboard:
                 self.state_label.configure(text="Complete")
             elif kind == "stopped":
                 self.state_label.configure(text="Stopped")
-            elif kind in ("batch_none", "batch_empty"):
+            elif kind in ("batch_none", "batch_empty", "batch_none_pending"):
                 self.state_label.configure(text="No pending batch")
+                self._terminal_status = kind
+            elif kind == "batch_nothing_to_submit":
+                self.state_label.configure(text="Nothing to submit")
+                self._terminal_status = kind
             else:
                 self.state_label.configure(text="Needs attention")
 
@@ -527,7 +618,7 @@ class CompactDashboard:
             return
         self.refresh_context()
         self._sync_banner()
-        if self.progress.phase == "audit":
+        if self.progress.phase == "audit" or (self.is_busy() and self.progress.phase in ("preparing", "scanning", "batch", "followup_plan", "followup_upload")):
             self.refresh_progress()
         busy = self.is_busy()
         self.review_btn.configure(state="disabled" if busy else "normal")

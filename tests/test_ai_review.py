@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ai_review as review
+from _pdf_fixtures import corrupt_pdf_bytes, encrypted_pdf_bytes, pdf_bytes
 
 
 class Fixture:
@@ -24,10 +26,12 @@ class Fixture:
         self.request = self.base / "request"
         self.request.mkdir()
 
-    def file(self, rel, data=None):
+    def file(self, rel, data=None, pages=1):
+        # real parseable PDFs: claimed page evidence is validated against the
+        # exact bytes, so a text stand-in would be rejected as unreadable
         path = self.documents / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data or ("synthetic " + rel).encode())
+        path.write_bytes(data if data is not None else pdf_bytes("synthetic " + rel, pages))
         return path
 
     def prepare(self, candidate, confidence=95, suffix="csv"):
@@ -369,6 +373,10 @@ class TestAIReview(unittest.TestCase):
             with self.subTest(choice=choice), tempfile.TemporaryDirectory() as temp:
                 f, decisions = self.ranking_fixture(temp)
                 decisions["decisions"][0]["decision"] = choice
+                if choice == "keep":
+                    # a keep may only restate the retained type; approving the
+                    # rename target here would be contradictory intent
+                    decisions["decisions"][0].pop("approved_type")
                 before = {row["path"]: row["sha256"] for row in f.queue["inventory"]}
                 f.plan(decisions)
                 result = review.finalize_review(f.plan_path)
@@ -420,6 +428,100 @@ class TestAIReview(unittest.TestCase):
                 with self.assertRaisesRegex(review.ReviewError, "writer lock"):
                     review.finalize_review(f.plan_path)
             self.assertFalse((f.request / "REVIEW_TRANSACTION.json").exists())
+
+    def test_keep_approving_a_different_type_is_contradictory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f, decisions = self.ranking_fixture(temp)
+            decisions["decisions"][0].update(decision="keep", approved_type="DBS Document")
+            decisions["peer_reviews"] = []
+            with self.assertRaisesRegex(review.ReviewError, "contradictory intent"):
+                f.plan(decisions)
+            # a keep restating the document's CURRENT type stays supported
+            decisions["decisions"][0]["approved_type"] = "Other - Unknown"
+            self.assertEqual(f.plan(decisions)["operations"], [])
+
+    def test_peer_with_mismatched_type_or_unsettled_decision_is_rejected(self):
+        cases = ((dict(approved_type="Other - Whistleblowing Policy"), "cannot be ranked"),
+                 (dict(assessed_type="Employee Handbook"), "cannot be ranked"),
+                 (dict(decision="defer"), "not settled evidence"))
+        for update, message in cases:
+            with self.subTest(**update), tempfile.TemporaryDirectory() as temp:
+                f, decisions = self.ranking_fixture(temp)
+                decisions["peer_reviews"][0].update(update)
+                with self.assertRaisesRegex(review.ReviewError, message):
+                    f.plan(decisions)
+        with tempfile.TemporaryDirectory() as temp:
+            # matching peer semantics remain accepted, never silently ignored
+            f, decisions = self.ranking_fixture(temp)
+            for row in decisions["peer_reviews"]:
+                row.update(approved_type="DBS Document", decision="keep")
+            self.assertEqual(len(f.plan(decisions)["operations"]), 2)
+
+    def test_page_references_beyond_actual_page_count_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f, decisions = self.ranking_fixture(temp)
+            decisions["decisions"][0]["pages_examined"] = [2]
+            with self.assertRaisesRegex(review.ReviewError, "only 1 page"):
+                f.plan(decisions)
+        with tempfile.TemporaryDirectory() as temp:
+            f, decisions = self.ranking_fixture(temp)
+            decisions["peer_reviews"][0]["pages_examined"] = [1, 2]
+            with self.assertRaisesRegex(review.ReviewError, "only 1 page"):
+                f.plan(decisions)
+        with tempfile.TemporaryDirectory() as temp:
+            # keep decisions claim page evidence too and get the same bound
+            f, decisions = self.ranking_fixture(temp)
+            decisions["decisions"][0].update(decision="keep", pages_examined=[2])
+            decisions["peer_reviews"] = []
+            with self.assertRaisesRegex(review.ReviewError, "only 1 page"):
+                f.plan(decisions)
+        with tempfile.TemporaryDirectory() as temp:
+            # in-range references against real two-page bytes stay accepted
+            f = Fixture(temp)
+            f.file("Worker/Overwrite Documents/DBS Document.pdf", pages=2)
+            incoming = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf", pages=2)
+            f.prepare(incoming)
+            decisions = f.decisions()
+            decisions["decisions"][0]["pages_examined"] = [1, 2]
+            for row in decisions["peer_reviews"]:
+                row["pages_examined"] = [1, 2]
+            self.assertEqual(len(f.plan(decisions)["operations"]), 2)
+
+    def test_duplicate_page_references_do_not_inflate_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f, decisions = self.ranking_fixture(temp)
+            decisions["decisions"][0]["pages_examined"] = [1, 1]
+            with self.assertRaisesRegex(review.ReviewError, "Duplicate page references"):
+                f.plan(decisions)
+
+    def test_encrypted_and_corrupt_evidence_block_non_defer_but_allow_defer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = Fixture(temp)
+            f.file("Worker/Overwrite Documents/DBS Document.pdf")
+            incoming = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf",
+                              data=encrypted_pdf_bytes())
+            f.prepare(incoming)
+            decisions = f.decisions()
+            with self.assertRaisesRegex(review.ReviewError, "cannot be verified"):
+                f.plan(decisions)
+            # unreadable evidence never acquires a default count or score:
+            # the honest defer needs no page claim and moves nothing
+            decisions["decisions"][0] = {
+                "candidate_id": decisions["decisions"][0]["candidate_id"],
+                "decision": "defer",
+                "review_notes": "Encrypted; content cannot be read",
+                "evidence_summary": "Encrypted PDF could not be decrypted"}
+            decisions["peer_reviews"] = []
+            self.assertEqual(f.plan(decisions)["operations"], [])
+        with tempfile.TemporaryDirectory() as temp:
+            # a required ranking peer that cannot be verified blocks the family
+            f = Fixture(temp)
+            f.file("Worker/Overwrite Documents/DBS Document.pdf",
+                   data=corrupt_pdf_bytes())
+            incoming = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf")
+            f.prepare(incoming)
+            with self.assertRaisesRegex(review.ReviewError, "cannot be verified"):
+                f.plan(f.decisions())
 
 
 if __name__ == "__main__":

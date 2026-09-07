@@ -2,6 +2,7 @@
 
 No open-source licence has been selected for the Stage 2 application source or
 executables. The owner explicitly authorized the v1.4.0 source and binary release.
+The owner also authorized the v1.4.1 maintenance source and binary update.
 Publication does not add a new application licence or alter third-party terms.
 Contact the repository owner for application reuse/distribution permissions.
 

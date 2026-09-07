@@ -334,6 +334,71 @@ def evidence_checked(item):
     pages = item.get("pages_examined")
     if not isinstance(pages, list) or not pages or any(type(p) is not int or p < 1 for p in pages):
         raise ReviewError("Actual one-based page references are required")
+    if len(set(pages)) != len(pages):
+        raise ReviewError("Duplicate page references do not increase inspected coverage")
+
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".tif", ".webp"}
+
+
+def page_reference_limit(path):
+    """Upper bound for claimed one-based page references, read from the exact
+    bytes the verified inventory hash covers. Returns (limit, status): an
+    integer limit with status 'ok' for parseable PDFs and single images,
+    (None, 'unvalidated') for formats whose pagination cannot be established
+    from bytes (no fictional one-page count), and (None, 'encrypted') /
+    (None, 'unreadable') for evidence that cannot be verified at all. A
+    parseable page count is an upper-bound plausibility check only - it never
+    proves a page was rendered, legible or actually inspected."""
+    path = Path(path)
+    suffix = path.suffix.casefold()
+    if suffix in IMAGE_EXTENSIONS:
+        try:
+            from PIL import Image
+            with Image.open(path) as parsed:
+                parsed.load()
+            return 1, "ok"
+        except ImportError:
+            try:
+                import fitz
+                with fitz.open(str(path)) as parsed:
+                    if parsed.page_count != 1:
+                        return None, "unreadable"
+                    parsed[0].get_pixmap()
+                return 1, "ok"
+            except Exception:
+                return None, "unreadable"
+        except Exception:
+            return None, "unreadable"
+    if suffix != ".pdf":
+        return None, "unvalidated"
+    reader = None
+    try:
+        from pypdf import PdfReader as reader
+    except ImportError:
+        pass
+    if reader is not None:
+        try:
+            parsed = reader(str(path))
+            if parsed.is_encrypted:
+                return None, "encrypted"
+            return len(parsed.pages), "ok"
+        except Exception:
+            # PyMuPDF is the renderer used by Stage 2.  A parse failure in
+            # pypdf is not by itself proof that the exact bytes are unreadable.
+            pass
+    try:
+        import fitz
+    except ImportError as exc:
+        raise ReviewError("No supported PDF parser (pypdf or PyMuPDF) is "
+                          "available to validate page evidence") from exc
+    try:
+        with fitz.open(str(path)) as parsed:
+            if parsed.needs_pass:
+                return None, "encrypted"
+            return parsed.page_count, "ok"
+    except Exception:
+        return None, "unreadable"
 
 
 def peer_key(review, kind):
@@ -371,6 +436,23 @@ def build_plan(queue, decisions):
     inventory = {row["path"]: dict(row) for row in queue["inventory"]}
     policy = queue["policy"]
     desired = {path: row["base_type"] for path, row in inventory.items()}
+    documents_root = Path(queue["documents_root"])
+    page_limits = {}
+
+    def checked_pages(rel_path, pages, role):
+        # verify_queue has just re-hashed the inventory, so the bytes parsed
+        # here are exactly the reviewed occurrence. An upper bound only:
+        # in-range references still prove nothing about actual inspection.
+        if rel_path not in page_limits:
+            page_limits[rel_path] = page_reference_limit(documents_root / rel_path)
+        limit, status = page_limits[rel_path]
+        if status in ("encrypted", "unreadable"):
+            raise ReviewError(f"Claimed page evidence for a {role} cannot be verified "
+                              f"against its bytes ({status} PDF); defer the dependent decision: {rel_path}")
+        if limit is not None and max(pages) > limit:
+            raise ReviewError(f"A {role} references page {max(pages)} but the document "
+                              f"has only {limit} page(s): {rel_path}")
+
     changed = set()
     for choice in choices:
         candidate = candidate_map[choice["candidate_id"]]
@@ -381,6 +463,12 @@ def build_plan(queue, decisions):
             if not path:
                 raise ReviewError("A missing/out-of-scope document must be deferred")
             evidence_checked(choice)
+            checked_pages(path, choice["pages_examined"], "candidate decision")
+        if choice["decision"] == "keep":
+            claimed = str(choice.get("approved_type") or "").strip()
+            if claimed and normalized(claimed) != normalized(inventory[path]["base_type"]):
+                raise ReviewError("A keep approving a different type is contradictory intent, "
+                                  f"not a supported action; use rename or defer: {path}")
         if choice["decision"] == "rename":
             kind = canonical(str(choice.get("approved_type") or ""), policy)
             if path in changed:
@@ -407,7 +495,21 @@ def build_plan(queue, decisions):
             if not review or review.get("sha256") != inventory[path]["sha256"]:
                 raise ReviewError("Every affected category peer must be inspected and scored against its exact hash")
             required_peers.add(path)
+            # Peer semantics are binding, never silently ignored: a peer whose
+            # assessed type contradicts this family is a wrong-class member
+            # needing a real candidate correction, and an unresolved peer
+            # blocks the family instead of being ranked anyway.
+            for field in ("assessed_type", "approved_type", "type"):
+                label = str(review.get(field) or "").strip()
+                if label and normalized(label) != normalized(kind):
+                    raise ReviewError(f"A ranking peer assessed as '{label}' cannot be ranked in "
+                                      f"'{kind}'; correct it as a real candidate or defer the dependent decision: {path}")
+            verdict = str(review.get("decision") or "").strip().casefold()
+            if "decision" in review and verdict not in ("keep", "rename"):
+                raise ReviewError(f"A ranking peer marked '{verdict or 'blank'}' is not settled evidence; "
+                                  f"defer the dependent family instead of ranking it: {path}")
             key, date = peer_key(review, kind)
+            checked_pages(path, review["pages_examined"], "ranking peer")
             scored.append((key, path, date))
         scored.sort(key=lambda row: row[0])  # Stable tie order: frozen inventory order.
         for rank, (_key, path, date) in enumerate(scored):

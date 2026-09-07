@@ -14,6 +14,10 @@ class PhaseProgress:
     path: str = ""
     worker: str = ""
     report: str = ""
+    operation: str = ""
+    documents: int = 0
+    accepted: int = 0
+    prepared: int = 0
     started: float = 0.0
     step_started: float = 0.0
     finished: float = 0.0
@@ -29,7 +33,13 @@ class PhaseProgress:
             self.needs_review, self.errors = 0, 0
             self.started, self.step_started, self.finished = now, now, 0.0
             self.path, self.worker, self.report = "", "", ""
-        if state != self.state or event.get("path", self.path) != self.path:
+            self.operation, self.documents, self.accepted = "", 0, 0
+            self.prepared = 0
+        # Measure inactivity of the current operation, not total phase duration.
+        # Repeated UI polls with identical facts must not reset this clock.
+        advanced = int(event.get("completed", self.completed) or 0) > self.completed
+        if (state != self.state or event.get("path", self.path) != self.path
+                or event.get("operation", self.operation) != self.operation or advanced):
             self.step_started = now
         self.state = state
         self.total = max(0, int(event.get("total", self.total) or 0))
@@ -37,10 +47,13 @@ class PhaseProgress:
             int(event.get("completed", self.completed) or 0)))
         self.needs_review = max(0, int(event.get("needs_review", self.needs_review) or 0))
         self.errors = max(0, int(event.get("errors", self.errors) or 0))
-        for key in ("path", "worker", "report"):
+        self.documents = max(self.documents, int(event.get("documents", self.documents) or 0))
+        self.accepted = max(self.accepted, int(event.get("accepted", self.accepted) or 0))
+        self.prepared = max(self.prepared, int(event.get("prepared", self.prepared) or 0))
+        for key in ("path", "worker", "report", "operation"):
             if key in event:
                 setattr(self, key, str(event[key] or ""))
-        if state in ("complete", "stopped", "failed", "skipped"):
+        if state in ("complete", "stopped", "failed", "skipped", "limited", "submitted", "attention"):
             self.finished = now
         return self
 
@@ -49,7 +62,8 @@ class PhaseProgress:
         return 100 * self.completed / self.total if self.total else 0
 
     def wait_seconds(self):
-        if self.state not in ("checking", "adjudicating", "running", "writing_report"):
+        if self.state not in ("checking", "adjudicating", "running", "writing_report",
+                              "scanning", "orienting", "rendering", "submitting"):
             return 0
         return max(0, int(self.clock() - self.step_started))
 
@@ -78,10 +92,28 @@ class PhaseProgress:
             if self.state == "writing_report":
                 return count + " · saving report"
             return count + f" · {self.percent:.0f}%"
+        if self.phase == "followup_plan":
+            return (f"{self.completed:,} of {self.total:,} candidate checks finished"
+                    f" · {self.prepared:,} requests sized, not submitted")
+        if self.phase == "followup_upload":
+            return (f"{self.completed:,} of {self.total:,} remaining requests prepared"
+                    f" · {self.accepted:,} accepted overall")
         if self.total:
-            unit = {"preparing":"worker folders prepared", "batch":"requests prepared",
+            unit = {"preparing":"worker-folder preparation passes finished", "batch":"requests prepared",
+                    "scanning":"worker-folder scan passes finished",
                     "recovery":"documents prepared for recovery"}.get(self.phase, "worker folders checked")
-            return f"{self.completed:,} of {self.total:,} {unit}"
+            count = f"{self.completed:,} of {self.total:,} {unit}"
+            if self.phase == "scanning":
+                count += f" · {self.documents:,} documents encountered"
+                if self.state == "limited":
+                    count += " · file limit reached; remaining folders not fully scanned"
+            elif self.phase == "batch":
+                count += f" · {self.accepted:,} accepted by provider"
+            return count
+        if self.phase == "scanning":
+            return "Scanning documents; total not yet known"
+        if self.phase in ("preparing", "batch"):
+            return "Preparing the next operation; total not yet known"
         return "Choose a care-home folder to begin"
 
 
