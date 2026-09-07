@@ -47,4 +47,8 @@ def test_release_checksum_uses_public_download_filename():
     bootstrap = (ROOT / "install.ps1").read_text(encoding="utf-8")
     assert '"Stage2_Processing.exe" = Join-Path $RepoRoot "dist\\Stage 2 - Processing.exe"' in manifest
     assert '$AppAsset  = "Stage2_Processing.exe"' in bootstrap
-    assert '[regex]::Escape($AppAsset)' in bootstrap
+    # The common verifier validates both public assets by their download names.
+    assert '[regex]::Escape($AssetName)' in bootstrap
+    assert '-AssetPath $DownloadedApp -AssetName $AppAsset' in bootstrap
+    assert '-AssetPath $DownloadedGuide -AssetName $GuideAsset' in bootstrap
+    assert '$GuideAsset = "Stage2_Guide_AI_Processing.pdf"' in bootstrap
