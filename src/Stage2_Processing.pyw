@@ -662,7 +662,20 @@ SEED_IMPORTANT = [
                            "confidentiality undertaking is 'Employee "
                            "Confidentiality Agreement'; a code-of-conduct or "
                            "caregiver-promise acknowledgement is 'Code of "
-                           "Conduct Acknowledgement'."),
+                           "Conduct Acknowledgement'. It is also NOT a "
+                           "SINGLE-SUBJECT policy and procedure document - "
+                           "'Safeguarding Adults Policy and Procedure', 'Lone "
+                           "Working Policy and Procedure', 'Training Policy "
+                           "and Procedure', 'Spot Checks Policy and Procedure' "
+                           "and the like are each 'Other - <their title>' "
+                           "(e.g. 'Other - Lone Working Policy and "
+                           "Procedure'), however many pages they run to, even "
+                           "when they include appendix forms (blank, or filled "
+                           "in where the policy text starts the file - rule "
+                           "18), and even "
+                           "when they end with an e-signature / signing-"
+                           "certificate page: a signing certificate or a blank "
+                           "form does not turn one policy into the handbook."),
     ("Employment Application Form", "A job APPLICATION FORM with multiple "
                            "sections - personal details, application questions, "
                            "declarations, and often an employment-history part. "
@@ -829,7 +842,15 @@ SEED_IMPORTANT = [
                          "self-assessment form, an appraisal preparation form, "
                          "an induction checklist or sign-off, a supervision "
                          "record ('Supervision'), and a sickness/absence report "
-                         "are each their own document. It is also NOT 'DBS "
+                         "are each their own document; so are a disciplinary "
+                         "outcome / written-warning letter ('Other - "
+                         "Disciplinary Warning Letter') and a new-starter "
+                         "shadowing / orientation checklist ('Other - "
+                         "Shadowing Checklist'). The HEADING alone does not "
+                         "decide it either way: a form headed 'Performance "
+                         "Management' whose content explicitly records the "
+                         "probation review or its extension IS still a "
+                         "'Probation Review'. It is also NOT 'DBS "
                          "Check Notes' - probation feedback has nothing to do "
                          "with a DBS check unless the text explicitly discusses "
                          "a DBS/Disclosure/Barring check."),
@@ -991,8 +1012,31 @@ SEED_IMPORTANT = [
                                    "Handbook Receipt'), and NOT a Home Office "
                                    "right-to-work result page ('Share Code Check "
                                    "Result')."),
-    ("Spot Check", "Spot check form, observations, compliance review"),
-    ("Supervision", "Supervision meeting notes, actions, signatures"),
+    ("Spot Check", "A spot-check record OF THIS WORKER - an observation / "
+                   "compliance-visit form filled in about this worker (the "
+                   "date, the observer, the findings or scores and any "
+                   "actions), usually but not necessarily signed or fully "
+                   "completed: a partly filled or unsigned spot check of this "
+                   "worker is STILL a 'Spot Check' (it ranks lower for "
+                   "completeness), not an Other document. It is NOT the "
+                   "employer's 'Spot Checks Policy and Procedure' ('Other - "
+                   "Spot Checks Policy and Procedure', even with an appended "
+                   "blank or filled-in spot-check form when the policy starts "
+                   "the file - rule 18), NOT a new-starter shadowing / "
+                   "induction / orientation checklist ('Other - Shadowing "
+                   "Checklist'), and NOT a medication competency assessment "
+                   "('Other - Medication Administration Competency "
+                   "Assessment')."),
+    ("Supervision", "A supervision meeting RECORD for this worker - a "
+                    "supervision form or meeting notes with discussion points, "
+                    "actions and usually supervisee/supervisor signatures; an "
+                    "unsigned or partly completed supervision record of this "
+                    "worker is STILL 'Supervision' (it ranks lower for "
+                    "completeness). It is NOT the minutes of an investigation, "
+                    "disciplinary or grievance meeting ('Other - Investigation "
+                    "Meeting Minutes'), even when supervision is mentioned in "
+                    "them, and NOT a shadowing / induction checklist ('Other - "
+                    "Shadowing Checklist')."),
     ("Tenancy Agreement Signature Evidence", "Signed tenancy agreement/signature page"),
     ("Term Time Evidence", "Evidence of a worker's STUDENT STATUS and term "
                            "dates - typically a letter or portal printout from a "
@@ -1344,8 +1388,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.5.1"
-APP_BUILD = "2026.09.08-slack1"
+APP_VERSION = "1.5.2"
+APP_BUILD = "2026.09.08-ranking1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -2978,6 +3022,24 @@ DISAMBIGUATION_RULES = (
     "country's name or transport authority printed as the issuer). And if the "
     "document is headed 'INTERNATIONAL DRIVING PERMIT', it is neither: it is "
     "'Driving Permit'.\n"
+    "22. A POLICY PACK IS NEITHER A HANDBOOK NOR A WORKER RECORD. A document "
+    "whose title is one specific policy and procedure (safeguarding, lone "
+    "working, infection control, medication, training, spot checks, "
+    "whistleblowing, ...) is that policy: 'Other - <its title>', e.g. 'Other - "
+    "Lone Working Policy and Procedure'. It is NOT 'Employee Handbook' - that "
+    "name is reserved for the employer's general multi-section staff handbook "
+    "- and an appendix form or a final e-signature / signing-certificate page "
+    "does not make it a 'Spot Check', 'Supervision', 'Probation Review', "
+    "'Training Certificate' or acknowledgement record. Conversely a WORKER "
+    "RECORD is a form about THIS worker that stands alone or STARTS the file "
+    "(a spot-check observation, supervision notes, a probation review): it is "
+    "that record even when some fields are empty or a signature is missing - "
+    "completeness and signatures affect its quality rank, not what it is - "
+    "and policy text it quotes or attaches does not make it the policy. When "
+    "one file holds both a policy and a filled-in form, rule 18(b) decides: "
+    "the complete document that STARTS the file wins, so a full policy "
+    "followed by its filled-in appendix stays 'Other - <policy title>', and a "
+    "filled-in form followed by policy extracts stays the worker record.\n"
 )
 
 
@@ -4052,6 +4114,32 @@ def move_worker_folder(worker_dir: Path, dest_root: Path):
     return target
 
 
+def quality_evidence(answer):
+    """Normalise a stored or fresh quality answer into ranking evidence, or
+    return None when it is NOT an assessment.
+
+    A dict whose score is a number is evidence, including a genuine score of
+    0 (clamped to 0..100 exactly as the API client does). A missing
+    legible/complete flag is a legitimately absent field and reads as False,
+    again as the client normalises it. Anything else - no dict, no numeric
+    score, a bool where the score should be - is an invalid answer, which the
+    second pass treats as unavailable evidence rather than a score of zero."""
+    if not isinstance(answer, dict):
+        return None
+    score = answer.get("score")
+    if score is None or isinstance(score, bool):
+        return None
+    try:
+        score = int(float(score))
+    except (TypeError, ValueError):
+        return None
+    return {"score": max(0, min(100, score)),
+            "legible": bool(answer.get("legible", False)),
+            "complete": bool(answer.get("complete", False)),
+            "date": str(answer.get("date", "") or "").strip(),
+            "note": str(answer.get("note", "") or "").strip()}
+
+
 def parse_date(s: str):
     """Parse a YYYY-MM-DD-ish string to a date; return None on failure."""
     if not s:
@@ -4653,11 +4741,15 @@ LIVE_CHECKPOINT_NAME = ".docreview_live_checkpoint.json"
 def write_live_checkpoint(care_dir: Path, done: int, total: int,
                           current: str, errors: int, finished: bool,
                           auto_review_run_id: str = "", audit_worker_dirs=(),
-                          processing_complete: bool = False):
+                          processing_complete: bool = False,
+                          deferred_workers=()):
     try:
         p = Path(care_dir) / LIVE_CHECKPOINT_NAME
-        _write_hidden_json(p, {
-            "version": 2,
+        # Finishing operations and family state share this checkpoint. Preserve
+        # those durable fields when the positional progress marker advances.
+        saved = read_live_checkpoint(care_dir) or {}
+        saved.update({
+            "version": 3,
             "ts": datetime.datetime.now().isoformat(timespec="seconds"),
             "workers_done": done, "workers_total": total,
             "current_worker": current, "errors": errors,
@@ -4665,7 +4757,9 @@ def write_live_checkpoint(care_dir: Path, done: int, total: int,
             "auto_review_run_id": str(auto_review_run_id or ""),
             "audit_worker_dirs": [str(Path(p).resolve()) for p in audit_worker_dirs],
             "processing_complete": bool(processing_complete),
+            "deferred_workers": [str(name) for name in deferred_workers],
         })
+        _write_hidden_json(p, saved)
         return True
     except Exception:
         return False
@@ -4939,12 +5033,92 @@ class BatchState:
             os.fsync(backup.fileno())
         return target
 
+    def terminal_snapshot(self) -> Path:
+        """Write the complete terminal state before its mutable file is removed.
+
+        Unlike ``recovery_snapshot`` this includes the newly authorised attempt,
+        its result and the final cumulative costs.  The exclusive, timestamped
+        target is the durable receipt; failure leaves the active state in place.
+        """
+        terminal = copy.deepcopy(self.data)
+        terminal["applied"] = True
+        terminal["applied_ts"] = datetime.datetime.now().isoformat(
+            timespec="seconds")
+        target = self.path.with_name(
+            self.path.name + f".terminal-{time.time_ns()}.bak")
+        payload = json.dumps(terminal, indent=2, ensure_ascii=False).encode(
+            "utf-8")
+        with target.open("xb") as backup:
+            backup.write(payload)
+            backup.flush()
+            os.fsync(backup.fileno())
+        return target
+
+    def finalize_applied(self) -> Path:
+        """Take a terminal receipt, then mark and remove mutable state."""
+        target = self.terminal_snapshot()
+        self.data["applied"] = True
+        self.data["applied_ts"] = datetime.datetime.now().isoformat(
+            timespec="seconds")
+        if not self.save():
+            raise DurableStateError(
+                "terminal receipt was saved, but applied state could not be "
+                "persisted; mutable state was retained")
+        self.delete()
+        return target
+
     def delete(self):
         try:
             if self.path.exists():
                 self.path.unlink()
         except Exception:
             traceback.print_exc()
+
+
+class LiveFinishingState(BatchState):
+    """BatchState-compatible finishing state embedded in the live checkpoint."""
+
+    PROGRESS_FIELDS = (
+        "version", "ts", "workers_done", "workers_total", "current_worker",
+        "errors", "finished", "auto_review_run_id", "audit_worker_dirs",
+        "processing_complete", "deferred_workers")
+
+    def __init__(self, care_home_dir: Path):
+        self.dir = Path(care_home_dir)
+        self.path = self.dir / LIVE_CHECKPOINT_NAME
+        self.data = read_live_checkpoint(self.dir) or {}
+
+    def _merge_latest_progress(self):
+        """Keep progress written by `write_live_checkpoint` beside this object.
+
+        Live finishing operations, costs and worker records are mutated through
+        this long-lived object, while positional progress/review scope is written
+        by the checkpoint helper using a separately loaded dict. Merge the
+        newest helper-owned fields before every semantic save so a later
+        operation/error save cannot roll progress or audit scope backward.
+        """
+        latest = read_live_checkpoint(self.dir) or {}
+        for key in self.PROGRESS_FIELDS:
+            if key in latest:
+                # Update only helper-owned scalar/list fields in place. Active
+                # finishing code retains references to nested worker/operation
+                # dicts, so replacing the top-level mapping would detach those
+                # references and lose a response written later in the call.
+                self.data[key] = copy.deepcopy(latest[key])
+
+    def refresh_progress(self):
+        """Synchronize in-memory progress after a separate checkpoint write."""
+        self._merge_latest_progress()
+
+    def save(self):
+        self._merge_latest_progress()
+        return super().save()
+
+    def save_progress(self, **updates):
+        """Persist intentional progress changes without losing semantic state."""
+        self._merge_latest_progress()
+        self.data.update(copy.deepcopy(updates))
+        return super().save()
 
 
 class BatchWriterBusy(RuntimeError):
@@ -5274,6 +5448,18 @@ def estimate_run_cost_gbp(n_files: int, model_id: str, zoom: float,
         "input_tokens": int(input_tokens),
         "output_tokens": int(output_tokens),
     }
+
+
+def estimate_finishing_operation_gbp(model_id: str, zoom: float) -> float:
+    """Rough live price of ONE second-pass finishing request (a date, signed
+    or quality check), using the run estimate's per-document assumptions.
+    Shown before an explicitly confirmed retry of unresolved finishing
+    operations; real billing uses the API's own token counts."""
+    m = MODELS_BY_ID.get(model_id, {"in": 1.0, "out": 5.0})
+    per_doc_variable = (estimate_image_tokens(zoom) * EST_IMAGES_PER_DOC_FULL
+                        + EST_TEXT_TOKENS_PER_DOC)
+    usd = (per_doc_variable / 1e6) * m["in"] + (80 / 1e6) * m["out"]
+    return usd * FX_RATE[0]
 
 
 def estimate_pipeline_costs_gbp(n_files: int, primary_model_id: str,
@@ -6874,8 +7060,30 @@ class LimitReached(StopRequested):
         self.reason = reason
 
 
+class UnavailableEvidence:
+    """A finishing answer that does not exist: a request that failed, a
+    failed operation replayed from durable state, or an answer that is not
+    an assessment. It is never a value in the ranking comparator; a family
+    holding one is deferred with its names and ranks unchanged."""
+
+    def __init__(self, kind: str, operation_id: str, reason: str,
+                 stored: bool = False):
+        self.kind = kind
+        self.operation_id = operation_id
+        self.reason = reason
+        self.stored = stored   # replayed from an earlier session's state
+
+    def __repr__(self):
+        return f"UnavailableEvidence({self.kind!r}, {self.reason!r})"
+
+
 class FinishingAmbiguous(StopRequested):
     """A live finishing POST may have completed before its result was saved."""
+    pass
+
+
+class FinishingInputChanged(RuntimeError):
+    """Saved finishing authority no longer matches current document bytes."""
     pass
 
 
@@ -6985,6 +7193,9 @@ class Engine:
         self._persisted_live_cost_gbp = 0.0
         self._persisted_live_tokens = 0
         self._batch_state = None
+        self._live_state = None
+        self._authorized_finishing_retries = {}
+        self._finishing_retry_active = False
 
         # persistent processed-file cache (skip unchanged files on re-runs)
         self.manifest = ProcessedManifest(care_home_dir)
@@ -6997,6 +7208,7 @@ class Engine:
                       "cos": 0, "contracts": 0, "rtw": 0, "dbs": 0,
                       "ecs": 0, "brp": 0, "evisa": 0, "ni": 0, "sharecode": 0,
                       "duplicates": 0,
+                      "rank_deferred": 0, "workers_deferred": 0,
                       "converted": 0, "convert_failed": 0,
                       "batches": 0, "overwrite": 0, "bulk": 0, "ranked": 0, "errors": 0, "moved": 0, "skipped_done": 0,
                       "page1_only": 0, "skipped_api": 0,
@@ -7056,8 +7268,13 @@ class Engine:
                       + self.escalation_api.out_tokens)
         return total
 
+    def _finishing_state(self):
+        """The durable state backing finishing calls in batch or live mode."""
+        return (getattr(self, "_batch_state", None)
+                or getattr(self, "_live_state", None))
+
     def _persist_batch_live_cost(self):
-        state = getattr(self, "_batch_state", None)
+        state = self._finishing_state()
         if state is None:
             return
         session_cost = tokens_cost_gbp(
@@ -7079,10 +7296,34 @@ class Engine:
             raise DurableStateError(
                 "could not persist cumulative live finishing cost")
 
+    @staticmethod
+    def _operation_input_hash(operation_id: str):
+        value = str(operation_id or "").rsplit(":", 1)[-1]
+        return value if re.fullmatch(r"[0-9a-fA-F]{64}", value) else ""
+
+    def _validate_operation_input(self, operation_id: str, evidence_path):
+        """Hash-check the evidence immediately before a chargeable request."""
+        if evidence_path is None:
+            return
+        path = Path(evidence_path)
+        expected = self._operation_input_hash(operation_id)
+        if not expected or not path.is_file() or path.is_symlink():
+            raise FinishingInputChanged(
+                f"finishing evidence for '{operation_id}' is unavailable or "
+                "not a regular file")
+        try:
+            actual = file_hash(path)
+        except Exception as exc:
+            raise FinishingInputChanged(
+                f"finishing evidence for '{operation_id}' could not be hashed") from exc
+        if actual.casefold() != expected.casefold():
+            raise FinishingInputChanged(
+                f"finishing evidence changed for '{operation_id}'")
+
     def _finishing_operation(self, worker_dir: Path, operation_id: str,
-                             callback):
+                             callback, evidence_path=None):
         """Run one chargeable finishing operation at most once across restarts."""
-        state = getattr(self, "_batch_state", None)
+        state = self._finishing_state()
         if state is None:
             result = callback()
             self._emit_cost()
@@ -7093,20 +7334,41 @@ class Engine:
                          "source_path": str(worker_dir)})
         operations = worker.setdefault("finishing_operations", {})
         prior = operations.get(operation_id) or {}
-        if prior.get("status") in ("complete", "failed"):
-            return prior.get("result")
+        key = (worker_key, operation_id)
+        if (getattr(self, "_finishing_retry_active", False) and not prior
+                and key not in self._authorized_finishing_retries):
+            raise FinishingInputChanged(
+                f"confirmed retry does not authorize the current operation "
+                f"'{operation_id}'")
         if prior.get("status") == "submission_started":
+            # Never retried, not even by an explicit recovery: the request
+            # may have been accepted and billed without a saved answer.
             raise FinishingAmbiguous(
                 f"finishing operation '{operation_id}' for "
                 f"'{Path(worker_dir).name}' may already have been accepted; "
                 "automatic retry is blocked")
+        retry = self._take_finishing_retry(worker_key, operation_id, prior)
+        if prior.get("status") in ("complete", "failed") and not retry:
+            # Replay the stored outcome; a stored failure replays as None and
+            # is read by the caller as unavailable evidence, never re-bought.
+            return prior.get("result")
+        self._validate_operation_input(operation_id, evidence_path)
         attempt_id = hashlib.sha256(
             f"{time.time_ns()}:{worker_key}:{operation_id}".encode(
                 "utf-8")).hexdigest()[:24]
-        operations[operation_id] = {
+        marker = {
             "status": "submission_started", "attempt_id": attempt_id,
             "started_ts": datetime.datetime.now().isoformat(
                 timespec="seconds")}
+        if retry:
+            # An explicitly confirmed new attempt keeps the earlier attempt's
+            # status, result, error and timestamps as lineage. Nothing is
+            # cleared; the retry is visible in the state for audit.
+            lineage = list(prior.get("attempts") or [])
+            lineage.append({k: v for k, v in prior.items() if k != "attempts"})
+            marker["attempts"] = lineage
+            marker["retry_of"] = prior.get("attempt_id")
+        operations[operation_id] = marker
         worker["finishing_status"] = "in_progress"
         if not state.save():
             raise DurableStateError(
@@ -7141,6 +7403,273 @@ class Engine:
                      + self._session_live_tokens())
         self._check_budget()
         return result
+
+    def _finishing_failure(self, worker_dir: Path, operation_id: str):
+        """The recorded error of a finishing operation that FAILED in an
+        earlier session, or None. `_finishing_operation` replays such an
+        operation's stored result (None) rather than paying for it again, so
+        a caller that receives None can ask here why no answer exists."""
+        state = self._finishing_state()
+        if state is None:
+            return None
+        worker_key = str(Path(worker_dir).resolve()).casefold()
+        worker = (state.data.get("workers") or {}).get(worker_key) or {}
+        prior = (worker.get("finishing_operations") or {}).get(
+            operation_id) or {}
+        if prior.get("status") == "failed":
+            return prior.get("error") or "earlier attempt failed"
+        return None
+
+    def _remaining_finishing_retries(self, worker_dir: Path = None):
+        """Return explicit retry authorizations not consumed by their operation.
+
+        The map is deliberately in-memory: its durable source is the accepted
+        retry record plus the unchanged failed/complete operation in state.  A
+        caller must never cross an organisation/completion boundary while an
+        authorization for that worker remains here.
+        """
+        authorized = getattr(self, "_authorized_finishing_retries", {}) or {}
+        if worker_dir is None:
+            return sorted(authorized)
+        worker_key = str(Path(worker_dir).resolve()).casefold()
+        return sorted((key, operation) for key, operation in authorized
+                      if key == worker_key)
+
+    def _assert_no_unconsumed_finishing_retries(
+            self, worker_dir: Path = None, boundary: str = "completion"):
+        remaining = self._remaining_finishing_retries(worker_dir)
+        if not remaining:
+            return
+        operations = ", ".join(operation for _key, operation in remaining)
+        raise FinishingInputChanged(
+            f"confirmed finishing operation was not consumed before {boundary}: "
+            + operations)
+
+    def _validate_finishing_retry_binding(self, worker_key: str,
+                                          operation_id: str, expected: dict):
+        """Recheck every saved peer for one authorized family without consuming it."""
+        expected_binding = str(expected.get("binding") or "")
+        state = self._finishing_state()
+        worker = ((state.data.get("workers") or {}).get(worker_key) or {}
+                  if state is not None else {})
+        matching = [record for record in
+                    (worker.get("ranking_families") or {}).values()
+                    if record.get("status") == "deferred"
+                    and any(item.get("operation") == operation_id
+                            for item in record.get("unavailable", []))]
+        if not expected_binding or not matching:
+            raise FinishingInputChanged(
+                f"confirmed retry family binding is unavailable for "
+                f"'{operation_id}'")
+        for record in matching:
+            current_binding, _members = self._family_input_binding(worker, record)
+            if current_binding != expected_binding:
+                raise FinishingInputChanged(
+                    f"confirmed retry family changed for '{operation_id}'")
+
+    def _validate_authorized_finishing_inputs(self, worker_dir: Path):
+        """Reject retry input drift before dedup/ranking can mutate the worker."""
+        worker_key = str(Path(worker_dir).resolve()).casefold()
+        authorized = getattr(self, "_authorized_finishing_retries", {}) or {}
+        for (key, operation_id), expected in list(authorized.items()):
+            if key == worker_key:
+                self._validate_finishing_retry_binding(
+                    key, operation_id, expected)
+
+    def _take_finishing_retry(self, worker_key: str, operation_id: str,
+                              prior: dict) -> bool:
+        """Consume an explicitly confirmed retry authorization for exactly
+        this stored attempt (same worker, operation, stored status and attempt
+        id). Ordinary status checks hold no authorizations, so they can never
+        re-buy a failed finishing operation; a submission-started operation is
+        never authorized at all (see `_finishing_operation`)."""
+        authorized = getattr(self, "_authorized_finishing_retries", None)
+        if not authorized:
+            return False
+        key = (worker_key, operation_id)
+        expected = authorized.get(key)
+        if expected is None or prior.get("status") not in ("complete", "failed"):
+            return False
+        if ((expected.get("status"), expected.get("attempt_id")) !=
+                (prior.get("status"), prior.get("attempt_id"))):
+            return False
+        self._validate_finishing_retry_binding(
+            worker_key, operation_id, expected)
+        del authorized[key]
+        return True
+
+    # ---- durable per-family finishing record (batch mode only) ----
+    def _ranking_families(self, worker_dir: Path, create: bool = True):
+        """The worker's durable {family name: record} map, or None when there
+        is no batch state (live mode). A record is 'complete' once a family
+        was dated/ranked so a resumed pass never repeats it, or 'deferred'
+        with the operations whose evidence is unavailable."""
+        state = self._finishing_state()
+        if state is None:
+            return None
+        worker_key = str(Path(worker_dir).resolve()).casefold()
+        workers = state.data.setdefault("workers", {})
+        worker = workers.get(worker_key)
+        if worker is None:
+            if not create:
+                return None
+            worker = workers.setdefault(worker_key, {
+                "name": Path(worker_dir).name,
+                "source_path": str(worker_dir)})
+        return worker.setdefault("ranking_families", {})
+
+    def _save_ranking_family(self, worker_dir: Path, base_name: str,
+                             record: dict):
+        families = self._ranking_families(worker_dir)
+        if families is None:
+            return
+        families[base_name] = record
+        state = self._finishing_state()
+        if state is None or not state.save():
+            raise DurableStateError(
+                f"ranking record for '{base_name}' could not be persisted")
+
+    @staticmethod
+    def _finishing_attention(worker_dir: Path, deferred: list,
+                             previous: dict = None):
+        """Summarise a worker's deferred families for its durable state."""
+        previous = previous or {}
+        operations = []
+        for family in deferred:
+            for item in family.get("unavailable", []):
+                if item.get("operation") and item["operation"] not in operations:
+                    operations.append(item["operation"])
+        return {"families": [family["name"] for family in deferred],
+                "operations": operations,
+                "passes": int(previous.get("passes", 0) or 0) + 1,
+                 "updated_ts": datetime.datetime.now().isoformat(
+                     timespec="seconds")}
+
+    def _finishing_context_error(self, state) -> str:
+        # Model/resolution are included in the token below. Batch fixtures and
+        # legacy states may label the provider differently from the API client,
+        # so equality is not itself evidence of file drift.
+        return ""
+
+    @staticmethod
+    def _family_input_binding(worker: dict, record: dict):
+        """Return a current exact-member digest, or raise on any drift."""
+        root_text = str(worker.get("source_path") or "").strip()
+        members = record.get("members") or []
+        if not root_text or not isinstance(members, list) or not members:
+            raise FinishingInputChanged("saved family membership is incomplete")
+        root = Path(root_text).resolve()
+        bound = []
+        for member in members:
+            if not isinstance(member, dict):
+                raise FinishingInputChanged("saved family member is invalid")
+            text = str(member.get("path") or "").strip()
+            expected = str(member.get("hash") or "").strip().casefold()
+            if not text or not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise FinishingInputChanged("saved family path/hash is incomplete")
+            path = Path(text).resolve()
+            if root != path.parent and root not in path.parents:
+                raise FinishingInputChanged("saved family member is outside its worker")
+            if not path.is_file() or path.is_symlink():
+                raise FinishingInputChanged(
+                    f"saved family member is missing or unsafe: {path.name}")
+            try:
+                actual = file_hash(path).casefold()
+            except Exception as exc:
+                raise FinishingInputChanged(
+                    f"saved family member cannot be hashed: {path.name}") from exc
+            if actual != expected:
+                raise FinishingInputChanged(
+                    f"saved family member changed: {path.name}")
+            bound.append((str(path).casefold(), actual))
+        serial = json.dumps(sorted(bound), separators=(",", ":"))
+        return hashlib.sha256(serial.encode("utf-8")).hexdigest(), bound
+
+    def assess_unresolved_finishing(self, state=None) -> dict:
+        """Read-only. Which finishing operations keep workers deferred, which
+        of them an explicitly confirmed retry may attempt again (stored status
+        'failed', or 'complete' with an answer that was not an assessment),
+        which are blocked for ever (submission started, answer unknown), and
+        what a retry could cost. Touches neither the state file nor the
+        provider. The token binds a confirmation to exactly these attempts."""
+        if state is None:
+            state = BatchState(self.dir)
+        workers_out, retryable, blocked, fresh, changed = [], [], [], [], []
+        context_error = self._finishing_context_error(state)
+        for worker_key, worker in sorted(
+                (state.data.get("workers") or {}).items()):
+            if worker.get("finishing_status") != "deferred":
+                continue
+            families_out = []
+            operations = worker.get("finishing_operations") or {}
+            for family_name, record in sorted(
+                    (worker.get("ranking_families") or {}).items()):
+                if record.get("status") != "deferred":
+                    continue
+                families_out.append(family_name)
+                binding = ""
+                binding_error = context_error
+                if not binding_error:
+                    try:
+                        binding, _members = self._family_input_binding(
+                            worker, record)
+                    except FinishingInputChanged as exc:
+                        binding_error = str(exc)
+                for item in record.get("unavailable", []):
+                    op_id = item.get("operation") or ""
+                    prior = operations.get(op_id) or {}
+                    entry = {"worker": worker.get("name", "?"),
+                             "worker_key": worker_key, "family": family_name,
+                             "operation": op_id, "path": item.get("path", ""),
+                             "reason": item.get("reason", ""),
+                             "status": prior.get("status"),
+                             "attempt_id": prior.get("attempt_id"),
+                             "binding": binding}
+                    if binding_error:
+                        entry["input_error"] = binding_error
+                        changed.append(entry)
+                        continue
+                    if prior.get("status") in ("complete", "failed"):
+                        retryable.append(entry)
+                    elif prior.get("status") == "submission_started":
+                        blocked.append(entry)
+                    else:
+                        fresh.append(entry)   # no stored attempt: any pass asks
+            workers_out.append({"name": worker.get("name", "?"),
+                                "families": families_out})
+        token = ""
+        if retryable:
+            token = hashlib.sha256(json.dumps({
+                "model_id": state.data.get("model_id"),
+                "resolution": state.data.get("resolution"),
+                "operations": sorted((
+                    e["worker_key"], e["family"], e["operation"],
+                    str(e["status"]), str(e["attempt_id"]), e["binding"])
+                    for e in retryable)}, sort_keys=True).encode(
+                        "utf-8")).hexdigest()[:24]
+        model_id = state.data.get("model_id") or self.api.model_id
+        try:
+            zoom = float(state.data.get("resolution") or self.resolution)
+        except Exception:
+            zoom = float(self.resolution)
+        per_op = estimate_finishing_operation_gbp(model_id, zoom)
+        return {"workers": workers_out, "retryable": retryable,
+                "blocked": blocked, "fresh": fresh, "changed": changed,
+                "operations": len(retryable), "token": token,
+                "estimated_extra_gbp": round(per_op * len(retryable), 4)}
+
+    @staticmethod
+    def _attention_payload(assessment: dict, **extra) -> str:
+        payload = {"workers": assessment.get("workers", []),
+                   "operations": int(assessment.get("operations", 0)),
+                   "blocked": len(assessment.get("blocked", [])),
+                   "fresh": len(assessment.get("fresh", [])),
+                   "changed": len(assessment.get("changed", [])),
+                   "token": assessment.get("token", ""),
+                   "estimated_extra_gbp": assessment.get(
+                       "estimated_extra_gbp", 0.0)}
+        payload.update(extra)
+        return json.dumps(payload)
 
     def _check_budget(self):
         """Stop the whole run if the live estimated spend reaches the ceiling."""
@@ -7584,8 +8113,21 @@ class Engine:
             traceback.print_exc()
 
     # ---- run ----
+    def _retain_live_terminal_state(self):
+        """Keep completed retry lineage before a live checkpoint is cleared."""
+        state = getattr(self, "_live_state", None)
+        if state is None or not state.data.get("finishing_retries"):
+            return None
+        terminal = state.terminal_snapshot()
+        state.data["terminal_receipt"] = str(terminal)
+        if not state.save():
+            raise DurableStateError(
+                "live terminal retry receipt could not be recorded; checkpoint "
+                "was retained")
+        return terminal
+
     @_care_home_writer_operation
-    def run(self):
+    def run(self, retry_unresolved: str = None):
         try:
             pending = BatchState(self.dir)
             if pending.exists():
@@ -7595,6 +8137,63 @@ class Engine:
                          "request was made.")
                 self.on_done(self.stats, "live_blocked_by_batch")
                 return
+            live_state = LiveFinishingState(self.dir)
+            checkpoint = live_state.data
+            self._live_state = live_state
+            if not checkpoint.get("processing_complete"):
+                if not checkpoint.get("model_id"):
+                    checkpoint["model_id"] = self.api.model_id
+                if "resolution" not in checkpoint:
+                    checkpoint["resolution"] = float(self.resolution)
+                checkpoint.setdefault("workers", {})
+                checkpoint.setdefault("costs", {})
+                saved_costs = checkpoint.get("costs") or {}
+                self._persisted_live_cost_gbp = float(
+                    saved_costs.get("live_actual_gbp", 0) or 0)
+                self._persisted_live_tokens = int(
+                    saved_costs.get("live_tokens", 0) or 0)
+                existing_attention = self.assess_unresolved_finishing(live_state)
+                if existing_attention.get("changed"):
+                    self.log("*** LIVE RANKING INPUT CHANGED: saved deferred "
+                             "document paths/hashes or run settings no longer "
+                             "match. No request, movement, receipt or audit was "
+                             "started. ***")
+                    self.on_done(self.stats, "live_finishing_attention:"
+                                 + self._attention_payload(existing_attention,
+                                                           stale=True))
+                    return
+                if retry_unresolved:
+                    if (not existing_attention["retryable"]
+                            or existing_attention["token"] != retry_unresolved):
+                        self.log("*** The confirmed live finishing retry no "
+                                 "longer matches saved state; nothing was retried. ***")
+                        self.on_done(self.stats, "live_finishing_attention:"
+                                     + self._attention_payload(
+                                         existing_attention, stale=True))
+                        return
+                    snapshot = live_state.recovery_snapshot()
+                    self._authorized_finishing_retries = {
+                        (item["worker_key"], item["operation"]): {
+                            "status": item["status"],
+                            "attempt_id": item["attempt_id"],
+                            "binding": item["binding"]}
+                        for item in existing_attention["retryable"]}
+                    self._finishing_retry_active = True
+                    checkpoint.setdefault("finishing_retries", []).append({
+                        "ts": datetime.datetime.now().isoformat(
+                            timespec="seconds"),
+                        "token": existing_attention["token"],
+                        "snapshot": str(snapshot),
+                        "estimated_extra_gbp": existing_attention[
+                            "estimated_extra_gbp"],
+                        "operations": [[item["worker_key"], item["operation"],
+                                        item["status"], item["attempt_id"]]
+                                       for item in existing_attention["retryable"]]})
+                    if not live_state.save():
+                        self._authorized_finishing_retries = {}
+                        raise DurableStateError(
+                            "live finishing retry authorization could not be "
+                            "persisted; nothing was retried")
             if getattr(self, "_resume_processing_complete", False):
                 self.log("Live processing is already complete; resuming only "
                          "the saved Accuracy Audit for its original review run.")
@@ -7608,11 +8207,13 @@ class Engine:
                 if audit_receipt.get("status") == "complete":
                     self.stats["audit_status"] = "complete"
                     self.stats["audit_report"] = audit_receipt.get("report_path", "")
+                    self._retain_live_terminal_state()
                     clear_live_checkpoint(self.dir)
                     self.on_done(self.stats, None)
                     return
                 self._run_post_run_audit()
                 if self.stats.get("audit_status") in ("complete", "skipped", "disabled"):
+                    self._retain_live_terminal_state()
                     clear_live_checkpoint(self.dir)
                 self.on_done(self.stats, None)
                 return
@@ -7621,6 +8222,8 @@ class Engine:
             if saved_scope is not None:
                 workers = [worker for worker in workers if worker.name.casefold() in saved_scope]
             if not workers:
+                self._assert_no_unconsumed_finishing_retries(
+                    boundary="empty live worker scope")
                 self.log("No worker sub-folders found in that care-home folder.")
                 self.on_done(self.stats, None)
                 return
@@ -7632,6 +8235,8 @@ class Engine:
                 total = self.max_workers
             TRACKER.reset("live", self.care_home)
             TRACKER.update(workers_total=total)
+            completed_count = 0
+            deferred_names = []
             for idx, w in enumerate(workers[:total], 1):
                 self._check_stop()
                 self._phase_progress("processing", idx - 1, total)
@@ -7646,6 +8251,8 @@ class Engine:
                     self.dir, idx - 1, total, w.name,
                     self.stats.get("errors", 0), False,
                     review_run_id, self._audit_worker_dirs)
+                if checkpoint_saved:
+                    live_state.refresh_progress()
                 if review_run_id and not checkpoint_saved:
                     raise LiveCheckpointWriteError(
                         "The automatic-review live checkpoint could not be saved; "
@@ -7662,8 +8269,52 @@ class Engine:
                 self.set_status(f"Worker {idx}/{total}: {w.name}")
                 self._current_worker = w.name
                 try:
-                    self._process_worker(w)
+                    outcome = self._process_worker(w)
+                    # Defense in depth for any no-document, mocked or future
+                    # early-success return that bypasses `_finish_worker`.
+                    self._assert_no_unconsumed_finishing_retries(
+                        w, "live worker completion")
+                    deferred = (list(outcome.get("deferred") or [])
+                                if isinstance(outcome, dict) else [])
+                    if deferred:
+                        # Unavailable finishing evidence: the worker is not
+                        # complete. Leave it where it is (unmoved, unfiled)
+                        # and outside the audit scope, exactly like a
+                        # worker-level failure. A later ordinary Start replays
+                        # the saved failure for free and offers an explicit
+                        # retry confirmation; it never silently re-purchases.
+                        self.stats["workers_deferred"] = \
+                            self.stats.get("workers_deferred", 0) + 1
+                        deferred_names.append(w.name)
+                        worker_key = str(w.resolve()).casefold()
+                        worker_state = live_state.data.setdefault(
+                            "workers", {}).setdefault(
+                                worker_key, {"name": w.name,
+                                             "source_path": str(w)})
+                        worker_state.update({
+                            "finishing_status": "deferred",
+                            "finishing_attention": self._finishing_attention(
+                                w, deferred,
+                                worker_state.get("finishing_attention")),
+                            "movement_status": "not_ready",
+                            "final_path": str(w), "completed": False})
+                        worker_state.pop("completed_ts", None)
+                        if not live_state.save():
+                            raise DurableStateError(
+                                "live finishing deferral could not be persisted")
+                        self.log(f"  ! {w.name}: {len(deferred)} document "
+                                 f"famil{'y' if len(deferred) == 1 else 'ies'} "
+                                 "without dating/signed/quality evidence - "
+                                 "worker left "
+                                 + ("in source, not moved"
+                                    if self.move_mode else "unorganised")
+                                 + " and outside the audit scope; press Start "
+                                 "to review it, then explicitly confirm any "
+                                 "new paid retry")
+                        self._emit_cost()
+                        continue
                     self.stats["workers"] += 1
+                    completed_count += 1
                     final_dir = w
                     # fully completed -> move the whole subfolder to destination
                     if self.move_mode:
@@ -7682,11 +8333,28 @@ class Engine:
                     if all(str(Path(old).resolve()).casefold() != final_key
                            for old in self._audit_worker_dirs):
                         self._audit_worker_dirs.append(final_dir)
+                    worker_key = str(w.resolve()).casefold()
+                    worker_state = live_state.data.setdefault(
+                        "workers", {}).setdefault(
+                            worker_key, {"name": w.name,
+                                         "source_path": str(w)})
+                    worker_state.update({
+                        "finishing_status": "complete",
+                        "movement_status": ("complete" if final_dir != w
+                                            else "disabled"),
+                        "final_path": str(final_dir), "completed": True,
+                        "completed_ts": datetime.datetime.now().isoformat(
+                            timespec="seconds")})
+                    if not live_state.save():
+                        raise DurableStateError(
+                            "live worker completion could not be persisted")
                     self._record_roster_handover(w, final_dir)
                     checkpoint_saved = write_live_checkpoint(
                         self.dir, idx, total, "",
                         self.stats.get("errors", 0), False,
                         review_run_id, self._audit_worker_dirs)
+                    if checkpoint_saved:
+                        live_state.refresh_progress()
                     if review_run_id and not checkpoint_saved:
                         raise LiveCheckpointWriteError(
                             "The completed worker could not be added to the "
@@ -7695,12 +8363,40 @@ class Engine:
                     raise
                 except LiveCheckpointWriteError:
                     raise
+                except FinishingInputChanged:
+                    # This is an integrity boundary, not a skippable per-worker
+                    # failure. Let the outer handler retain and surface the
+                    # exact incomplete checkpoint before any later worker,
+                    # movement, receipt or audit is attempted.
+                    raise
                 except Exception as e:
                     self.stats["errors"] += 1
                     self.log(f"  ! error on {w.name}: {e} "
                              f"{'(left in source, not moved)' if self.move_mode else ''}")
                     traceback.print_exc()
                 self._emit_cost()
+            self._assert_no_unconsumed_finishing_retries(
+                boundary="final live completion")
+            if deferred_names:
+                checkpoint_saved = write_live_checkpoint(
+                    self.dir, completed_count, total, deferred_names[0],
+                    self.stats.get("errors", 0), False, review_run_id,
+                    self._audit_worker_dirs, processing_complete=False,
+                    deferred_workers=deferred_names)
+                if checkpoint_saved:
+                    live_state.refresh_progress()
+                if not checkpoint_saved:
+                    raise LiveCheckpointWriteError(
+                        "unresolved live finishing state could not be saved")
+                TRACKER.update(workers_done=completed_count,
+                               current_worker=deferred_names[0],
+                               status="ranking needs attention", finished=False,
+                               stats=dict(self.stats))
+                self.manifest.save()
+                attention = self.assess_unresolved_finishing(live_state)
+                self.on_done(self.stats, "live_finishing_attention:"
+                             + self._attention_payload(attention))
+                return
             self._phase_progress("processing", total, total)
             self.set_progress(total, total)
             review_run_id = getattr(self, "_review_run_id", "")
@@ -7717,6 +8413,8 @@ class Engine:
                 self.dir, total, total, "", self.stats.get("errors", 0),
                 False, review_run_id, self._audit_worker_dirs,
                 processing_complete=True)
+            if checkpoint_saved:
+                live_state.refresh_progress()
             if review_run_id and not checkpoint_saved:
                 raise LiveCheckpointWriteError(
                     "Processing completed, but its automatic-review checkpoint "
@@ -7730,6 +8428,7 @@ class Engine:
             # Retain a processing-complete checkpoint while an audit is pending
             # or failed, so Start resumes the exact captured review run.
             if self.stats.get("audit_status") in ("complete", "skipped", "disabled"):
+                self._retain_live_terminal_state()
                 clear_live_checkpoint(self.dir)
             self.on_done(self.stats, None)
         except CreditExhausted as e:
@@ -7765,6 +8464,54 @@ class Engine:
             TRACKER.update(finished=True, status="stopped by user",
                            stats=dict(self.stats))
             self.on_done(self.stats, "stopped")
+        except FinishingInputChanged as e:
+            # A confirmed live retry is allowed to complete only if every
+            # authorized operation was actually reached and consumed. Preserve
+            # the durable retry/attempt/cost state and report attention; never
+            # convert this into the generic per-worker skip/success path.
+            self.manifest.save()
+            self.stats["errors"] += 1
+            state = getattr(self, "_live_state", None)
+            remaining = self._remaining_finishing_retries()
+            names = []
+            if state is not None:
+                checkpoint = state.data
+                for worker_key, _operation in remaining:
+                    worker = (checkpoint.get("workers") or {}).get(worker_key)
+                    if not worker:
+                        continue
+                    name = worker.get("name") or Path(
+                        worker.get("source_path") or "").name or "(unknown)"
+                    if name not in names:
+                        names.append(name)
+                    worker.update({"finishing_status": "deferred",
+                                   "movement_status": "not_ready",
+                                   "completed": False,
+                                   "finishing_input_error": str(e)})
+                    worker.pop("completed_ts", None)
+                checkpoint.pop("processing_completed_ts", None)
+                checkpoint["finishing_input_error"] = {
+                    "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "error": str(e),
+                    "operations": [[key, operation]
+                                   for key, operation in remaining]}
+                if not state.save_progress(
+                        processing_complete=False, deferred_workers=names):
+                    self.log("*** LIVE RETRY INPUT CHANGED, and the updated "
+                             "attention marker could not be saved. The prior "
+                             "checkpoint was retained. ***")
+            self.stats["workers_deferred"] = max(
+                int(self.stats.get("workers_deferred", 0) or 0), len(names) or 1)
+            self.log("*** LIVE RETRY INCOMPLETE: " + str(e)
+                     + ". The checkpoint and prior attempt/cost lineage were "
+                       "retained; nothing was moved, receipted or audited. ***")
+            TRACKER.update(finished=False, status="ranking needs attention",
+                           stats=dict(self.stats))
+            assessment = (self.assess_unresolved_finishing(state)
+                          if state is not None else {})
+            self.on_done(self.stats, "live_finishing_attention:"
+                         + self._attention_payload(
+                             assessment, stale=True, input_error=str(e)))
         except Exception as e:
             self.manifest.save()
             self.log(f"\n! fatal error: {e}")
@@ -7796,6 +8543,8 @@ class Engine:
 
         files = list_worker_docs(worker_dir)
         if not files:
+            self._assert_no_unconsumed_finishing_retries(
+                worker_dir, "no-document live return")
             self.log("  (no documents)")
             return
         self.log(f"  {len(files)} document(s) to review")
@@ -7878,10 +8627,20 @@ class Engine:
                     # still rename to the cached name so the folder ends up tidy
                     cname = cached.get("name") or "Other"
                     cgroup = cached.get("group") or self.kb.group_of(cname) or "Other"
-                    new_path = unique_path(worker_dir, safe_stem(cname), f.suffix)
+                    # A deferred live resume re-enters through this cache path.
+                    # Preserve an existing controlled base/rank spelling; using
+                    # unique_path unconditionally would mint a new suffix before
+                    # the saved family hash/path binding can be replayed.
+                    already_named = (
+                        base_controlled_name(f.stem).strip().casefold()
+                        == str(cname).strip().casefold())
+                    new_path = (f if already_named else
+                                unique_path(worker_dir, safe_stem(cname),
+                                            f.suffix))
                     try:
-                        f.rename(new_path)
-                        self._orientation_move_path(f, new_path)
+                        if new_path != f:
+                            f.rename(new_path)
+                            self._orientation_move_path(f, new_path)
                         renamed_records.append({"path": new_path, "name": cname,
                                                 "group": cgroup, "original": f.name,
                                                 "imgs": [], "text": ""})
@@ -8042,7 +8801,7 @@ class Engine:
                 default_source=default_source)
 
         # 2-4) DEDUP -> SECOND PASS -> ORGANISE (shared tail, used by batch too).
-        self._finish_worker(worker_dir, renamed_records)
+        return self._finish_worker(worker_dir, renamed_records)
 
     # ---- multi-document bundle split, from the classify call's page map ----
     BUNDLE_ARCHIVE_DIRNAME = "Original Bundles"
@@ -8485,11 +9244,102 @@ class Engine:
                             "original": path.name, "imgs": [], "text": ""})
         return records
 
+    def _validate_batch_worker_records(self, worker_dir: Path, records: list,
+                                       state: BatchState):
+        """Require every current worker document to have one exact applied row.
+
+        A changed, added, failed or otherwise unmatched file must keep the whole
+        worker out of finishing, movement, receipts and audit.  Merely having at
+        least one good record is not proof that the worker is complete.
+        """
+        docs = list_worker_docs(worker_dir)
+        doc_keys = {str(path.resolve()).casefold(): path for path in docs}
+        record_keys = {}
+        for record in records:
+            path = Path(record.get("path") or "")
+            if not path.is_file() or path.is_symlink():
+                raise FinishingInputChanged(
+                    "an applied finishing record is missing or unsafe")
+            key = str(path.resolve()).casefold()
+            if key in record_keys:
+                raise FinishingInputChanged(
+                    f"duplicate applied records exist for '{path.name}'")
+            record_keys[key] = path
+        missing = [path.name for key, path in doc_keys.items()
+                   if key not in record_keys]
+        stale = [path.name for key, path in record_keys.items()
+                 if key not in doc_keys]
+        if missing or stale:
+            detail = []
+            if missing:
+                detail.append("unmatched current file(s): " + ", ".join(missing))
+            if stale:
+                detail.append("missing applied file(s): " + ", ".join(stale))
+            raise FinishingInputChanged("; ".join(detail))
+        current_hashes = []
+        for path in docs:
+            try:
+                current_hash = file_hash(path)
+            except Exception as exc:
+                raise FinishingInputChanged(
+                    f"current file cannot be hashed: {path.name}") from exc
+            current_hashes.append(current_hash.casefold())
+        worker = self._batch_worker_state(state, worker_dir) or {}
+        saved_rows = worker.get("applied_records") or []
+        saved_hashes = [str(row.get("hash") or "").casefold()
+                        for row in saved_rows if isinstance(row, dict)]
+        if (saved_rows and saved_hashes
+                and all(not value for value in saved_hashes)):
+            # Safe one-time upgrade for an interrupted v4/v5 apply written by
+            # the immediately preceding build. It recorded path/name/group but
+            # not hashes. Require a complete current record set and manifest
+            # proof before adding hashes; otherwise block.
+            saved_labels = sorted((str(row.get("name") or ""),
+                                   str(row.get("group") or ""))
+                                  for row in saved_rows
+                                  if isinstance(row, dict))
+            current_labels = sorted((str(record.get("name") or ""),
+                                     str(record.get("group") or ""))
+                                    for record in records)
+            manifest_bound = all(
+                self.manifest.seen(value, self.api.model_id, self.resolution)
+                for value in current_hashes)
+            if (len(saved_rows) != len(records)
+                    or saved_labels != current_labels or not manifest_bound):
+                raise FinishingInputChanged(
+                    "legacy applied-record inventory cannot be safely hash-bound")
+            worker["applied_records"] = [
+                {"path": str(record_keys[key]),
+                 "hash": file_hash(record_keys[key]),
+                 "name": next(record.get("name", "") for record in records
+                              if str(Path(record.get("path") or "").resolve())
+                              .casefold() == key),
+                 "group": next(record.get("group", "") for record in records
+                               if str(Path(record.get("path") or "").resolve())
+                               .casefold() == key)}
+                for key in sorted(record_keys)]
+            if not state.save():
+                raise DurableStateError(
+                    "legacy applied-record hash upgrade could not be persisted")
+            saved_hashes = [row["hash"].casefold()
+                            for row in worker["applied_records"]]
+        if (not saved_hashes
+                or any(not re.fullmatch(r"[0-9a-f]{64}", value)
+                       for value in saved_hashes)
+                or sorted(saved_hashes) != sorted(current_hashes)):
+            raise FinishingInputChanged(
+                "current worker files do not match the exact applied-record "
+                "hash inventory")
+
     def _finish_worker(self, worker_dir: Path, renamed_records: list):
         """Steps 2-4 shared by live and batch modes: remove exact duplicates,
         run the second-pass reviews (dating / ranking / signed checks - these
         always run LIVE, even after a batch), then organise into 'Overwrite
         Documents' and 'Bulk' sub-folders."""
+        # Validate all authorized family peers before deduplication, ranking or
+        # organisation can mutate the worker. The operation itself rechecks the
+        # same family and charged evidence again at its later call boundary.
+        self._validate_authorized_finishing_inputs(worker_dir)
         # 2) DEDUP FIRST - remove exact-copy duplicates, keep one of each.
         #    Done before the second pass so identical copies are collapsed
         #    before the (costly) CoS/contract/RTW analysis runs on them, and
@@ -8508,7 +9358,26 @@ class Engine:
 
         # 3) SECOND PASS - special reviews -------------------------
         self._phase("ranking", "Dating, signed checks and ranking")
-        self._second_pass(worker_dir, renamed_records)
+        outcome = self._second_pass(worker_dir, renamed_records) or {}
+        # The second pass may legitimately see fewer live members than the
+        # saved family if a file disappeared after confirmation. Do not let a
+        # resulting singleton/no-op cross into irreversible organisation.
+        self._assert_no_unconsumed_finishing_retries(
+            worker_dir, "worker organisation")
+        deferred = list(outcome.get("deferred") or [])
+        if deferred:
+            # A family whose dating, signed or quality evidence is unavailable
+            # stays unranked AND unfiled: organising it now would present an
+            # unresolved worker as finished. The caller keeps the worker out
+            # of completion, movement, receipts and the audit scope; a later
+            # pass that can answer, or an explicitly confirmed retry, finishes
+            # the same files in place.
+            names = ", ".join(family["name"] for family in deferred)
+            self.log(f"  [review] finishing deferred: {len(deferred)} "
+                     f"famil{'y' if len(deferred) == 1 else 'ies'} without "
+                     f"evidence ({names}) - files left in place, worker not "
+                     "organised")
+            return {"deferred": deferred, "organised": False}
 
         # 4) ORGANISE into two sub-folders: 'Overwrite Documents' (only the
         #    OVERWRITE_TYPES, loose, for Stage 3's individual overwrite flow)
@@ -8533,6 +9402,7 @@ class Engine:
                 self.stats["leftovers_removed"] = \
                     self.stats.get("leftovers_removed", 0) + n
                 self.log(f"  removed {n} leftover file(s) (.splitbak/.zip)")
+        return {"deferred": [], "organised": True}
 
     # ================================================================
     # OVERNIGHT BATCH MODE  (Message Batches API - 50% cheaper)
@@ -10130,13 +11000,20 @@ class Engine:
                      f"{self._redact(new_path.name)}")
 
     @_care_home_writer_operation
-    def run_batch_apply(self):
+    def run_batch_apply(self, retry_unresolved: str = None):
         """Poll/apply the primary and, when required, discounted follow-up.
 
         Primary results are first divided into settled canonical/descriptive
         answers and genuinely unresolved answers.  Only the latter are sent in
         one persisted Message Batches follow-up.  No worker is finalised or
         moved until that follow-up has ended.
+
+        `retry_unresolved` is the token from `assess_unresolved_finishing`
+        that the user explicitly confirmed. Without it (an ordinary Check
+        batch status) every stored finishing answer is replayed and every
+        stored failure stays failed: nothing is re-bought. With it, exactly
+        the assessed failed/invalid operations may be attempted once more,
+        keeping their earlier attempts as lineage; a stale token is refused.
         """
         try:
             state = BatchState(self.dir)
@@ -10189,6 +11066,50 @@ class Engine:
                 self.on_done(self.stats, "batch_scope_invalid:" + str(exc))
                 return
 
+            # ---- explicitly confirmed retry of unresolved finishing ----
+            self._authorized_finishing_retries = {}
+            self._finishing_retry_active = False
+            if retry_unresolved:
+                assessment = self.assess_unresolved_finishing(state)
+                if (not assessment["retryable"]
+                        or assessment["token"] != retry_unresolved):
+                    self.log("*** The confirmed finishing retry no longer "
+                             "matches the saved state (it changed since the "
+                             "assessment); nothing was retried. ***")
+                    self.on_done(self.stats, "batch_apply_attention:"
+                                 + self._attention_payload(assessment, stale=True))
+                    return
+                # The exact pre-retry state survives in a never-overwritten
+                # snapshot, so the lineage outlives the state file's deletion
+                # at a later successful completion.
+                snapshot = state.recovery_snapshot()
+                self._authorized_finishing_retries = {
+                    (item["worker_key"], item["operation"]):
+                        {"status": item["status"],
+                         "attempt_id": item["attempt_id"],
+                         "binding": item["binding"]}
+                    for item in assessment["retryable"]}
+                self._finishing_retry_active = True
+                state.data.setdefault("finishing_retries", []).append({
+                    "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "token": assessment["token"],
+                    "snapshot": str(snapshot),
+                    "estimated_extra_gbp": assessment["estimated_extra_gbp"],
+                    "operations": [[item["worker_key"], item["operation"],
+                                    item["status"], item["attempt_id"]]
+                                   for item in assessment["retryable"]]})
+                if not state.save():
+                    self._authorized_finishing_retries = {}
+                    raise DurableStateError(
+                        "finishing retry authorization could not be "
+                        "persisted; nothing was retried")
+                self.log(f"Explicitly confirmed retry of "
+                         f"{len(assessment['retryable'])} unresolved finishing "
+                         f"operation(s) (estimated extra "
+                         f"~£{assessment['estimated_extra_gbp']:.2f}); earlier "
+                         f"attempts are kept in the saved state and in "
+                         f"{snapshot.name}.")
+
             # Classification, finishing and movement were durably completed
             # before the optional audit began. A restart resumes only audit.
             if state.data.get("processing_complete"):
@@ -10217,8 +11138,8 @@ class Engine:
                 self._run_post_run_audit()
                 audit_status = (state.data.get("audit") or {}).get("status")
                 if audit_status in ("complete", "skipped", "disabled"):
-                    state.mark_applied()
-                    state.delete()
+                    terminal = state.finalize_applied()
+                    self.log(f"Terminal batch receipt retained: {terminal.name}")
                     self.on_done(self.stats, "batch_audit_complete")
                 return
 
@@ -10557,15 +11478,32 @@ class Engine:
                     worker_state["classification_status"] = "complete"
                     worker_state["classification_completed_ts"] = \
                         datetime.datetime.now().isoformat(timespec="seconds")
-                    worker_state["applied_records"] = [
-                        {"path": str(record.get("path", "")),
-                         "name": record.get("name", ""),
-                         "group": record.get("group", "")}
-                        for record in records]
+                    if not classification_done:
+                        applied_records = []
+                        for record in records:
+                            record_path = Path(record.get("path") or "")
+                            try:
+                                record_hash = file_hash(record_path)
+                            except Exception as exc:
+                                raise FinishingInputChanged(
+                                    "an applied record could not be hash-bound: "
+                                    f"{record_path.name}") from exc
+                            applied_records.append({
+                                "path": str(record_path),
+                                "hash": record_hash,
+                                "name": record.get("name", ""),
+                                "group": record.get("group", "")})
+                        worker_state["applied_records"] = applied_records
                     if not state.save():
                         raise DurableStateError(
                             "worker classification completion could not be "
                             "persisted; finishing was not started")
+
+                    # Classification completion is a worker-wide claim. A
+                    # partial record list must never permit the remaining files
+                    # to be ranked, organised or moved as if the worker were
+                    # complete.
+                    self._validate_batch_worker_records(w, records, state)
 
                     # ---- shared tail: dedupe -> LIVE second pass -> organise --
                     if worker_state.get("finishing_status") != "complete":
@@ -10576,13 +11514,50 @@ class Engine:
                         if not state.save():
                             raise DurableStateError(
                                 "worker finishing start could not be persisted")
-                        if records:
-                            self._finish_worker(w, records)
+                        outcome = (self._finish_worker(w, records)
+                                   if records else None)
+                        deferred = (list(outcome.get("deferred") or [])
+                                    if isinstance(outcome, dict) else [])
+                        self._persist_batch_live_cost()
+                        if deferred:
+                            # Truthful, non-looping unresolved state: the
+                            # worker stays incomplete, unmoved and outside
+                            # the audit scope, so no receipt, completion or
+                            # automatic review can follow. Check batch status
+                            # revisits it without paying again (stored
+                            # answers replay, stored failures stay failed);
+                            # only an explicitly confirmed retry makes a new
+                            # attempt.
+                            worker_state["finishing_status"] = "deferred"
+                            worker_state["finishing_attention"] = \
+                                self._finishing_attention(
+                                    w, deferred,
+                                    worker_state.get("finishing_attention"))
+                            worker_state.pop("finishing_completed_ts", None)
+                            worker_state["movement_status"] = "not_ready"
+                            worker_state["final_path"] = str(w)
+                            worker_state["completed"] = False
+                            worker_state.pop("completed_ts", None)
+                            if not state.save():
+                                raise DurableStateError(
+                                    "worker finishing deferral could not be "
+                                    "persisted")
+                            self.stats["workers_deferred"] = \
+                                self.stats.get("workers_deferred", 0) + 1
+                            self.log(f"  ! {w.name}: finishing deferred - "
+                                     "unresolved evidence for "
+                                     + ", ".join(family["name"]
+                                                 for family in deferred)
+                                     + "; worker not completed or moved. Check "
+                                     "batch status shows it again without new "
+                                     "requests; a retry needs your confirmation.")
+                            continue
+                        self._assert_no_unconsumed_finishing_retries(
+                            w, "batch worker completion")
                         worker_state["finishing_status"] = "complete"
                         worker_state["finishing_completed_ts"] = \
                             datetime.datetime.now().isoformat(
                                 timespec="seconds")
-                        self._persist_batch_live_cost()
                         if not state.save():
                             raise FinishingAmbiguous(
                                 "worker finishing completed but its durable "
@@ -10674,6 +11649,24 @@ class Engine:
             if incomplete_workers:
                 state.data["phase"] = "processing_incomplete"
                 state.save()
+                attention = self.assess_unresolved_finishing(state)
+                if attention["workers"]:
+                    names = ", ".join(
+                        f"{worker['name']} ({', '.join(worker['families'])})"
+                        for worker in attention["workers"])
+                    self.log("*** RANKING NEEDS ATTENTION: dating, signed or "
+                             "quality evidence is unavailable for " + names
+                             + ". Those workers are not complete, moved or "
+                             "audited; their files keep their current names. "
+                             f"{attention['operations']} failed request(s) can "
+                             "be retried only after your explicit confirmation"
+                             + (f"; {len(attention['blocked'])} may already "
+                                "have been accepted and are never retried "
+                                "automatically" if attention["blocked"] else "")
+                             + ". ***")
+                    self.on_done(self.stats, "batch_apply_attention:"
+                                 + self._attention_payload(attention))
+                    return
                 self.log("Batch apply remains incomplete for: "
                          + ", ".join(worker.get("name", "?")
                                      for worker in incomplete_workers)
@@ -10721,8 +11714,8 @@ class Engine:
             self._run_post_run_audit()
             audit_status = (state.data.get("audit") or {}).get("status")
             if audit_status in ("complete", "skipped", "disabled"):
-                state.mark_applied()
-                state.delete()
+                terminal = state.finalize_applied()
+                self.log(f"Terminal batch receipt retained: {terminal.name}")
             else:
                 self.on_done(self.stats, "batch_processing_complete_audit_pending")
                 return
@@ -10959,36 +11952,51 @@ class Engine:
         return None
 
     def _rebuild_records(self, worker_dir: Path, records: list):
-        """After dedup, some recorded paths may be gone (deleted) or the kept
-        copy may have been renamed to the clean base name. Re-map records to the
-        files that actually exist now, matching by base label + extension.
-        Carries the cached page images/text forward so the second pass need not
-        re-render or re-download."""
-        existing = [p for p in worker_dir.iterdir()
-                    if p.is_file() and p.suffix.lower() in DOC_EXT
-                    and not is_program_file(p)]
-        by_label = {}
-        for p in existing:
-            by_label.setdefault((_base_label(p.stem), p.suffix.lower()), []).append(p)
-        new_records = []
-        seen = set()
+        """After dedup, drop the records whose files were deleted and keep every
+        surviving record bound to ITS OWN file.
+
+        A record's cached page images/text are evidence about one specific
+        file's bytes: the second pass dates, scores and signature-checks from
+        that cache. Records are therefore matched by their exact recorded path
+        and never re-paired by label. An earlier version re-mapped records to
+        files by (base label, extension) in directory-listing order, so two
+        same-type files whose processing order differed from their listing
+        order silently swapped caches: one worker's two right-to-work checks
+        were each dated with the OTHER file's check date, and a signed
+        contract was ranked as the unsigned copy (2026-09-07 trial). Dedup
+        only deletes exact duplicates and never renames a survivor, so every
+        surviving record still has an exact-path match."""
+        kept, seen = [], set()
         for r in records:
-            key = (_base_label(r["name"]), r["path"].suffix.lower())
-            candidates = by_label.get(key, [])
-            chosen = None
-            for c in candidates:
-                if c not in seen:
-                    chosen = c
-                    break
-            if chosen is None:
+            path = r.get("path")
+            if path is None or not Path(path).exists():
                 continue  # this record's file was a deleted duplicate
-            seen.add(chosen)
-            new_records.append({"path": chosen, "name": r["name"],
-                                "group": r["group"], "original": r["original"],
-                                "imgs": r.get("imgs", []), "text": r.get("text", "")})
-        return new_records
+            key = str(path).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(r)
+        return kept
 
     # ---- second pass ----
+    def _signature_pages(self, rec, path: Path):
+        """Evidence for the employee-signed contract check: the LAST pages of
+        the document, where a contract's signature block sits. The ordinary
+        review sample is the first two pages plus the last page, which skips a
+        signature page that is followed by an e-signature certificate or a
+        blank sheet - an eight-page contract signed on page 7 was judged from
+        pages 1, 2 and 8, so its blank-signature twin could outrank it. Short
+        documents reuse the cached review pages. The returned text starts with
+        the rendered pages, so the API's text window covers the block too."""
+        total = DocRender.page_count(path)
+        if total <= DocRender.MAX_PAGES:
+            return self._pages_for_review(rec, path)
+        idxs = list(range(total - DocRender.MAX_PAGES, total))
+        imgs, text = DocRender.render(path, zoom=self.resolution, pages=idxs)
+        if not imgs and not text:
+            return self._pages_for_review(rec, path)
+        return imgs, text
+
     def _pages_for_review(self, rec, path: Path):
         """Return (imgs, text) for a second-pass review. Reuses the cached
         render when it already covers multiple pages; if only page 1 was cached
@@ -11016,65 +12024,173 @@ class Engine:
             (newest / clearest / most relevant). Single copies keep the bare
             name. Dated types (CoS / Share Code) keep their date AND, when there
             are multiples, also get the rank number: 'Name - (date) (NN)'.
+
+        Evidence principle: a date, signed or quality answer that does not
+        exist (a failed request, a failed operation replayed from durable
+        state, or an answer that is not an assessment) is never read as
+        'undated', 'unsigned' or 'score 0'. The family keeps its current
+        names and ranks, every member is recorded as 'ranking deferred', and
+        the family is reported to the caller. A legitimately absent date (an
+        answer with no supported date) remains an assessment: the copy is
+        undated and ranks below dated peers, as before.
+
+        In batch mode each family's outcome is persisted per worker, so a
+        resumed pass skips families that were already dated/ranked instead of
+        repeating their renames, and revisits deferred ones without buying
+        anything the state already answers.
+
+        Returns {"deferred": [...], "completed": [...]} with one entry per
+        family; a deferred entry names the unavailable operations.
         """
         self._check_stop()
+        families_state = self._ranking_families(worker_dir)
+        deferred_out, completed_out = [], []
 
         def current(rec):
             return rec["path"] if rec["path"].exists() else None
 
+        hash_of = {}
+
+        def identity_of(path):
+            key = str(path).casefold()
+            if key not in hash_of:
+                try:
+                    hash_of[key] = file_hash(path)
+                except Exception:
+                    hash_of[key] = str(path).casefold()
+            return hash_of[key]
+
         def finishing_key(kind, path):
+            return f"{kind}:{identity_of(path)}"
+
+        WHAT = {"cos-date": "CoS issue date",
+                "share-code-date": "Share Code check date",
+                "contract-signed": "signed check",
+                "quality": "quality assessment"}
+
+        def what_of(kind):
+            return WHAT.get(kind.split(":", 1)[0], kind)
+
+        def stored_failure(op_id):
+            return self._finishing_failure(worker_dir, op_id)
+
+        def unavailable(kind, op_id, p, reason, stored=False):
+            self.stats["errors"] += 1
+            self.log(f"      ! {self._redact(p.name)}: {what_of(kind)} "
+                     f"unavailable ({reason})")
+            return UnavailableEvidence(kind, op_id, reason, stored=stored)
+
+        def answer_for(kind, r, p, call, pages=None):
+            """Run/replay one finishing operation. Returns the answer, or an
+            UnavailableEvidence when there is none. None from a replay is a
+            failed earlier attempt, never a value."""
+            imgs, text = pages if pages is not None else self._pages_for_review(r, p)
+            op_id = finishing_key(kind, p)
             try:
-                identity = file_hash(path)
-            except Exception:
-                identity = str(path).casefold()
-            return f"{kind}:{identity}"
+                answer = self._finishing_operation(
+                    worker_dir, op_id, lambda: call(imgs, text),
+                    evidence_path=p)
+            except (StopRequested, LimitReached, CreditExhausted):
+                raise
+            except Exception as e:
+                return unavailable(kind, op_id, p, f"{type(e).__name__}: {e}")
+            if answer is None:
+                return unavailable(
+                    kind, op_id, p,
+                    "no answer recorded ("
+                    + (stored_failure(op_id) or "earlier attempt failed") + ")",
+                    stored=True)
+            return answer
 
         # ---- date helpers for the two dated types ----
         def cos_date_for(r, p):
-            imgs, text = self._pages_for_review(r, p)
-            try:
-                raw = self._finishing_operation(
-                    worker_dir, finishing_key("cos-date", p),
-                    lambda: self.api.cos_issue_date(imgs, text))
-                return parse_date(raw)
-            except (StopRequested, LimitReached, CreditExhausted):
-                raise
-            except Exception as e:
-                self.stats["errors"] += 1
-                self.log(f"      ! {self._redact(p.name)}: CoS date unreadable ({e})")
-                return None
+            answer = answer_for("cos-date", r, p, self.api.cos_issue_date)
+            if isinstance(answer, UnavailableEvidence):
+                return answer
+            if not isinstance(answer, str):
+                return unavailable("cos-date", finishing_key("cos-date", p), p,
+                                   f"invalid answer recorded ({type(answer).__name__})",
+                                   stored=True)
+            return parse_date(answer)   # None = no supported date: an assessment
 
         def sc_date_for(r, p):
-            imgs, text = self._pages_for_review(r, p)
-            try:
-                d = self._finishing_operation(
-                    worker_dir, finishing_key("share-code-date", p),
-                    lambda: self.api.share_code_check(imgs, text)) or {}
-                return parse_date(d.get("check_date", ""))
-            except (StopRequested, LimitReached, CreditExhausted):
-                raise
-            except Exception as e:
-                self.stats["errors"] += 1
-                self.log(f"      ! {self._redact(p.name)}: Share Code date "
-                         f"unreadable ({e})")
-                return None
+            answer = answer_for("share-code-date", r, p, self.api.share_code_check)
+            if isinstance(answer, UnavailableEvidence):
+                return answer
+            if not isinstance(answer, dict):
+                return unavailable("share-code-date",
+                                   finishing_key("share-code-date", p), p,
+                                   f"invalid answer recorded ({type(answer).__name__})",
+                                   stored=True)
+            return parse_date(str(answer.get("check_date", "") or ""))
 
         def quality_for(r, p, doc_type):
-            imgs, text = self._pages_for_review(r, p)
-            try:
-                q = self._finishing_operation(
-                    worker_dir, finishing_key(f"quality:{doc_type}", p),
-                    lambda: self.api.doc_quality(imgs, text, doc_type))
-                if not isinstance(q, dict):
-                    raise ValueError("quality result unavailable")
-            except (StopRequested, LimitReached, CreditExhausted):
-                raise
-            except Exception as e:
-                self.stats["errors"] += 1
-                self.log(f"      ! {self._redact(p.name)}: quality unreadable ({e})")
-                q = {"score": 0, "legible": False, "complete": False,
-                     "date": "", "note": "score failed"}
-            return q
+            kind = f"quality:{doc_type}"
+            answer = answer_for(
+                kind, r, p, lambda imgs, text: self.api.doc_quality(imgs, text, doc_type))
+            if isinstance(answer, UnavailableEvidence):
+                return answer
+            evidence = quality_evidence(answer)
+            if evidence is None:
+                # an answer that is not an assessment (no dict / no numeric
+                # score) is invalid evidence, not a score of zero
+                return unavailable(kind, finishing_key(kind, p), p,
+                                   f"invalid answer recorded ({type(answer).__name__})",
+                                   stored=True)
+            return evidence
+
+        def defer_family(base_name, live, unresolved):
+            """Leave the family exactly as it is, record every member as
+            unresolved, persist the deferral and report it to the caller.
+            Nothing has been parked yet, so there is nothing to roll back."""
+            self.stats["rank_deferred"] = self.stats.get("rank_deferred", 0) + 1
+            kinds = sorted({what_of(u.kind) for _r, _p, u in unresolved})
+            self.log(f"  [review] {base_name}: {' / '.join(kinds)} unavailable "
+                     f"for {len(unresolved)} of {len(live)} "
+                     f"cop{'y' if len(live) == 1 else 'ies'} - ranking "
+                     "deferred, names unchanged")
+            by_record = {}
+            for r, p, u in unresolved:
+                by_record.setdefault(id(r), []).append(u)
+            failed_log = getattr(self, "failed_log", None)
+            noun = "contract" if base_name == "Employment Contract" else "copy"
+            members, unavailable_items = [], []
+            for r, p in live:
+                members.append({"path": str(p), "hash": identity_of(p)})
+                own = by_record.get(id(r), [])
+                if own:
+                    detail = "; ".join(f"{what_of(u.kind)} unavailable ({u.reason})"
+                                       for u in own)
+                    for u in own:
+                        unavailable_items.append({
+                            "path": str(p), "operation": u.operation_id,
+                            "kind": u.kind, "reason": u.reason,
+                            "stored": bool(u.stored)})
+                else:
+                    detail = (f"peer of a {noun} whose "
+                              + " / ".join(kinds) + " is unavailable")
+                if failed_log is not None:
+                    failed_log.record(self.care_home, worker_dir.name, p,
+                                      "ranking deferred",
+                                      detail + "; name and rank left unchanged")
+            previous = (families_state or {}).get(base_name) or {}
+            record = {"status": "deferred", "members": members,
+                      "unavailable": unavailable_items,
+                      "passes": int(previous.get("passes", 0) or 0) + 1,
+                      "updated_ts": datetime.datetime.now().isoformat(
+                          timespec="seconds")}
+            self._save_ranking_family(worker_dir, base_name, record)
+            deferred_out.append({"name": base_name, "members": len(live),
+                                 "unavailable": unavailable_items})
+
+        def complete_family(base_name, live):
+            members = [{"path": str(current(r) or p), "hash": identity_of(p)}
+                       for r, p in live]
+            record = {"status": "complete", "members": members,
+                      "completed_ts": datetime.datetime.now().isoformat(
+                          timespec="seconds")}
+            self._save_ranking_family(worker_dir, base_name, record)
+            completed_out.append({"name": base_name, "members": len(live)})
 
         # ---- group records by their (base) controlled name ----
         groups = {}
@@ -11101,19 +12217,49 @@ class Engine:
                 continue
 
             n = len(live)
+            stored = (families_state or {}).get(base_name) or {}
+            if stored.get("status") == "complete":
+                saved_hashes = sorted(
+                    str(member.get("hash") or "").casefold()
+                    for member in (stored.get("members") or [])
+                    if isinstance(member, dict))
+                live_hashes = sorted(identity_of(path).casefold()
+                                     for _record, path in live)
+                if (not saved_hashes or saved_hashes != live_hashes
+                        or any(not re.fullmatch(r"[0-9a-f]{64}", value)
+                               for value in saved_hashes)):
+                    raise FinishingInputChanged(
+                        f"completed ranking family '{base_name}' no longer "
+                        "matches its saved member hashes")
+                # dated/ranked on an earlier pass of this batch: repeating the
+                # renames would mint '(2)' names and reorder equal keys
+                self.log(f"  [review] {base_name}: already dated/ranked on an "
+                         "earlier pass - skipped without API calls")
+                completed_out.append({"name": base_name, "members": n,
+                                      "replayed": True})
+                continue
             self.log(f"  [review] {base_name}: {n} cop{'y' if n == 1 else 'ies'}")
 
             # gather a date for dated types (needed for naming + as rank signal)
             date_of = {}
+            unresolved = []     # (record, path, UnavailableEvidence)
             if base_name in DATED:
                 getter = DATED[base_name]
                 for r, p in live:
                     self._check_stop()
-                    date_of[id(r)] = getter(r, p)
+                    d = getter(r, p)
+                    if isinstance(d, UnavailableEvidence):
+                        unresolved.append((r, p, d))
+                        d = None
+                    date_of[id(r)] = d
 
             # ----- single copy: just (date) if dated, else leave as-is -----
             if n == 1:
                 r, p = live[0]
+                if unresolved:
+                    # the required date is unknown, not absent: hold the name
+                    defer_family(base_name, live, unresolved)
+                    continue
                 if base_name in DATED:
                     d = date_of.get(id(r))
                     if d is not None:
@@ -11121,6 +12267,7 @@ class Engine:
                             worker_dir, p,
                             f"{base_name} - ({d.strftime('%d-%m-%Y')})",
                             r, "Crucial")
+                    complete_family(base_name, live)
                 if base_name in STAT_KEY:
                     self.stats[STAT_KEY[base_name]] = \
                         self.stats.get(STAT_KEY[base_name], 0) + 1
@@ -11136,19 +12283,27 @@ class Engine:
                 d = date_of.get(id(r))
                 date_rank = d.toordinal() if d else 0
                 signed_bonus = 0
+                signed_state = None
+                # signed_state is "signed" / "unsigned" from an inspected
+                # answer, or "unavailable" when there is no answer. Only the
+                # first two are evidence; "unavailable" never becomes a rank.
                 if base_name == "Employment Contract":
-                    imgs, text = self._pages_for_review(r, p)
-                    try:
-                        signed = self._finishing_operation(
-                            worker_dir, finishing_key("contract-signed", p),
-                            lambda: self.api.contract_signed(imgs, text))
+                    signed = answer_for(
+                        "contract-signed", r, p, self.api.contract_signed,
+                        pages=self._signature_pages(r, p))
+                    if isinstance(signed, UnavailableEvidence):
+                        signed_state = "unavailable"
+                        unresolved.append((r, p, signed))
+                    else:
                         signed_bonus = 1 if signed else 0
-                    except (StopRequested, LimitReached, CreditExhausted):
-                        raise
-                    except Exception:
-                        signed_bonus = 0
+                        signed_state = "signed" if signed else "unsigned"
+                if isinstance(q, UnavailableEvidence):
+                    unresolved.append((r, p, q))
+                if isinstance(q, UnavailableEvidence) or signed_state == "unavailable":
+                    # no comparator value is ever made from missing evidence
+                    continue
                 scored.append({
-                    "r": r, "p": p, "q": q,
+                    "r": r, "p": p, "q": q, "signed_state": signed_state,
                     "sort_key": (date_rank, signed_bonus, q["score"],
                                  1 if q["legible"] else 0,
                                  1 if q["complete"] else 0),
@@ -11162,6 +12317,15 @@ class Engine:
                     extra.append(q["note"])
                 self.log(f"      {self._redact(p.name)}: score {q['score']}"
                          + (f"  [{', '.join(extra)}]" if extra else ""))
+
+            # Unavailable evidence anywhere in the family: with one date,
+            # signed or quality answer missing, every order would be
+            # manufactured. Leave the family's current names and ranks exactly
+            # as they are and record every member as unresolved. A later pass
+            # that can answer, or an explicitly confirmed retry, resolves it.
+            if unresolved:
+                defer_family(base_name, live, unresolved)
+                continue
 
             # worst first, best last -> index 0 gets bare name, last gets (NN)
             scored.sort(key=lambda s: s["sort_key"])
@@ -11214,6 +12378,8 @@ class Engine:
                     self.stats.get(STAT_KEY[base_name], 0) + 1
             else:
                 self.stats["ranked"] = self.stats.get("ranked", 0) + 1
+            complete_family(base_name, live)
+        return {"deferred": deferred_out, "completed": completed_out}
 
     def _rename_suffix(self, worker_dir, path: Path, new_name, rec, group,
                        display_from: str = None):
@@ -13761,6 +14927,17 @@ class App(tk.Tk):
                 label += ("\nPRIMARY SUBMISSION NEEDS RECOVERY: saved request "
                           "and batch IDs are retained. Use Check batch status "
                           "to verify what Anthropic accepted.")
+            elif any(worker.get("finishing_status") == "deferred"
+                     for worker in (pending.get("workers") or {}).values()):
+                deferred = [worker.get("name", "?")
+                            for worker in (pending.get("workers") or {}).values()
+                            if worker.get("finishing_status") == "deferred"]
+                label += (f"\nRANKING NEEDS ATTENTION: {len(deferred)} worker "
+                          "folder(s) have unresolved dating/signed/quality "
+                          f"checks ({', '.join(deferred[:5])}"
+                          f"{', …' if len(deferred) > 5 else ''}). They are not "
+                          "complete or moved. Use Check batch status to see "
+                          "them; a retry needs your confirmation.")
             else:
                 followup = pending.get("followup") or {}
                 active = followup if followup.get("phase") else pending
@@ -13770,10 +14947,17 @@ class App(tk.Tk):
                           f"{len(active.get('batches', []))} batch(es). "
                           "Use Check batch status to continue.")
         elif checkpoint and not checkpoint.get("finished"):
-            label += (f"\nUNFINISHED RUN: worker "
-                      f"{checkpoint.get('workers_done', 0) + 1}/"
-                      f"{checkpoint.get('workers_total', '?')}. "
-                      "Press Start to resume completed-file skipping.")
+            deferred = checkpoint.get("deferred_workers") or []
+            if deferred:
+                label += (f"\nRANKING NEEDS ATTENTION: {len(deferred)} live "
+                          "worker folder(s) remain incomplete. Press Start to "
+                          "inspect saved failures; retrying requires a separate "
+                          "confirmation.")
+            else:
+                label += (f"\nUNFINISHED RUN: worker "
+                          f"{checkpoint.get('workers_done', 0) + 1}/"
+                          f"{checkpoint.get('workers_total', '?')}. "
+                          "Press Start to resume completed-file skipping.")
         self.folder_lbl.configure(text=label)
         return pending, checkpoint
 
@@ -14077,9 +15261,11 @@ class App(tk.Tk):
             return True
         return False
 
-    def _batch_check_status(self):
+    def _batch_check_status(self, retry_token: str = None):
         """Poll the pending batch; if it has ended, download and apply the
-        results (Phase B) on a background thread."""
+        results (Phase B) on a background thread. `retry_token` is only ever
+        supplied after the user confirmed the exact unresolved finishing
+        operations shown to them (see `_done_batch`)."""
         if not self.care_home_dir or self._batch_busy_guard():
             return
         if not has_pending_batch(self.care_home_dir):
@@ -14110,8 +15296,11 @@ class App(tk.Tk):
         self._reset_stats()
         self.engine = self._make_engine(api_key, model_id)
         self.log(f"\nChecking batch status for: {self.care_home_dir}")
+        engine = self.engine
         self.worker_thread = threading.Thread(
-            target=self.engine.run_batch_apply, daemon=True)
+            target=lambda: engine.run_batch_apply(
+                retry_unresolved=retry_token),
+            daemon=True)
         self.worker_thread.start()
         self._poll_stats()
 
@@ -14584,8 +15773,34 @@ class App(tk.Tk):
                  f"Redact logs: {'on' if cfg.get('redact_logs',False) else 'off'}")
         if reprocess:
             self.log("Re-run mode: FORCING full re-process (cache ignored).")
+        live_retry_token = None
+        if run_mode == "live" and getattr(self, "_resuming_live", False):
+            attention = self.engine.assess_unresolved_finishing(
+                LiveFinishingState(self.care_home_dir))
+            if attention.get("changed"):
+                messagebox.showwarning(
+                    "Live ranking input changed",
+                    "A document or saved run setting no longer matches the "
+                    "unfinished ranking checkpoint. No request was sent. "
+                    "Restore the exact saved files/settings or arrange a new "
+                    "review; Stage 2 will not reuse stale retry authority.")
+                self._scan_ui_reset()
+                return
+            if attention.get("retryable") and attention.get("token"):
+                extra = float(attention.get("estimated_extra_gbp", 0) or 0)
+                if messagebox.askyesno(
+                        "Retry failed live ranking checks?",
+                        f"The unfinished run has {attention['operations']} "
+                        "failed dating, signed or quality request(s). A normal "
+                        "resume replays their failures and sends nothing.\n\n"
+                        "Retry them once now? This is new paid work "
+                        f"(estimated ~£{extra:.2f}); ambiguous requests are "
+                        "never retried. Earlier attempts and costs are retained.",
+                        icon="warning"):
+                    live_retry_token = attention["token"]
         target = (self.engine.run_batch_submit if run_mode == "batch"
-                  else self.engine.run)
+                  else lambda: self.engine.run(
+                      retry_unresolved=live_retry_token))
         self.worker_thread = threading.Thread(target=target, daemon=True)
         self.worker_thread.start()
         self._poll_stats()
@@ -14675,9 +15890,19 @@ class App(tk.Tk):
             limit_reason = status.split("limit:", 1)[1]
             self.set_status(f"Stopped — {limit_reason}.")
             head = "Run stopped at a safety limit"
+        elif kind == "live_finishing_attention":
+            deferred = int(stats.get("workers_deferred", 0) or 0)
+            self.set_status(f"Ranking needs attention; {deferred} worker "
+                            "folder(s) remain incomplete.")
+            head = "Ranking needs attention"
         elif status:
             self.set_status("Finished with errors.")
             head = "Finished with an error"
+        elif int(stats.get("workers_deferred", 0) or 0):
+            deferred = int(stats.get("workers_deferred", 0) or 0)
+            self.set_status(f"Finished; {deferred} worker folder(s) have unresolved "
+                            "dating/signed/quality checks and were not completed.")
+            head = "Finished - ranking needs attention"
         else:
             self.set_status("Processing complete; accuracy audit needs attention." if stats.get("audit_status") in ("failed", "pending", "skipped") else "All workers complete.")
             head = "Review complete"
@@ -14740,6 +15965,15 @@ class App(tk.Tk):
                         f"(~£{stats.get('audit_expected_gbp', 0):.2f}).")
         if stats.get("audit_status") in ("failed", "pending"):
             summary += "\n\nThe accuracy audit is INCOMPLETE. Its progress is not a completed review; check Details & full log before restarting it."
+        if int(stats.get("workers_deferred", 0) or 0):
+            summary += (f"\n\n{stats.get('workers_deferred', 0)} worker folder(s) were "
+                        "NOT completed: a dating, signed or quality check had no "
+                        "answer, so their document families keep their current "
+                        "names and ranks (listed in the failed-files CSV as "
+                        "'ranking deferred'). They were not moved, organised or "
+                        "audited. Press Start to inspect the saved state. A "
+                        "normal resume sends no failed request; any retry is "
+                        "shown with a separate cost estimate and confirmation.")
         n_failed = (stats.get('errors', 0) + stats.get('skipped_oversized', 0)
                     + stats.get('skipped_cloud', 0))
         if n_failed:
@@ -14847,6 +16081,56 @@ class App(tk.Tk):
                 "The saved state and any accepted batch IDs are retained. "
                 "Use Check batch status to verify them before continuing. "
                 "Do not start a new run or remove the state file.")
+        elif kind == "batch_apply_attention":
+            try:
+                info = json.loads(payload) if payload else {}
+            except Exception:
+                info = {}
+            workers = info.get("workers") or []
+            n_ops = int(info.get("operations", 0) or 0)
+            n_blocked = int(info.get("blocked", 0) or 0)
+            names = "\n".join(
+                f"    {worker.get('name', '?')}: "
+                + ", ".join(worker.get("families") or [])
+                for worker in workers) or "    (see the log)"
+            self.set_status("Ranking needs attention - unresolved finishing "
+                            "checks; those workers were not completed or moved.")
+            message = (
+                f"{len(workers)} worker folder(s) have document families whose "
+                "dating, signed or quality check has no answer:\n" + names
+                + "\n\nTheir files keep their current names and ranks, stay in "
+                "the source folder and are listed in the failed-files CSV as "
+                "'ranking deferred'. No worker was marked complete, moved or "
+                "audited on their behalf, and no receipt or automatic review "
+                "was produced.\n\nCheck batch status replays saved answers "
+                "only; it never re-sends a failed request by itself.")
+            if info.get("stale"):
+                message = ("The confirmed retry no longer matched the saved "
+                           "state, so nothing was retried.\n\n" + message)
+            if n_blocked:
+                message += (f"\n\n{n_blocked} request(s) may already have "
+                            "been accepted by the provider without a saved "
+                            "answer; they are never retried automatically.")
+            token = str(info.get("token") or "")
+            if n_ops and token:
+                try:
+                    extra = float(info.get("estimated_extra_gbp", 0) or 0)
+                except Exception:
+                    extra = 0.0
+                message += (f"\n\nRetry the {n_ops} failed finishing "
+                            "request(s) now? Each is one new live request "
+                            f"(estimated ~£{extra:.2f} in total). Earlier "
+                            "attempts, their errors and their cost are kept "
+                            "in the saved state and a snapshot.")
+                if messagebox.askyesno("Ranking needs attention", message,
+                                       icon="warning"):
+                    self.after(300, lambda: self._batch_check_status(
+                        retry_token=token))
+                    return
+                self.set_status("Unresolved ranking checks retained. Use Check "
+                                "batch status to see them again.")
+            else:
+                messagebox.showwarning("Ranking needs attention", message)
         elif kind == "batch_followup_ambiguous":
             self.set_status("Follow-up resubmission blocked.")
             messagebox.showwarning(

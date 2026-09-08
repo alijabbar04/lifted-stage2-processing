@@ -625,6 +625,9 @@ class TestSharedSelectorAndAutoReview(_HiddenTkBase):
     def test_auto_review_dialog_footer_fits(self):
         self.app.attributes("-alpha", 0.0)
         self.app.deiconify()
+        # Map the synthetic parent before constructing a transient Toplevel;
+        # otherwise its geometry can remain 1x1 before footer layout runs.
+        self.app.update_idletasks()
         try:
             dialog = self.auto_dialog()
             dialog.attributes("-alpha", 0.0)

@@ -1,6 +1,6 @@
 # Stage 2 — Processing
 
-## v1.5.1 Obsidian / Jade notifications and recovery — build 2026.09.08-slack1
+## v1.5.2 Obsidian / Jade ranking recovery — build 2026.09.08-ranking1
 
 The current UI direction is **Graphite + Deep Jade**: a near-black/graphite
 surface with restrained jade accents, real filled/outlined buttons, a clean
@@ -85,6 +85,30 @@ Completed worker moves update the shared `<Care Home> roster.csv`, preserving
 approved Lifted profile IDs for Stage 3. Classification models, pricing,
 vocabulary and orientation policy are unchanged by this pipeline patch.
 The earlier pipeline and restart-safe batch recovery work is included in this release.
+
+### Ranking needs attention and targeted recovery
+
+**Ranking needs attention** means a required date, signature or quality check
+did not provide usable evidence. It is not a zero score and is not permission
+to guess, mark a contract unsigned, or promote a copy because a request failed.
+Keep saved results and source files in place. Completed workers may already be
+in **Processed**; that does not mean the captured run scope is complete.
+
+For a batch, use **Check batch status**. It reuses saved answers and explains
+unresolved checks. If a confirmed failed finishing check is eligible for
+another attempt, Stage 2 asks separately before sending new paid finishing work
+and shows an estimate. Declining preserves unfinished work. An uncertain
+provider outcome must be reconciled first; it is not eligible for a blind
+retry. Keep the same files and settings: added, removed, moved or changed
+inputs invalidate the old retry confirmation.
+
+Targeted audit-row recovery is separate from the standard review scope. It
+retains the original audit/report identity, current document evidence and prior
+history; it does not silently turn every earlier **Correct** row into an
+AI-reviewed row. Normal review still includes flagged and error rows. A
+signature sample covering the last three pages of a long contract is not proof
+about every page. Offline review or regression results are not measured live
+accuracy improvement.
 
 **AI-powered document classification and renaming for UK care-worker compliance
 documents.**
@@ -189,8 +213,10 @@ of downloading the public setup. Developer checkout instructions are below.
 4. Point **Folder to process** at the `[Files]` folder Stage 1 produced —
    typically `Documents\Lifted\<Care Home>\<Care Home> [Files]`, the folder
    holding one sub-folder per worker.
-5. Pick **Live** (results as it goes) or **Overnight Batch** (half price, ready
-   within ~1 hour, guaranteed within 24). Start it.
+5. Pick **Live** (results as it goes) or **Overnight Batch**. Batch primary
+   classification is discounted, while follow-up, finishing and optional audit
+   work have separate estimates; provider turnaround is asynchronous and
+   variable. Start it only after reviewing the estimate.
 
 In v1.3.1, Overnight Batch settles confident controlled matches and descriptive
 Other results from the primary batch. Only genuinely unresolved documents are
@@ -335,7 +361,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.1 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.2 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

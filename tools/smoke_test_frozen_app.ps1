@@ -1,8 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ExePath,
-    [string]$ExpectedVersion = "1.5.1",
-    [string]$ExpectedBuild = "2026.09.08-slack1"
+    [string]$ExpectedVersion = "1.5.2",
+    [string]$ExpectedBuild = "2026.09.08-ranking1"
 )
 
 $ErrorActionPreference = "Stop"

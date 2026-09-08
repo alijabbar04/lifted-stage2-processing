@@ -1,6 +1,7 @@
 # Installing Stage 2 — Processing
 
-This guide applies to the v1.4.1 Obsidian Compact release.
+This guide applies to the v1.5.2 Obsidian / Jade release (build
+2026.09.08-ranking1).
 
 This guide assumes no technical knowledge. Follow it top to bottom.
 
@@ -139,9 +140,10 @@ higher number is the **better** copy — `DBS Document (02)` beats
 
 1. Pick the `[Files]` folder.
 2. Leave the model on **Haiku (cheapest)** unless you have a reason not to.
-3. Choose **Live** (results as it goes) or **Overnight Batch** (half price,
-   ready in about an hour, up to 24). Batch is the right choice for a big run
-   you can leave overnight.
+3. Choose **Live** (results as it goes) or **Overnight Batch**. Batch primary
+   classification is discounted, while follow-up, finishing and optional audit
+   work have separate estimates. Provider turnaround is asynchronous and
+   variable; review the estimate and do not assume a fixed completion time.
 4. Start it. The cost estimate in GBP updates live from the real token counts
    the API returns. The run uses one cumulative budget across primary
    classification, follow-up, finishing and the optional audit (**£35** by
@@ -158,6 +160,15 @@ The estimate screen lists primary batch classification, required live finishing,
 the follow-up reserve and the optional audit separately. An enabled audit shows
 its expected cost before it starts and is skipped—without undoing completed
 processing—when the remaining cumulative budget is insufficient.
+
+If the run reports **ranking needs attention**, a date, signature or quality
+check lacked usable evidence. Use **Check batch status** to read the retained
+finishing details. Only a confirmed eligible failed finishing operation may be
+retried after its separate estimate and confirmation; reconcile an uncertain
+provider outcome first, and never repeat primary classification blindly. Keep
+the same files and settings: a changed, moved, added or removed input
+invalidates the old retry confirmation. Some workers may already be in
+**Processed** while the captured run is still incomplete.
 
 Read **`docs/USER_GUIDE.pdf`** for the full walkthrough. It is
 also available inside the app from the **Guide** button.

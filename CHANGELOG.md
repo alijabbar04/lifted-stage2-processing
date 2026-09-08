@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.5.2 — 2026-09-08 — Ranking attention and bounded recovery
+
+- Preserve exact-path classification evidence when rebuilding records after
+  duplicate removal, so surviving documents retain the correct evidence.
+- Clarify policy/handbook versus individual worker-record boundaries, including
+  mixed bundles and genuinely partially completed forms, without worker-specific rules.
+- Keep failed or unavailable date, signature and quality finishing evidence as
+  durable **ranking needs attention** state; do not turn an incomplete run
+  into a completed result or guess missing evidence.
+- Allow a separately confirmed retry only for eligible failed finishing
+  operations against unchanged, hash-bound inputs. Reconcile uncertain
+  provider outcomes first; never repeat primary classification blindly.
+- Preserve captured scope, original audit identity and prior review history
+  during supported explicit audit-row recovery. Normal review still includes
+  flagged/error rows; explicit rows do not imply every **Correct** row was
+  reviewed.
+- Document that a signature sample covering the last three pages is not proof
+  about every page of a long contract. No live accuracy improvement is claimed
+  from offline evidence.
+- Update public release metadata to build `2026.09.08-ranking1`.
+
 ## v1.5.1 — 2026-09-08 — Slack notifications and reliable review handoff
 
 - Add optional Slack incoming-webhook delivery alongside Discord and Telegram,

@@ -187,10 +187,11 @@ chunks.
 
 ### Overnight Batch results never arrived
 
-Batch jobs normally finish in about an hour and are guaranteed within 24. State
-lives in `.docreview_batch_state.json` (hidden) in the care-home folder — leave
-it alone, it is how the app resumes and collects results. Re-open the app and the
-same folder to check on and apply a submitted batch.
+Provider turnaround is asynchronous and variable; a quiet period alone does
+not mean failure. State lives in `.docreview_batch_state.json` (hidden) in the
+care-home folder — leave it alone, it is how the app resumes and collects
+results. Re-open the app and the same folder to check on and apply a submitted
+batch.
 
 v1.3.1 can show a second **follow-up** phase for only the genuinely unresolved
 documents. This is also a discounted Message Batch, not a live Haiku-to-Sonnet
@@ -237,6 +238,25 @@ After recovery, the main header updates from saved state. Use **Check batch
 status** again to collect and apply the results when the batches finish.
 A stopped, failed or pending operation no longer fills the progress bar just
 because its background operation returned.
+
+### Ranking needs attention
+
+**Ranking needs attention** means a required date, signature or quality check
+did not provide usable evidence. It is not permission to guess a score, mark a
+contract unsigned or promote a copy because a request failed. Use **Check batch
+status** and read the retained finishing details. If a confirmed failed
+finishing operation is eligible for another attempt, Stage 2 asks separately,
+shows an estimate and sends only that new paid finishing work after explicit
+confirmation. It never authorizes a blind repeat of primary classification.
+
+An uncertain provider outcome must be reconciled before any retry. Keep the
+same files and saved settings; if a file was added, removed, moved or changed,
+the old retry confirmation is invalid. Do not delete state or force a new run.
+Incomplete scope remains incomplete even when some workers are already in
+Processed. Targeted explicit audit-row recovery preserves the original audit
+identity and review history; it does not mean every earlier **Correct** row was
+AI-reviewed. A signature sample limited to the last three pages is not proof
+about every page of a long contract.
 
 ### Local orientation warning / model unavailable
 

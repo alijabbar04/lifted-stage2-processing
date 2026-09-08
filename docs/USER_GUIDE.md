@@ -1,8 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.5.1 Obsidian / Jade
-
-Obsidian / Jade edition. A practical guide to processing documents, checking the result, and turning verified corrections into better software.
+## User guide | v1.5.2 Obsidian / Jade
 
 Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Stage 3 uploads the prepared folders. Completing Stage 2 does not itself upload anything.
 
@@ -24,14 +22,15 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 | The new workspace and its controls | 2 |
 | Folder setup and your first run | 3 |
 | Live processing, batches and recovery | 4 |
-| Reading progress and the post-run audit | 5 |
-| Reports: audit versus review ledger | 6 |
-| Launching the document review | 7 |
-| Naming collisions, ranking and review quality | 8 |
-| Learning from corrections and changing code | 9 |
-| Settings and API usage | 10 |
-| Discord, Telegram and Slack updates | 11 |
-| Troubleshooting and completion checklist | 12 |
+| Ranking needs attention and targeted recovery | 5 |
+| Reading progress and the post-run audit | 6 |
+| Reports: audit versus review ledger | 7 |
+| Launching the document review | 8 |
+| Naming collisions, ranking and review quality | 9 |
+| Learning from corrections and changing code | 10 |
+| Settings and API usage | 11 |
+| Discord, Telegram and Slack updates | 12 |
+| Troubleshooting and completion checklist | 13 |
 
 Edition: 8 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
 
@@ -54,7 +53,7 @@ when relevant.
 | AI Document Review | Prepare an account-selected document review. |
 | Improve Stage 2 | Prepare a software-learning review of accumulated correction evidence. |
 
-The v1.5.1 presentation uses Graphite surfaces, restrained Deep Jade accents,
+The v1.5.2 presentation uses Graphite surfaces, restrained Deep Jade accents,
 real buttons and progressive active panels. **Accuracy Audit** finds possible
 mistakes; **AI Document Review** checks pages; **Improve Stage 2** studies the
 ledger for justified software changes. Corrections never grant code authority.
@@ -149,7 +148,49 @@ Content-hash records help avoid repeating settled work. They do not mean every f
 
 <!-- pagebreak -->
 
-## 4. Reading progress and the post-run audit
+## 4. Ranking needs attention and targeted recovery
+
+**Ranking needs attention** means a required date, signature or quality check
+did not provide usable evidence. It is different from a zero score or from a
+document with no applicable date. Stage 2 must not guess a score, mark a
+contract unsigned, or promote a copy because a request failed.
+
+Incomplete worker folders stay in the source location with their saved results.
+Completed workers may already be in **Processed**; that does not mean the
+captured processing scope finished. The full **Accuracy Audit** and automatic
+**AI Document Review** wait until the captured scope is complete and durable.
+
+For a Batch run, use **Check batch status**. It reuses saved answers and
+explains unresolved checks. If a confirmed failed finishing check is eligible
+for another attempt, the app asks separately before sending new paid finishing
+requests and shows an estimate. Declining preserves unfinished work for later.
+An uncertain provider outcome is not retried this way: reconcile whether it was
+accepted first. Do not restart primary classification to solve a finishing
+attention state.
+
+Keep the same files and saved run settings. If a document is changed, added,
+removed or moved, the old retry confirmation is no longer valid. Resolve the
+mismatch rather than deleting state or forcing a fresh run. Confirmed retries
+apply only to eligible failed finishing operations; they do not authorize a
+repeat primary submission.
+
+### Targeted audit-row recovery
+
+The supported explicit-row helper can prepare a deliberately selected audit
+row for the existing review workflow when its original report identity and
+current document evidence are verified. It retains the original audit/history
+and binds the new request to the current source and inventory. It does not
+silently make every earlier **Correct** audit row part of the AI review. The
+standard review still includes all flagged and error rows.
+
+Reviewers must inspect actual evidence and defer unresolved cases honestly. A
+signature sample covering the last three pages of a long contract is not proof
+about every page. Offline review or regression success is not a measured live
+accuracy improvement.
+
+<!-- pagebreak -->
+
+## 5. Reading progress and the post-run audit
 
 The progress display describes the **current phase**. Processing, waiting for a provider batch and checking filenames are different phases; do not interpret one phase's percentage as completion of the whole pipeline.
 
@@ -181,7 +222,7 @@ Check the current step, elapsed wait, recent activity and **Details & full log**
 
 <!-- pagebreak -->
 
-## 5. Reports: two different kinds of evidence
+## 6. Reports: two different kinds of evidence
 
 Press **Reports** to answer **Which report would you like?** The automatic audit and the review ledger are intentionally separate.
 
@@ -214,7 +255,7 @@ The ledger is shared across accounts, providers and runs. On an existing setup i
 
 <!-- pagebreak -->
 
-## 6. AI Document Review
+## 7. AI Document Review
 
 Before Start, configure **AI Document Review** as **Model → Account → Effort**;
 the provider is inferred. The default is **Sol - Codex, High**, with
@@ -256,7 +297,7 @@ The older manual command may use a confidence-greater-than-80 queue. Follow the 
 
 <!-- pagebreak -->
 
-## 7. Naming collisions and a trustworthy review
+## 8. Naming collisions and a trustworthy review
 
 Official naming and routing rules come from the Stage 2 implementation and the supplied naming-rule snapshot. The reviewer should not invent a near-match, shorten a type arbitrarily or change rules to fit one example.
 
@@ -293,7 +334,7 @@ Look for a review summary, recorded decisions, applied-change evidence where app
 
 <!-- pagebreak -->
 
-## 8. Improve Stage 2
+## 9. Improve Stage 2
 
 This is a separate reviewer with a different job: critically inspect the accumulated review evidence and decide whether a general software change is warranted. It may find that a previous correction was wrong, too specific to generalise, or not caused by a code defect.
 
@@ -330,7 +371,7 @@ Changing accounts does not erase the ledger or role memory. Changing roles does 
 
 <!-- pagebreak -->
 
-## 9. Settings and API Usage
+## 10. Settings and API Usage
 
 Processing settings affect the main engine; review-model choices do not change
 classification. Theme choices are **A · Deep jade**, **B · Graphite**, and
@@ -363,7 +404,7 @@ not an invoice, prepaid balance or record of external subscription sessions.
 
 <!-- pagebreak -->
 
-## 10. Discord, Telegram and Slack updates
+## 11. Discord, Telegram and Slack updates
 
 Open **Settings > Notifications...**. Enable any combination of Discord, Telegram and Slack, or none. Updates report lifecycle events; they do not upload documents or start an AI review.
 
@@ -397,7 +438,7 @@ Delivery is best-effort. A channel failure does not stop processing or other cha
 
 <!-- pagebreak -->
 
-## 11. Troubleshooting and completion checks
+## 12. Troubleshooting and completion checks
 
 | What you see | What to do |
 | --- | --- |

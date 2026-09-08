@@ -41,7 +41,7 @@ def test_live_checkpoint_is_atomic_and_records_exact_resume_scope(tmp_path):
         care, 1, 1, "", 0, False,
         "review-run-1", [worker], processing_complete=True) is True
     saved = app.read_live_checkpoint(care)
-    assert saved["version"] == 2
+    assert saved["version"] == 3
     assert saved["auto_review_run_id"] == "review-run-1"
     assert saved["processing_complete"] is True
     assert saved["audit_worker_dirs"] == [str(worker.resolve())]

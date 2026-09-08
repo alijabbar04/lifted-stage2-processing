@@ -15,7 +15,12 @@ import sys
 import time
 
 
-MODULES = ["tests/test_stage2_compact_ui.py", "tests/test_stage2_app_ui_smoke.py", "tests/test_stage2_workflow_ui.py"]
+MODULES = [
+    "tests/test_stage2_compact_ui.py",
+    "tests/test_stage2_app_ui_smoke.py",
+    "tests/test_stage2_workflow_ui.py",
+    "tests/test_slack_settings_ui.py",
+]
 
 
 def main():

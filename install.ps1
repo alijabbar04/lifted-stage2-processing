@@ -21,7 +21,7 @@
 # ============================================================================
 $ErrorActionPreference = "Stop"
 $Repo      = "alijabbar04/lifted-stage2-processing"
-$Tag       = "v1.5.1"
+$Tag       = "v1.5.2"
 $AppAsset  = "Stage2_Processing.exe"
 $ChecksumAsset = "SHA256SUMS.txt"
 $GuideAsset = "Stage2_Guide_AI_Processing.pdf"
