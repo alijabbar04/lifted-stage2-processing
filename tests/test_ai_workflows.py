@@ -25,7 +25,7 @@ def setup(tmp_path, monkeypatch):
     processing = tmp_path / "Care home [Files]"
     processing.mkdir()
     audit = tmp_path / "Filename_Audit_Report.csv"
-    audit.write_text("file,verdict\na.pdf,LikelyMisnamed\n", encoding="utf-8")
+    audit.write_text("file,verdict\na.pdf,LikelyMisnamed\nb.pdf,Correct\nc.pdf,Correct\n", encoding="utf-8")
     source = tmp_path / "source"
     (source / "src").mkdir(parents=True)
     (source / ".git").mkdir()
@@ -165,6 +165,8 @@ def test_roles_separate_memory_and_authority(setup):
         assert manifest["review_confidence_operator"] == ">"
         assert manifest["review_confidence_threshold"] == 80
         assert not manifest["expanded_review_authorized"]
+        assert "review_include_rows" not in manifest
+        assert "explicit_review_rows_authorized" not in manifest
         assert manifest["python_runtime"] == setup.runtime
     assert str(setup.documents) in audit.provider_args
     assert str(setup.source) in learning.provider_args
@@ -208,6 +210,41 @@ def test_queue_scope_and_processing_lock_paths(setup):
     assert manifest["review_all_flags"] and manifest["expanded_review_authorized"]
     assert manifest["processing_root"] == str(setup.processing)
     assert str(setup.processing) in prepared.provider_args
+
+
+def test_explicit_review_rows_are_manifest_bound_and_printed_in_helper_command(setup):
+    prepared = wf.prepare_workflow("audit-review", setup.account, "luna",
+                                   review_include_rows=[2, 4], **setup.kwargs)
+    manifest = json.loads((prepared.request_dir / "manifest.json").read_text())
+    request = prepared.prompt_file.read_text(encoding="utf-8")
+    assert manifest["review_include_rows"] == [2, 4]
+    assert manifest["explicit_review_rows_authorized"] is True
+    assert manifest["expanded_review_authorized"] is False
+    assert "union with explicitly authorized audit rows 2, 4" in request
+    assert "'--threshold' '80' '--include-row' '2' '--include-row' '4'" in request
+
+
+@pytest.mark.parametrize("rows", [[True], ["2"], [1], [2, 2]])
+def test_explicit_review_rows_validate_before_request_creation(setup, rows):
+    with pytest.raises(wf.WorkflowError, match="Explicit review rows|explicit review row|Duplicate"):
+        wf.prepare_workflow("audit-review", setup.account, "luna",
+                            review_include_rows=rows, **setup.kwargs)
+    assert not (Path(setup.kwargs["workspace_root"]) / "audit-review").exists()
+
+
+def test_code_learning_rejects_explicit_audit_rows_before_request_creation(setup):
+    with pytest.raises(wf.WorkflowError, match="only valid for the audit-review role"):
+        wf.prepare_workflow("code-learning", setup.account, "sol", review_include_rows=[2],
+                            allow_code_changes=True, **setup.kwargs)
+    assert not (Path(setup.kwargs["workspace_root"]) / "code-learning").exists()
+
+
+def test_out_of_range_explicit_review_row_fails_before_workspace_writes(setup):
+    workspace_root = Path(setup.kwargs["workspace_root"])
+    with pytest.raises(wf.WorkflowError, match="do not exist in the selected audit"):
+        wf.prepare_workflow("audit-review", setup.account, "luna",
+                            review_include_rows=[5], **setup.kwargs)
+    assert not workspace_root.exists()
 
 
 def test_incomplete_audit_and_missing_source_rejected(setup):

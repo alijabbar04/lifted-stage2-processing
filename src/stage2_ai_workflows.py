@@ -7,6 +7,7 @@ process-local profile environment. Preparing a handoff never starts an AI run.
 from __future__ import annotations
 
 import base64
+import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -543,10 +544,52 @@ def _hash_file(path):
     return digest.hexdigest()
 
 
+def _validated_review_include_rows(value, available_rows=None):
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        raise WorkflowError("Explicit review rows must be supplied as integers.")
+    try:
+        rows = list(value)
+    except TypeError as exc:
+        raise WorkflowError("Explicit review rows must be supplied as integers.") from exc
+    if any(type(number) is not int for number in rows):
+        raise WorkflowError("Every explicit review row must be an integer, not a boolean or string.")
+    if any(number <= 1 for number in rows):
+        raise WorkflowError("Explicit review rows are one-based data rows; row 1 is the header.")
+    if len(set(rows)) != len(rows):
+        raise WorkflowError("Duplicate explicit review rows are not allowed.")
+    if available_rows is not None:
+        missing = [number for number in rows if number not in available_rows]
+        if missing:
+            raise WorkflowError("Explicit review row(s) do not exist in the selected audit: "
+                                + ", ".join(map(str, missing)) + ".")
+    return rows
+
+
+def _audit_data_rows(path):
+    """Return row numbers using the same one-based data-row convention as ai_review."""
+    try:
+        if path.suffix.lower() == ".csv":
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                return {number for number, _row in enumerate(csv.DictReader(stream), 2)}
+        from openpyxl import load_workbook
+        book = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheet = book["Audit"] if "Audit" in book.sheetnames else book.active
+            values = iter(sheet.iter_rows(values_only=True))
+            next(values, None)
+            return {number for number, _row in enumerate(values, 2)}
+        finally:
+            book.close()
+    except Exception as exc:
+        raise WorkflowError("The selected audit could not be read to validate explicit review rows.") from exc
+
+
 def prepare_workflow(role, account, model_key, *, audit_report=None, document_root=None, care_home="", source_root=None,
                      assets_root=None, workspace_root=None, ledger_path=None, misnaming_path=None,
                      allow_document_changes=False, allow_code_changes=False, completed_audit=False, preflight=True, expected_email=None,
-                     processing_root=None, review_all_flags=False, effort=None):
+                     processing_root=None, review_all_flags=False, review_include_rows=None, effort=None):
     """Prepare a fresh exact request in a persistent provider-neutral role folder.
 
     preflight=False is for offline inspection/tests only. launch_workflow refuses
@@ -556,6 +599,9 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
     """
     if role not in ROLES:
         raise WorkflowError("Unknown AI workflow role.")
+    explicit_review_rows = _validated_review_include_rows(review_include_rows)
+    if role != "audit-review" and explicit_review_rows:
+        raise WorkflowError("Explicit audit-row selection is only valid for the audit-review role.")
     choice = model_choice(model_key, effort, role)
     if choice["provider"] != account.provider:
         raise WorkflowError("The selected account belongs to a different provider.")
@@ -583,6 +629,9 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
             raise WorkflowError("Audit review requires the current Stage 2 source folder with src/ai_review.py and Stage2_Processing.pyw for queue preparation and records, even without document corrections.")
         if allow_document_changes and not processing:
             raise WorkflowError("Document corrections require the original processing (Files) folder so both source and processed folders can be locked.")
+        if explicit_review_rows:
+            explicit_review_rows = _validated_review_include_rows(
+                explicit_review_rows, _audit_data_rows(audit))
     else:
         if not source or not all((source / "src" / name).is_file() for name in ("Stage2_Processing.pyw", "ai_review.py")) or not (source / ".git").exists():
             raise WorkflowError("Choose the current Stage 2 Git source checkout with src/ai_review.py for code learning, not its installed application folder.")
@@ -644,6 +693,9 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
                 "python_runtime": python_runtime,
                 "allow_document_changes": bool(allow_document_changes), "allow_code_changes": bool(allow_code_changes),
                 "allow_record_updates": True, "allow_publish_or_install": False, "state": "prepared", "preflight": {k: v for k, v in verified.items() if k != "executable"}}
+    if explicit_review_rows:
+        manifest["review_include_rows"] = explicit_review_rows
+        manifest["explicit_review_rows_authorized"] = True
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     rule_name = "REVIEW_RULES.md" if role == "audit-review" else "LEARNING_RULES.md"
     task = ("Independently inspect the completed audit and actual documents; resolve each review candidate with evidence. "
@@ -653,6 +705,14 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
             "Review the accumulated filename-change evidence and the previous reviewers' work critically. Decide which general software changes are justified, "
             "reproduce each defect, add regression tests, assess naming/ranking/quality tradeoffs, and implement only verified corrections if authorized. "
             "Do not turn individual corrections into broad rules without counterexamples and evidence.")
+    review_scope = ("all flagged/error rows (expanded review authorized)" if review_all_flags
+                    else "legacy confidence strictly >80")
+    if explicit_review_rows:
+        review_scope += ("; union with explicitly authorized audit rows "
+                         + ", ".join(map(str, explicit_review_rows))
+                         + "; all other issues remain outside the checked queue")
+    elif not review_all_flags:
+        review_scope += "; other issues remain explicitly outside the checked queue"
     request_text = (f"# Stage 2 {role} request\n\n{task}\n\n"
                     f"Read `{request_dir / 'manifest.json'}` completely; it defines exact paths and authority.\n"
                     f"Read `{request_dir / 'context' / rule_name}`, NAMING_RULES.md and WORKFLOW_GUIDE.md fully before acting.\n"
@@ -663,7 +723,7 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
                     f"Care home: {care_home.strip() or '(cross-run learning)'}\n"
                     f"Audit: {audit or '(not required for cross-run learning)'}\nDocuments: {documents or '(not in write scope)'}\n"
                     f"Processing (Files) root to lock while applying: {processing or '(not configured; do not guess)'}\n"
-                    f"Review queue: {'all flagged/error rows (expanded review authorized)' if review_all_flags else 'legacy confidence strictly >80; other issues remain explicitly outside the checked queue'}.\n"
+                    f"Review queue: {review_scope}.\n"
                     f"Source checkout: {source or '(not configured; use the supplied naming-rule snapshot)'}\n"
                     f"Master review ledger: {ledger}\nMisnaming record: {misnames}\n\n"
                     f"Document corrections authorized: {bool(allow_document_changes)}. Code edits authorized: {bool(allow_code_changes)}. "
@@ -681,6 +741,8 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
         if processing:
             helper_args += ["--processing-root", str(processing)]
         helper_args += ["--all-flags"] if review_all_flags else ["--threshold", "80"]
+        for row_number in explicit_review_rows:
+            helper_args += ["--include-row", str(row_number)]
         request_text += ("\n## Required transaction-helper intake\n\n"
                          "Use the exact verified external Python recorded in the manifest. This preparation command is read-only for worker documents:\n\n"
                          "```powershell\n& " + " ".join(_ps_quote(arg) for arg in helper_args) + "\n```\n\n"

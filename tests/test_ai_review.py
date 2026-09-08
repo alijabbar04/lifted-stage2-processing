@@ -34,10 +34,11 @@ class Fixture:
         path.write_bytes(data if data is not None else pdf_bytes("synthetic " + rel, pages))
         return path
 
-    def prepare(self, candidate, confidence=95, suffix="csv"):
+    def prepare(self, candidate, confidence=95, suffix="csv", *, review_status="Likely Misnamed",
+                include_rows=None, queue_name="review_queue.json"):
         self.audit = self.base / f"audit.{suffix}"
         headers = ["Current Filename", "Suggested Filename", "Full File Path", "Confidence Score", "Review Status"]
-        row = [candidate.name, "DBS Document.pdf", str(candidate), confidence, "Likely Misnamed"]
+        row = [candidate.name, "DBS Document.pdf", str(candidate), confidence, review_status]
         if suffix == "csv":
             with self.audit.open("w", newline="", encoding="utf-8-sig") as stream:
                 writer = csv.writer(stream)
@@ -51,9 +52,9 @@ class Fixture:
             book.active.append(row)
             book.save(self.audit)
             book.close()
-        self.queue_path = self.request / "review_queue.json"
+        self.queue_path = self.request / queue_name
         self.queue = review.prepare(self.audit, "Synthetic Home", self.documents,
-                                   self.source, self.queue_path)
+                                   self.source, self.queue_path, include_rows=include_rows)
         return self.queue
 
     def decisions(self, kind="DBS Document", scores=None):
@@ -94,6 +95,107 @@ class TestAIReview(unittest.TestCase):
                 p = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf")
                 self.assertEqual(f.prepare(p, 80, suffix)["candidates"], [])
                 self.assertEqual(f.queue["policy"]["batch_size"], 30)
+
+    def test_empty_explicit_selection_preserves_legacy_queue_schema(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = Fixture(temp)
+            candidate = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf")
+            queue = f.prepare(candidate, 20, review_status="Correct", include_rows=[])
+            self.assertEqual(queue["threshold_rule"], "confidence > 80")
+            self.assertEqual(queue["candidates"], [])
+            self.assertNotIn("explicit_audit_rows", queue)
+            self.assertNotIn("selection_provenance", queue)
+
+    def test_unselected_path_is_not_resolved_by_legacy_selection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = Fixture(temp)
+            selected = f.file("Worker/Bulk/Batch 01/Other - selected.pdf")
+            f.audit = f.base / "audit.csv"
+            headers = ["Current Filename", "Suggested Filename", "Full File Path", "Confidence Score", "Review Status"]
+            with f.audit.open("w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(headers)
+                writer.writerow([selected.name, "DBS Document.pdf", str(selected), 95, "Likely Misnamed"])
+                writer.writerow(["irrelevant.pdf", "DBS Document.pdf", "\x00invalid", 10, "Correct"])
+            queue = review.prepare(f.audit, "Synthetic Home", f.documents, f.source,
+                                   f.request / "review_queue.json")
+            self.assertEqual([row["audit_row"] for row in queue["candidates"]], [2])
+
+    def test_explicit_row_includes_correct_false_negative_without_editing_audit_fields(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = Fixture(temp)
+            candidate = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf")
+            queue = f.prepare(candidate, 20, review_status="Correct", include_rows=[2])
+            selected = queue["candidates"]
+            self.assertEqual(len(selected), 1)
+            self.assertEqual(selected[0]["audit_row"], 2)
+            self.assertEqual(selected[0]["confidence"], 20)
+            self.assertEqual(selected[0]["current_filename"], candidate.name)
+            self.assertEqual(selected[0]["suggested_filename"], "DBS Document.pdf")
+            self.assertEqual(selected[0]["selection_reason"], "explicit audit row")
+            self.assertEqual(queue["explicit_audit_rows"], [2])
+            self.assertEqual(queue["selection_provenance"]["combination"], "union")
+            self.assertEqual(queue["audit_workbook_sha256"], review.digest(f.audit))
+            review.verify_queue(queue)
+
+    def test_explicit_selection_unions_with_threshold_and_deduplicates_existing_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = Fixture(temp)
+            candidate = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf")
+            first = f.prepare(candidate, 95, include_rows=[2], queue_name="queue-one.json")
+            second = f.prepare(candidate, 95, include_rows=[2], queue_name="queue-two.json")
+            self.assertEqual(len(first["candidates"]), 1)
+            self.assertEqual(first["candidates"][0]["selection_reason"],
+                             "confidence > 80; also explicit audit row")
+            self.assertEqual(first["candidates"][0]["case_id"], second["candidates"][0]["case_id"])
+            self.assertNotEqual(first["candidates"][0]["candidate_id"], second["candidates"][0]["candidate_id"])
+
+    def test_all_flags_union_adds_only_the_explicit_correct_row_with_stable_cases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = Fixture(temp)
+            flagged = f.file("Worker/Bulk/Batch 01/Other - flagged.pdf")
+            correct = f.file("Worker/Bulk/Batch 01/Other - false negative.pdf")
+            f.audit = f.base / "audit.csv"
+            headers = ["Current Filename", "Suggested Filename", "Full File Path", "Confidence Score", "Review Status"]
+            with f.audit.open("w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(headers)
+                writer.writerow([flagged.name, "DBS Document.pdf", str(flagged), 10, "Likely Misnamed"])
+                writer.writerow([correct.name, "Employment Contract.pdf", str(correct), 10, "Correct"])
+            first = review.prepare(f.audit, "Synthetic Home", f.documents, f.source,
+                                   f.request / "queue-one.json", all_flags=True, include_rows=[3])
+            second = review.prepare(f.audit, "Synthetic Home", f.documents, f.source,
+                                    f.request / "queue-two.json", all_flags=True, include_rows=[3])
+            self.assertEqual([row["audit_row"] for row in first["candidates"]], [2, 3])
+            self.assertEqual(first["candidates"][0]["selection_reason"], "all flagged rows")
+            self.assertEqual(first["candidates"][1]["selection_reason"], "explicit audit row")
+            self.assertEqual([row["case_id"] for row in first["candidates"]],
+                             [row["case_id"] for row in second["candidates"]])
+            review.verify_queue(first)
+
+    def test_invalid_explicit_rows_fail_before_queue_output(self):
+        invalid = ([True], ["2"], [1], [3], [2, 2])
+        for include_rows in invalid:
+            with self.subTest(include_rows=include_rows), tempfile.TemporaryDirectory() as temp:
+                f = Fixture(temp)
+                candidate = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf")
+                with self.assertRaises(review.ReviewError):
+                    f.prepare(candidate, 20, review_status="Correct", include_rows=include_rows)
+                self.assertFalse((f.request / "review_queue.json").exists())
+
+    def test_explicit_selection_refuses_existing_queue_and_revalidates_candidate_origin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = Fixture(temp)
+            candidate = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf")
+            queue = f.prepare(candidate, 20, review_status="Correct", include_rows=[2])
+            original = f.queue_path.read_bytes()
+            with self.assertRaisesRegex(review.ReviewError, "Queue already exists"):
+                review.prepare(f.audit, "Synthetic Home", f.documents, f.source,
+                               f.queue_path, include_rows=[2])
+            self.assertEqual(f.queue_path.read_bytes(), original)
+            queue["candidates"][0]["source_relative_path"] = "Worker/phantom.pdf"
+            with self.assertRaisesRegex(review.ReviewError, "do not match"):
+                review.verify_queue(queue)
 
     def test_ranking_requires_every_peer_not_just_the_new_document(self):
         with tempfile.TemporaryDirectory() as temp:

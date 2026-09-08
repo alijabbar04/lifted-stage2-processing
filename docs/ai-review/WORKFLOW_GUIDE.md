@@ -56,6 +56,7 @@ The launcher opens a process-local terminal session with the requested identity.
 ## Scope and practical limits
 
 - The manual helper defaults to the established **confidence strictly greater than 80** rule. The desktop handoff requests **all flags**, including lower-confidence/error rows, and records that expanded scope explicitly. Always follow the current request. Neither selection is a claim to inspect every file.
+- A false negative marked Correct can be added only when the current audit-review request records its exact one-based audit row as an explicitly authorized follow-up. The helper unions those rows with the request's normal selection and records provenance; it never rewrites the completed audit or grants blanket all-file review.
 - A completed report is needed. Do not review while processing, applying, or auditing is changing those folders. The helper also takes the same writer locks as Stage 2.
 - Review inputs may be CSV or modern Excel XLSX. Legacy XLS is not supported by this helper; convert a copy first.
 - Document inspection requires the review model's available PDF/image/document tools. The helper hashes and moves files; it does not read their meaning or verify whether the reviewer really looked at a page.

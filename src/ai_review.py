@@ -255,46 +255,114 @@ def _audit_headers(headers):
         raise ReviewError("Audit headers are missing or duplicated; select the completed Stage 2 Audit CSV/XLSX")
 
 
+def _validated_include_rows(include_rows, available_rows=None):
+    """Validate explicit one-based worksheet rows without accepting bool-as-int."""
+    if include_rows is None:
+        return []
+    if isinstance(include_rows, (str, bytes)):
+        raise ReviewError("Explicit audit rows must be supplied as integers")
+    try:
+        rows = list(include_rows)
+    except TypeError as exc:
+        raise ReviewError("Explicit audit rows must be supplied as integers") from exc
+    if any(type(number) is not int for number in rows):
+        raise ReviewError("Every explicit audit row must be an integer, not a boolean or string")
+    if any(number <= 1 for number in rows):
+        raise ReviewError("Explicit audit rows are one-based data rows; row 1 is the header")
+    if len(set(rows)) != len(rows):
+        raise ReviewError("Duplicate explicit audit rows are not allowed")
+    if available_rows is not None:
+        missing = [number for number in rows if number not in available_rows]
+        if missing:
+            raise ReviewError("Explicit audit row(s) do not exist: " + ", ".join(map(str, missing)))
+    return rows
+
+
+def _selection_details(threshold, all_flags, include_rows):
+    base_rule = "all flagged rows" if all_flags else f"confidence > {threshold:g}"
+    if not include_rows:
+        return base_rule, None
+    row_rule = "explicit audit row" + ("s" if len(include_rows) != 1 else "") + " " + ", ".join(map(str, include_rows))
+    return f"{base_rule} OR {row_rule}", {
+        "base_rule": base_rule,
+        "threshold": threshold,
+        "all_flags": bool(all_flags),
+        "explicit_audit_rows": include_rows,
+        "combination": "union",
+        "audit_row_numbering": "one-based; row 1 is the header",
+    }
+
+
+def _audit_confidence(row, number):
+    try:
+        confidence = float(row.get("Confidence Score") or 0)
+    except (TypeError, ValueError):
+        raise ReviewError(f"Invalid audit confidence at row {number}")
+    if not math.isfinite(confidence) or not 0 <= confidence <= 100:
+        raise ReviewError(f"Invalid audit confidence at row {number}")
+    return confidence
+
+
+def _candidate_from_audit(row, number, *, audit_hash, sheet, by_path, run_id,
+                          selection_reason=None):
+    confidence = _audit_confidence(row, number)
+    raw_path = str(row.get("Full File Path") or "")
+    resolved = Path(raw_path).resolve() if raw_path else None
+    item = by_path.get(os.path.normcase(str(resolved))) if resolved else None
+    case_id = identity(f"{audit_hash}|{sheet}|{number}|{resolved}")
+    candidate = {"candidate_id": identity(f"{run_id}|{case_id}"), "case_id": case_id,
+        "audit_sheet": sheet, "audit_row": number, "confidence": confidence,
+        "current_filename": str(row.get("Current Filename") or ""),
+        "suggested_filename": str(row.get("Suggested Filename") or ""),
+        "source_relative_path": item["path"] if item else None,
+        "source_sha256": item["sha256"] if item else None,
+        "source_exists": item is not None}
+    if selection_reason is not None:
+        candidate["selection_reason"] = selection_reason
+    return candidate
+
+
 def prepare(audit, care_home, documents_root, source_root, output, *,
-            threshold=80.0, all_flags=False, processing_root=None):
+            threshold=80.0, all_flags=False, processing_root=None, include_rows=None):
     if not math.isfinite(threshold) or not 0 <= threshold <= 100:
         raise ReviewError("Confidence threshold must be between 0 and 100")
+    explicit_rows = _validated_include_rows(include_rows)
     root = Path(documents_root).resolve(strict=True)
     audit = Path(audit).resolve(strict=True)
     policy = load_policy(source_root)
     inventory = document_inventory(root, policy)
     by_path = {os.path.normcase(str((root / row["path"]).resolve())): row for row in inventory}
     sheet, rows = read_audit(audit)
+    explicit_rows = _validated_include_rows(explicit_rows, {number for number, _row in rows})
+    explicit_set = set(explicit_rows)
     audit_hash = digest(audit)
     run_id = f"review-{audit_hash[:12]}-{identity(str(root))[:8]}-{uuid.uuid4().hex[:12]}"
+    threshold_rule, provenance = _selection_details(threshold, all_flags, explicit_rows)
     candidates = []
     for number, row in rows:
-        try:
-            confidence = float(row.get("Confidence Score") or 0)
-        except (TypeError, ValueError):
-            raise ReviewError(f"Invalid audit confidence at row {number}")
-        if not math.isfinite(confidence) or not 0 <= confidence <= 100:
-            raise ReviewError(f"Invalid audit confidence at row {number}")
+        confidence = _audit_confidence(row, number)
         flagged = str(row.get("Review Status") or "") not in ("Correct", "Custom Name", "")
-        if not (flagged if all_flags else confidence > threshold):
+        base_selected = flagged if all_flags else confidence > threshold
+        explicit_selected = number in explicit_set
+        if not (base_selected or explicit_selected):
             continue
-        raw_path = str(row.get("Full File Path") or "")
-        resolved = Path(raw_path).resolve() if raw_path else None
-        item = by_path.get(os.path.normcase(str(resolved))) if resolved else None
-        case_id = identity(f"{audit_hash}|{sheet}|{number}|{resolved}")
-        candidates.append({"candidate_id": identity(f"{run_id}|{case_id}"), "case_id": case_id,
-            "audit_sheet": sheet, "audit_row": number, "confidence": confidence,
-            "current_filename": str(row.get("Current Filename") or ""),
-            "suggested_filename": str(row.get("Suggested Filename") or ""),
-            "source_relative_path": item["path"] if item else None,
-            "source_sha256": item["sha256"] if item else None,
-            "source_exists": item is not None})
+        candidate = _candidate_from_audit(row, number, audit_hash=audit_hash, sheet=sheet,
+                                          by_path=by_path, run_id=run_id)
+        if explicit_rows:
+            reason = ("all flagged rows" if all_flags else f"confidence > {threshold:g}") if base_selected else ""
+            if explicit_selected:
+                reason += ("; also " if reason else "") + "explicit audit row"
+            candidate["selection_reason"] = reason
+        candidates.append(candidate)
     queue = {"format_version": 2, "run_id": run_id,
         "prepared_at_utc": utc_now(), "care_home": care_home,
         "audit_workbook": str(audit), "audit_workbook_sha256": audit_hash,
         "documents_root": str(root), "processing_root": str(Path(processing_root).resolve()) if processing_root else str(root),
-        "threshold_rule": "all flagged rows" if all_flags else f"confidence > {threshold:g}",
+        "threshold_rule": threshold_rule,
         "policy": policy, "inventory": inventory, "candidates": candidates}
+    if explicit_rows:
+        queue["explicit_audit_rows"] = explicit_rows
+        queue["selection_provenance"] = provenance
     if Path(output).exists():
         raise ReviewError("Queue already exists; use it or create a new request directory")
     write_json(output, queue)
@@ -308,6 +376,49 @@ def verify_queue(queue):
         raise ReviewError("Audit changed after the review was prepared")
     if document_inventory(queue["documents_root"], queue["policy"]) != queue["inventory"]:
         raise ReviewError("Worker documents changed; refresh the review before applying")
+    # Explicit false-negative recovery has extra provenance. Reconstruct its
+    # exact union from the immutable audit and inventory so edited queues cannot
+    # invent an audit-row origin or a phantom candidate path.
+    if "explicit_audit_rows" in queue or "selection_provenance" in queue:
+        if "explicit_audit_rows" not in queue or "selection_provenance" not in queue:
+            raise ReviewError("Explicit audit-row selection provenance is incomplete")
+        sheet, rows = read_audit(queue["audit_workbook"])
+        explicit_rows = _validated_include_rows(
+            queue["explicit_audit_rows"], {number for number, _row in rows})
+        provenance = queue["selection_provenance"]
+        if not isinstance(provenance, dict):
+            raise ReviewError("Explicit audit-row selection provenance is invalid")
+        threshold = provenance.get("threshold")
+        all_flags = provenance.get("all_flags")
+        if (type(threshold) not in (int, float) or isinstance(threshold, bool)
+                or not math.isfinite(threshold) or not 0 <= threshold <= 100
+                or type(all_flags) is not bool):
+            raise ReviewError("Explicit audit-row selection provenance is invalid")
+        threshold_rule, expected_provenance = _selection_details(threshold, all_flags, explicit_rows)
+        if provenance != expected_provenance or queue.get("threshold_rule") != threshold_rule:
+            raise ReviewError("Explicit audit-row selection provenance does not match the audit")
+        root = Path(queue["documents_root"])
+        by_path = {os.path.normcase(str((root / row["path"]).resolve())): row
+                   for row in queue["inventory"]}
+        explicit_set = set(explicit_rows)
+        expected_candidates = []
+        for number, row in rows:
+            confidence = _audit_confidence(row, number)
+            flagged = str(row.get("Review Status") or "") not in ("Correct", "Custom Name", "")
+            base_selected = flagged if all_flags else confidence > threshold
+            explicit_selected = number in explicit_set
+            if not (base_selected or explicit_selected):
+                continue
+            candidate = _candidate_from_audit(
+                row, number, audit_hash=queue["audit_workbook_sha256"], sheet=sheet,
+                by_path=by_path, run_id=queue["run_id"])
+            reason = ("all flagged rows" if all_flags else f"confidence > {threshold:g}") if base_selected else ""
+            if explicit_selected:
+                reason += ("; also " if reason else "") + "explicit audit row"
+            candidate["selection_reason"] = reason
+            expected_candidates.append(candidate)
+        if queue.get("candidates") != expected_candidates:
+            raise ReviewError("Explicit audit-row candidates do not match the immutable audit and inventory")
 
 
 def evidence_checked(item):
@@ -1119,6 +1230,7 @@ def main(argv=None):
     prep.add_argument("--processing-root")
     prep.add_argument("--threshold", type=float, default=80)
     prep.add_argument("--all-flags", action="store_true")
+    prep.add_argument("--include-row", action="append", type=int, default=[])
     plan = sub.add_parser("plan")
     plan.add_argument("--queue", required=True)
     plan.add_argument("--decisions", required=True)
@@ -1145,7 +1257,8 @@ def main(argv=None):
     try:
         if args.command == "prepare":
             result = prepare(args.audit, args.care_home, args.documents_root, args.source_root, args.output,
-                             threshold=args.threshold, all_flags=args.all_flags, processing_root=args.processing_root)
+                             threshold=args.threshold, all_flags=args.all_flags, processing_root=args.processing_root,
+                             include_rows=args.include_row)
             print(json.dumps({"run_id": result["run_id"], "candidates": len(result["candidates"])}))
         elif args.command == "plan":
             result = make_plan(args.queue, args.decisions, args.output)
