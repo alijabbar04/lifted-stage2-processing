@@ -36,13 +36,17 @@ def setup(tmp_path, monkeypatch):
     (ledger.parent / "review_records.jsonl").write_text("", encoding="utf-8")
     account = wf.Account("test", "codex", "Personal", tmp_path / "codex-home", "test@example.com")
     account.config_dir.mkdir()
+    runtime = {"executable": str(Path(sys.executable).resolve()), "version": "3.test", "implementation": "CPython",
+               "modules": {"openpyxl": "3.test", "fitz": "1.test", "PIL": "11.test"}}
+    monkeypatch.setattr(wf, "resolve_python_runtime", lambda environment=None, candidates=(): dict(runtime))
+    monkeypatch.setattr(wf, "verify_python_runtime", lambda executable, environment=None: dict(runtime))
     def fake_validate(account, model_key, expected_email=None, effort=None, role=None):
         # Echo the exact requested model/effort like the real preflight does.
         choice = wf.model_choice(model_key, effort, role)
         return {"provider": account.provider, "email": "test@example.com", "model": choice["id"], "model_key": model_key,
                 "effort": choice["effort"], "status": "verified", "executable": "codex.exe"}
     monkeypatch.setattr(wf, "validate_selection", fake_validate)
-    return SimpleNamespace(account=account, audit=audit, documents=documents, processing=processing, source=source, ledger=ledger,
+    return SimpleNamespace(account=account, audit=audit, documents=documents, processing=processing, source=source, ledger=ledger, runtime=runtime,
                            kwargs=dict(audit_report=audit, document_root=documents, care_home="Care home", source_root=source,
                                        assets_root=assets, workspace_root=tmp_path / "context", ledger_path=ledger,
                                        misnaming_path=tmp_path / "Misnaming Record.xlsx", processing_root=processing, completed_audit=True))
@@ -57,6 +61,59 @@ def test_account_environment_process_local_and_no_default_claude_redirect(tmp_pa
     assert original["CLAUDE_CONFIG_DIR"] == "wrong"
     isolated = wf.Account("2", "claude", "Personal", tmp_path)
     assert wf.account_environment(isolated, {}) == {"CLAUDE_CONFIG_DIR": str(tmp_path)}
+
+
+def test_python_runtime_probe_is_exact_external_and_checks_inspection_imports(tmp_path, monkeypatch):
+    executable = tmp_path / "python.exe"
+    executable.write_bytes(b"stub")
+    seen = {}
+    payload = {"executable": str(executable.resolve()), "version": "3.13.7", "implementation": "CPython",
+               "modules": {"openpyxl": "3.1.5", "fitz": "1.27.2.3", "PIL": "11.3.0"}}
+    def fake_run(args, **kwargs):
+        seen.update(args=args, kwargs=kwargs)
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload) + "\n", stderr="")
+    monkeypatch.setattr(wf.subprocess, "run", fake_run)
+    environment = {"PATH": "isolated", "CODEX_HOME": "selected"}
+    assert wf.verify_python_runtime(executable, environment) == payload
+    assert seen["args"][:3] == [str(executable.resolve()), "-I", "-c"]
+    assert all(name in seen["args"][3] for name in wf.PYTHON_RUNTIME_MODULES)
+    assert seen["kwargs"]["env"] == environment
+    assert os.environ.get("CODEX_HOME") != "selected"
+
+
+def test_python_runtime_probe_missing_library_fails_before_request(tmp_path, monkeypatch):
+    executable = tmp_path / "python.exe"
+    executable.write_bytes(b"stub")
+    monkeypatch.setattr(wf.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=1, stdout="", stderr="ModuleNotFoundError: No module named 'fitz'\n"))
+    with pytest.raises(wf.WorkflowError, match="missing required document-inspection libraries.*PyMuPDF"):
+        wf.verify_python_runtime(executable, {})
+
+
+def test_python_runtime_resolution_rejects_frozen_app_and_fails_closed(tmp_path, monkeypatch):
+    frozen_app = tmp_path / "Stage2_Processing.exe"
+    frozen_app.write_bytes(b"not python")
+    monkeypatch.setattr(wf.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(wf.sys, "executable", str(frozen_app))
+    monkeypatch.setattr(wf.shutil, "which", lambda *a, **k: None)
+    with pytest.raises(wf.WorkflowError, match="No suitable external Python runtime"):
+        wf.resolve_python_runtime({}, ())
+    with pytest.raises(wf.WorkflowError, match="frozen Stage 2 application"):
+        wf.verify_python_runtime(frozen_app, {})
+
+
+def test_python_runtime_resolution_uses_registered_process_local_override(tmp_path, monkeypatch):
+    executable = tmp_path / "python.exe"
+    executable.write_bytes(b"stub")
+    expected = {"executable": str(executable.resolve()), "version": "3.13.7", "implementation": "CPython", "modules": {}}
+    seen = []
+    def fake_verify(candidate, environment=None):
+        seen.append((Path(candidate), dict(environment or {})))
+        return expected
+    monkeypatch.setattr(wf, "verify_python_runtime", fake_verify)
+    result = wf.resolve_python_runtime({"STAGE2_PYTHON": str(executable), "PATH": "child-only"})
+    assert result == expected
+    assert seen[0] == (executable, {"STAGE2_PYTHON": str(executable), "PATH": "child-only"})
 
 
 def test_discovery_reads_only_registered_metadata(tmp_path, monkeypatch):
@@ -108,12 +165,41 @@ def test_roles_separate_memory_and_authority(setup):
         assert manifest["review_confidence_operator"] == ">"
         assert manifest["review_confidence_threshold"] == 80
         assert not manifest["expanded_review_authorized"]
+        assert manifest["python_runtime"] == setup.runtime
     assert str(setup.documents) in audit.provider_args
     assert str(setup.source) in learning.provider_args
     with pytest.raises(wf.WorkflowError, match="cannot be authorized"):
         wf.prepare_workflow("audit-review", setup.account, "luna", allow_code_changes=True, **setup.kwargs)
     with pytest.raises(wf.WorkflowError, match="cannot be authorized"):
         wf.prepare_workflow("code-learning", setup.account, "sol", allow_document_changes=True, **setup.kwargs)
+
+
+def test_prepared_requests_use_and_export_only_verified_python(setup):
+    original_path = os.environ.get("PATH")
+    audit = wf.prepare_workflow("audit-review", setup.account, "luna", **setup.kwargs)
+    learning = wf.prepare_workflow("code-learning", setup.account, "sol", allow_code_changes=True, **setup.kwargs)
+    for prepared in (audit, learning):
+        request = prepared.prompt_file.read_text(encoding="utf-8")
+        manifest = json.loads((prepared.request_dir / "manifest.json").read_text())
+        executable = setup.runtime["executable"]
+        assert prepared.python_runtime == setup.runtime and manifest["python_runtime"] == setup.runtime
+        assert f"Verified helper Python: {executable}." in request
+        assert "do not substitute python, python3, py" in request
+        assert "& " + wf._ps_quote(executable) in request
+        assert "& 'python' " not in request and "& 'python3' " not in request and "& 'py' " not in request
+        assert prepared.environment["STAGE2_PYTHON"] == executable
+        assert prepared.environment["PATH"].split(os.pathsep)[0] == str(Path(executable).parent)
+    assert os.environ.get("PATH") == original_path
+
+
+def test_launch_rechecks_exact_python_without_fallback(setup, monkeypatch):
+    prepared = wf.prepare_workflow("audit-review", setup.account, "luna", **setup.kwargs)
+    changed = dict(setup.runtime)
+    changed["version"] = "3.changed"
+    monkeypatch.setattr(wf, "verify_python_runtime", lambda executable, environment=None: changed)
+    monkeypatch.setattr(wf.subprocess, "Popen", lambda *a, **k: pytest.fail("must not launch"))
+    with pytest.raises(wf.WorkflowError, match="runtime changed after preparation"):
+        wf.launch_workflow(prepared)
 
 
 def test_queue_scope_and_processing_lock_paths(setup):

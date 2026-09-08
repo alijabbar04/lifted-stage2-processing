@@ -23,6 +23,9 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
+from stage2_locking import (DOCUMENT_WRITER_LOCK, PathWriterLock,
+                            WriterLockBusy)
+
 
 class ReviewError(RuntimeError):
     pass
@@ -104,38 +107,17 @@ def write_json(path, value):
 
 
 @contextlib.contextmanager
-def writer_lock(root, name=".docreview_batch_writer.lock"):
-    """Use the same permanent OS lock as Stage 2; never remove a lock file."""
-    root = Path(root).resolve(strict=True)
-    stream = (root / name).open("a+b")
-    locked = False
+def writer_lock(root, name=DOCUMENT_WRITER_LOCK):
+    """Use the exact same OS lock lifecycle as the Stage 2 engine."""
+    lock = PathWriterLock(root, name)
     try:
-        stream.seek(0, 2)
-        if not stream.tell():
-            stream.write(b"\0")
-            stream.flush()
-        stream.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            locked = True
-        except OSError as exc:
-            raise ReviewError("Another operation owns this folder's writer lock") from exc
+        lock.acquire()
+    except WriterLockBusy as exc:
+        raise ReviewError("Another operation owns this folder's writer lock") from exc
+    try:
         yield
     finally:
-        if locked:
-            stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        stream.close()
+        lock.release()
 
 
 def request_writer(*, directory=False):

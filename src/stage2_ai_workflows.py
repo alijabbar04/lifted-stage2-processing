@@ -16,6 +16,7 @@ from pathlib import Path
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from types import MappingProxyType
@@ -74,6 +75,7 @@ MODEL_CHOICES = {key: {"label": entry["label"], "provider": entry["provider"], "
                        "roles": tuple(sorted(entry["roles"], key=lambda role: entry["roles"][role][0])), "family": entry["family"]}
                  for key, entry in MODEL_CATALOG.items()}
 RULE_FILES = ("REVIEW_RULES.md", "LEARNING_RULES.md", "NAMING_RULES.md", "WORKFLOW_GUIDE.md", "REVIEW_RECORDS.md")
+PYTHON_RUNTIME_MODULES = ("openpyxl", "fitz", "PIL")
 
 
 def model_keys_for_role(role):
@@ -164,6 +166,7 @@ class PreparedWorkflow:
     environment: dict = field(repr=False)
     preflight: dict = field(default_factory=dict)
     effort: str = ""
+    python_runtime: dict = field(default_factory=dict)
 
 
 def _json(path, default=None):
@@ -250,6 +253,93 @@ def account_environment(account, environ=None):
     else:
         raise WorkflowError("Unknown AI provider.")
     return env
+
+
+def verify_python_runtime(executable, environment=None):
+    """Verify one exact external Python and the document-inspection imports.
+
+    The check is deliberately isolated from the application process and never
+    installs anything.  A frozen Stage 2 executable is not a Python runtime,
+    even though ``sys.executable`` points to it.
+    """
+    candidate = Path(executable).expanduser()
+    try:
+        candidate = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise WorkflowError(f"The selected Python runtime no longer exists: {candidate}") from exc
+    stem = candidate.stem.casefold()
+    if not candidate.is_file() or not (stem in ("python", "pythonw") or stem.startswith("python3")):
+        raise WorkflowError("The selected helper runtime is not an external Python executable. The frozen Stage 2 application cannot be used as Python.")
+    probe = (
+        "import importlib,json,platform,sys\n"
+        f"names={PYTHON_RUNTIME_MODULES!r}\n"
+        "mods={}\n"
+        "for name in names:\n"
+        " m=importlib.import_module(name); mods[name]=str(getattr(m,'__version__',''))\n"
+        "print(json.dumps({'executable':sys.executable,'version':platform.python_version(),"
+        "'implementation':platform.python_implementation(),'modules':mods},sort_keys=True))\n"
+    )
+    try:
+        result = subprocess.run([str(candidate), "-I", "-c", probe],
+                                env=dict(os.environ if environment is None else environment), capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=20,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkflowError(f"Python helper runtime verification failed for {candidate}. Nothing was launched.") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "required imports failed").strip().splitlines()[-1][:300]
+        raise WorkflowError(f"Python helper runtime {candidate} is missing required document-inspection libraries "
+                            f"(openpyxl, PyMuPDF and Pillow): {detail}")
+    try:
+        payload = json.loads(next(line for line in reversed(result.stdout.splitlines()) if line.strip()))
+    except (StopIteration, ValueError, TypeError) as exc:
+        raise WorkflowError(f"Python helper runtime {candidate} returned an invalid verification result. Nothing was launched.") from exc
+    reported = Path(payload.get("executable", "")).resolve()
+    if not _same_path(candidate, reported) or not all(name in payload.get("modules", {}) for name in PYTHON_RUNTIME_MODULES):
+        raise WorkflowError(f"Python helper runtime identity/import verification did not match {candidate}. Nothing was launched.")
+    return {"executable": str(candidate), "version": str(payload.get("version") or ""),
+            "implementation": str(payload.get("implementation") or ""),
+            "modules": {name: str(payload["modules"].get(name) or "") for name in PYTHON_RUNTIME_MODULES}}
+
+
+def resolve_python_runtime(environment=None, candidates=()):
+    """Select and verify a deterministic external Python for helper commands.
+
+    Explicit candidates are tried first.  Otherwise a process-local override,
+    a normal (non-frozen) Python host, conventional per-user Windows installs,
+    and PATH are considered.  The returned absolute executable is the only
+    runtime placed in a request; ``py`` and implicit command lookup are never
+    recorded.
+    """
+    env = dict(os.environ if environment is None else environment)
+    choices = [Path(item) for item in candidates if item]
+    if env.get("STAGE2_PYTHON"):
+        choices.append(Path(env["STAGE2_PYTHON"]))
+    if not getattr(sys, "frozen", False):
+        choices.append(Path(sys.executable))
+    local = env.get("LOCALAPPDATA")
+    if local:
+        base = Path(local) / "Programs" / "Python"
+        if base.is_dir():
+            choices.extend(sorted(base.glob("Python*/python.exe"), key=lambda path: path.parent.name.casefold(), reverse=True))
+    for name in ("python.exe", "python3.exe", "python3", "python"):
+        found = shutil.which(name, path=env.get("PATH"))
+        if found:
+            choices.append(Path(found))
+    errors, seen = [], set()
+    for candidate in choices:
+        key = str(candidate.expanduser().absolute()).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            return verify_python_runtime(candidate, env)
+        except WorkflowError as exc:
+            errors.append(str(exc))
+    suffix = f" Last check: {errors[-1]}" if errors else ""
+    raise WorkflowError("No suitable external Python runtime was found for the Stage 2 transaction helper. "
+                        "Install or register Python with openpyxl, PyMuPDF and Pillow, then retry; the frozen Stage 2 application is never used as Python."
+                        + suffix)
 
 
 def find_cli(provider):
@@ -503,6 +593,15 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
     verified = validate_selection(account, model_key, expected_email, effort=choice["effort"], role=role) if preflight else {}
     if verified and (verified.get("model") != choice["id"] or verified.get("effort") != choice["effort"]):
         raise WorkflowError("Verification returned a different model/effort than selected. No request was prepared.")
+    child_environment = account_environment(account)
+    python_runtime = resolve_python_runtime(child_environment)
+    python_executable = python_runtime["executable"]
+    # This environment belongs only to the provider child.  Prepending the
+    # verified runtime keeps incidental `python` calls deterministic, while all
+    # application-owned helper commands below still use the absolute path.
+    runtime_dir = str(Path(python_executable).parent)
+    child_environment["PATH"] = runtime_dir + (os.pathsep + child_environment["PATH"] if child_environment.get("PATH") else "")
+    child_environment["STAGE2_PYTHON"] = python_executable
     workspace = (Path(workspace_root or default_workspace_root()) / role).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     request_dir = workspace / "requests" / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8])
@@ -542,6 +641,7 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
                 "provider": account.provider, "model": choice["id"], "model_key": choice["key"], "model_label": choice["label"],
                 "effort": choice["effort"], "effort_source": "explicit" if choice["effort_explicit"] else "recommended", "account_id": account.id,
                 "expected_account_email": verified.get("email") or expected_email or account.email, "rules_sha256": rule_hashes,
+                "python_runtime": python_runtime,
                 "allow_document_changes": bool(allow_document_changes), "allow_code_changes": bool(allow_code_changes),
                 "allow_record_updates": True, "allow_publish_or_install": False, "state": "prepared", "preflight": {k: v for k, v in verified.items() if k != "executable"}}
     (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -559,6 +659,7 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
                     f"Read shared context `{memory}`. Both providers for this role receive these exact same files.\n\n"
                     f"Selected account: {manifest['expected_account_email'] or 'must be verified before launch'}\n"
                     f"Selected model: {choice['id']} ({choice['label']}) / {choice['effort']} effort. No alternate account, model or effort is authorized.\n"
+                    f"Verified helper Python: {python_executable}. Use this exact executable for every Stage 2 transaction-helper command; do not substitute python, python3, py, or the Stage 2 application.\n"
                     f"Care home: {care_home.strip() or '(cross-run learning)'}\n"
                     f"Audit: {audit or '(not required for cross-run learning)'}\nDocuments: {documents or '(not in write scope)'}\n"
                     f"Processing (Files) root to lock while applying: {processing or '(not configured; do not guess)'}\n"
@@ -574,14 +675,14 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
                     "LEARNING_REVIEW.md and regression evidence for code learning. Explain completion, unresolved cases and verification honestly.\n"
                     "Update manifest state to completed only after outputs and record reconciliation are verified; otherwise record blocked/failed and why.\n")
     if role == "audit-review" and source and (source / "src" / "ai_review.py").is_file():
-        helper_args = ["python", str(source / "src" / "ai_review.py"), "prepare", "--audit", str(audit),
+        helper_args = [python_executable, str(source / "src" / "ai_review.py"), "prepare", "--audit", str(audit),
                        "--care-home", care_home.strip(), "--documents-root", str(documents), "--source-root", str(source),
                        "--output", str(request_dir / "review_queue.json")]
         if processing:
             helper_args += ["--processing-root", str(processing)]
         helper_args += ["--all-flags"] if review_all_flags else ["--threshold", "80"]
         request_text += ("\n## Required transaction-helper intake\n\n"
-                         "Use the existing installed Python environment with openpyxl. This preparation command is read-only for worker documents:\n\n"
+                         "Use the exact verified external Python recorded in the manifest. This preparation command is read-only for worker documents:\n\n"
                          "```powershell\n& " + " ".join(_ps_quote(arg) for arg in helper_args) + "\n```\n\n"
                          "Follow the helper schema in context/REVIEW_RULES.md and REVIEW_RECORDS.md for decisions, plan, authorized apply, and sync-records. "
                          f"When syncing, pass --ledger-root {_ps_quote(ledger.parent)}, --ledger-path {_ps_quote(ledger)}, "
@@ -594,7 +695,7 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
         request_text += ("\n## Recording learning decisions\n\n"
                          "Use the helper's update-learning schema from REVIEW_RECORDS.md. Maintain the six improvement fields through journal-first updates, "
                          "not direct workbook edits. Record updates are part of this handoff; they do not grant code changes when that permission is false.\n\n"
-                         "```powershell\n& " + " ".join(_ps_quote(arg) for arg in ["python", str(source / "src" / "ai_review.py"),
+                         "```powershell\n& " + " ".join(_ps_quote(arg) for arg in [python_executable, str(source / "src" / "ai_review.py"),
                          "update-learning", "--updates", str(request_dir / "learning_updates.json"), "--ledger-root", str(ledger.parent),
                          "--ledger-path", str(ledger), "--authorized"]) + "\n```\n")
     prompt_file = request_dir / "REQUEST.md"
@@ -623,8 +724,8 @@ def prepare_workflow(role, account, model_key, *, audit_report=None, document_ro
         for additional in dict.fromkeys(str(p) for p in writable):
             args += ["--add-dir", additional]
         args += [command]
-    return PreparedWorkflow(role, workspace, request_dir, prompt_file, command, args, account, model_key, account_environment(account), verified,
-                            choice["effort"])
+    return PreparedWorkflow(role, workspace, request_dir, prompt_file, command, args, account, model_key, child_environment, verified,
+                            choice["effort"], python_runtime)
 
 
 def _ps_quote(value):
@@ -673,6 +774,12 @@ def _check_launch(prepared):
     effort = prepared.effort or manifest.get("effort") or prepared.preflight.get("effort")
     if manifest.get("effort") != effort or prepared.preflight.get("effort") != effort:
         raise WorkflowError("The prepared effort no longer matches its manifest. Prepare a fresh handoff.")
+    recorded_runtime = manifest.get("python_runtime")
+    if not isinstance(recorded_runtime, dict) or recorded_runtime != prepared.python_runtime:
+        raise WorkflowError("The prepared Python helper runtime no longer matches its manifest. Prepare a fresh handoff.")
+    runtime = verify_python_runtime(recorded_runtime.get("executable", ""), prepared.environment)
+    if runtime != recorded_runtime:
+        raise WorkflowError("The prepared Python helper runtime changed after preparation. Prepare a fresh handoff; no fallback was selected.")
     # The account manager may have changed the profile after preparation.
     verified = validate_selection(prepared.account, prepared.model_key, prepared.preflight["email"], effort=effort, role=prepared.role)
     if verified.get("model") != manifest.get("model") or verified.get("effort") != effort:

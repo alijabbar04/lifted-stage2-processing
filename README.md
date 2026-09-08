@@ -1,6 +1,6 @@
 # Stage 2 — Processing
 
-## v1.5.0 Obsidian / Jade refinement
+## v1.5.1 Obsidian / Jade notifications and recovery — build 2026.09.08-slack1
 
 The current UI direction is **Graphite + Deep Jade**: a near-black/graphite
 surface with restrained jade accents, real filled/outlined buttons, a clean
@@ -44,6 +44,14 @@ CLI is 2.1.263. Fable 5.1 / High is a code-learning recommendation, while
 Astra / Medium is a provisional complex-case alternative—not a benchmark
 claim—and filename corrections must never trigger automatic code changes.
 
+### Windows batch-folder lock cleanup
+
+Stage 2 keeps the same `.docreview_batch_writer.lock` path while batch work is
+active. On Windows, after unlocking and closing the writer, it makes a
+best-effort removal attempt. Another standard Python holder can keep the file
+open, leaving a harmless remnant for the next successful use. POSIX and
+request/ledger locks remain permanent by design; never delete locks manually.
+
 ## Earlier compact baseline (v1.4.1)
 
 The compact near-black UI keeps the three key run measures visible and moves
@@ -60,7 +68,7 @@ Document corrections use hash-checked transactions and full-category ranking;
 code learning requires evidence and regression tests. Both are explicit actions,
 not hidden extra API work after processing.
 
-**Settings → Notifications…** configures Discord and/or Telegram lifecycle
+**Settings → Notifications…** configures Discord, Telegram and/or Slack lifecycle
 updates. Credentials stay local; public builds contain no bot tokens.
 See the [complete user guide](docs/USER_GUIDE.md),
 [AI workflow details](docs/AI_WORKFLOW_INTEGRATION.md) and
@@ -327,7 +335,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.0 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.1 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

@@ -142,6 +142,8 @@ from stage2_compact_ui import CompactDashboard
 from stage2_notifications import NotificationService, normalize_settings
 import stage2_ai_workflows as ai_workflows
 from stage2_theme import PALETTES, resolve_palette
+from stage2_locking import (DOCUMENT_WRITER_LOCK, PathWriterLock,
+                            WriterLockBusy)
 from local_orientation import (
     MODEL_NAME as ORIENTATION_MODEL_NAME,
     MODEL_REVISION as ORIENTATION_MODEL_REVISION,
@@ -1342,8 +1344,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.5.0"
-APP_BUILD = "2026.09.07-jade1"
+APP_VERSION = "1.5.1"
+APP_BUILD = "2026.09.08-slack1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -4950,58 +4952,25 @@ class BatchWriterBusy(RuntimeError):
 
 
 class CareHomeWriterLock:
-    """OS-backed nonblocking lock, released even when a process crashes.
-
-    Keep the same lock file permanently: deleting/recreating it can let two
-    processes lock different file objects under one name on some platforms.
-    """
-    NAME = ".docreview_batch_writer.lock"
+    """App-facing wrapper around the shared engine/review-helper lock."""
+    NAME = DOCUMENT_WRITER_LOCK
 
     def __init__(self, care_home_dir):
-        self.path = Path(care_home_dir).resolve() / self.NAME
-        self.stream = None
+        self._lock = PathWriterLock(care_home_dir, self.NAME)
+        self.path = self._lock.path
 
     def acquire(self):
-        if self.stream is not None:
-            raise RuntimeError("Writer lock is already acquired")
-        stream = None
         try:
-            stream = self.path.open("a+b")
-            stream.seek(0, 2)
-            if stream.tell() == 0:
-                stream.write(b"\0")
-                stream.flush()
-            stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.stream = stream
+            self._lock.acquire()
             return self
-        except OSError as exc:
-            if stream is not None:
-                stream.close()
+        except WriterLockBusy as exc:
             raise BatchWriterBusy(
                 "Another Stage 2 operation is using this care-home folder, or "
                 "the folder's writer lock is unavailable. Wait for the current "
                 "operation to finish, then check batch status again.") from exc
 
     def release(self):
-        stream, self.stream = self.stream, None
-        if stream is None:
-            return
-        try:
-            stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        finally:
-            stream.close()
+        self._lock.release()
 
     def __enter__(self):
         return self.acquire()
@@ -7466,6 +7435,12 @@ class Engine:
         controller = getattr(self, "_review_controller", None)
         run_id = getattr(self, "_review_run_id", "")
         if controller is not None and run_id:
+            # Validate even when a receipt already exists.  A resumed engine
+            # must never treat a stale/partial in-memory scope as complete.
+            workers = controller.validate_processing_scope(
+                run_id, processing_root=self.dir,
+                worker_dirs=list(self._audit_worker_dirs))
+            self._audit_worker_dirs = [Path(item) for item in workers]
             if controller.get_status(run_id, processing_root=self.dir).get("processing_receipt"):
                 return
             controller.record_processing_complete(run_id, processing_root=self.dir,
@@ -7729,6 +7704,15 @@ class Engine:
             self._phase_progress("processing", total, total)
             self.set_progress(total, total)
             review_run_id = getattr(self, "_review_run_id", "")
+            # A worker-level failure leaves its folder out of the final scope.
+            # Validate before writing the audit-only resume boundary so Start
+            # can retry the outstanding original worker instead.
+            if getattr(self, "_review_controller", None) is not None \
+                    and review_run_id:
+                workers = self._review_controller.validate_processing_scope(
+                    review_run_id, processing_root=self.dir,
+                    worker_dirs=list(self._audit_worker_dirs))
+                self._audit_worker_dirs = [Path(item) for item in workers]
             checkpoint_saved = write_live_checkpoint(
                 self.dir, total, total, "", self.stats.get("errors", 0),
                 False, review_run_id, self._audit_worker_dirs,
@@ -8969,6 +8953,118 @@ class Engine:
             path, zoom=self.resolution, pages=pages, max_pages=max_pages)
         return imgs, text, page_idxs, total, segment_view
 
+    @staticmethod
+    def _batch_worker_state(state: "BatchState", source: Path):
+        """Return only the durable worker record for one exact source path."""
+        key = str(Path(source).resolve()).casefold()
+        direct = state.data.get("workers", {}).get(key)
+        if direct is not None:
+            return direct
+        for worker in state.data.get("workers", {}).values():
+            try:
+                if str(Path(worker.get("source_path") or "").resolve()).casefold() == key:
+                    return worker
+            except Exception:
+                continue
+        return None
+
+    def _batch_submitted_worker_scope(self, state: "BatchState"):
+        """Resolve the immutable worker cohort selected at batch submission.
+
+        Version-5 states persist this list before the first provider request.
+        Older states may be inferred only from their saved request inventory;
+        the current Files root is never used as a fallback because it may now
+        contain later, unsubmitted workers.
+        """
+        raw = state.data.get("submitted_worker_scope")
+        inferred = raw is None
+        if inferred:
+            inventory = state.data.get("primary_inventory")
+            evidence = (inventory if isinstance(inventory, dict) and inventory
+                        else state.data.get("requests"))
+            if not isinstance(evidence, dict) or not evidence:
+                raise RuntimeError(
+                    "The legacy batch has no saved worker-scope evidence. "
+                    "Apply is blocked rather than including the current Files root.")
+            raw = []
+            seen = set()
+            for meta in evidence.values():
+                if not isinstance(meta, dict):
+                    raise RuntimeError("The saved batch worker-scope evidence is invalid.")
+                source = str(meta.get("worker_dir") or "").strip()
+                name = str(meta.get("worker") or Path(source).name).strip()
+                key = source.casefold()
+                if not source or not name:
+                    raise RuntimeError("The saved batch worker-scope evidence is incomplete.")
+                if key not in seen:
+                    seen.add(key)
+                    raw.append({"name": name, "source_path": source})
+
+        if not isinstance(raw, list) or not raw:
+            raise RuntimeError("The submitted batch worker scope is missing or empty.")
+        root = self.dir.resolve()
+        scope = []
+        names = set()
+        paths = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                raise RuntimeError("The submitted batch worker scope is invalid.")
+            name = str(item.get("name") or "").strip()
+            source_text = str(item.get("source_path") or "").strip()
+            if not name or not source_text:
+                raise RuntimeError("The submitted batch worker scope is incomplete.")
+            source = Path(source_text).resolve()
+            name_key = name.casefold()
+            path_key = str(source).casefold()
+            if (source.parent != root or source.name.casefold() != name_key
+                    or name_key in names or path_key in paths):
+                raise RuntimeError(
+                    "The submitted batch worker scope does not match unique "
+                    "immediate folders under its original Files root.")
+            names.add(name_key)
+            paths.add(path_key)
+            if source.exists():
+                if not source.is_dir() or source.is_symlink():
+                    raise RuntimeError("A submitted worker path is no longer a safe folder.")
+            else:
+                worker = self._batch_worker_state(state, source)
+                final_text = str((worker or {}).get("final_path")
+                                 or (worker or {}).get("movement_target") or "")
+                final = Path(final_text) if final_text else None
+                if (not worker or worker.get("movement_status") not in
+                        ("started", "complete") or final is None
+                        or not final.is_dir()):
+                    raise RuntimeError(
+                        f"Submitted worker '{name}' is missing and has no "
+                        "durable completed-move record.")
+            scope.append(source)
+
+        # Every saved request must belong to the selected cohort.  This catches
+        # both a damaged new state and an unsafe legacy inference.
+        for collection_name in ("primary_inventory", "requests"):
+            collection = state.data.get(collection_name)
+            if not isinstance(collection, dict):
+                continue
+            for meta in collection.values():
+                try:
+                    key = str(Path(meta["worker_dir"]).resolve()).casefold()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "A saved batch request has invalid worker-scope metadata.") from exc
+                if key not in paths:
+                    raise RuntimeError(
+                        "A saved batch request falls outside the submitted worker scope.")
+
+        if inferred:
+            state.data["version"] = max(5, int(state.data.get("version", 1)))
+            state.data["submitted_worker_scope"] = [
+                {"name": source.name, "source_path": str(source)}
+                for source in scope]
+            if not state.save():
+                raise DurableStateError(
+                    "the inferred legacy worker scope could not be persisted")
+        return scope
+
     @_care_home_writer_operation
     def run_batch_submit(self):
         """Phase A: collect & submit. Runs on the background thread like run().
@@ -9144,6 +9240,16 @@ class Engine:
                          "reprocess": self.reprocess,
                          "move_mode": self.move_mode,
                          "move_dest": str(self.move_dest) if self.move_dest else ""})
+            # Bind both the automatic review and the exact selected cohort in
+            # the very first durable state, before any provider POST.  A later
+            # restart must not infer either from current settings/root content.
+            state.data["version"] = max(5, int(state.data.get("version", 1)))
+            state.data["auto_review_run_id"] = str(
+                getattr(self, "_review_run_id", "") or "")
+            state.data["submitted_worker_scope"] = [
+                {"name": worker.name,
+                 "source_path": str(worker.resolve())}
+                for worker in workers]
             inventory_counts = {}
             inventory = {}
             for worker, path, digest, pages in eligible:
@@ -10074,15 +10180,37 @@ class Engine:
                 self.on_done(self.stats, "batch_followup_ambiguous")
                 return
 
+            try:
+                submitted_scope = self._batch_submitted_worker_scope(state)
+            except Exception as exc:
+                self.log("*** BATCH WORKER SCOPE IS UNVERIFIABLE. Apply, "
+                         "movement, audit and automatic review are blocked; "
+                         "the saved state is retained. ***")
+                self.on_done(self.stats, "batch_scope_invalid:" + str(exc))
+                return
+
             # Classification, finishing and movement were durably completed
             # before the optional audit began. A restart resumes only audit.
             if state.data.get("processing_complete"):
                 self._audit_worker_dirs = []
-                for worker in (state.data.get("workers") or {}).values():
+                for source in submitted_scope:
+                    worker = self._batch_worker_state(state, source)
+                    if not worker or not worker.get("completed"):
+                        self.on_done(
+                            self.stats,
+                            "batch_scope_invalid:Processing was marked complete "
+                            f"without a completed record for '{source.name}'.")
+                        return
                     final_path = Path(worker.get("final_path")
                                       or worker.get("source_path") or "")
                     if final_path.is_dir():
                         self._audit_worker_dirs.append(final_path)
+                    else:
+                        self.on_done(
+                            self.stats,
+                            "batch_scope_invalid:The completed final folder for "
+                            f"'{source.name}' is unavailable.")
+                        return
                 self.log("Batch processing is already complete; resuming only "
                          "the separate post-run audit phase.")
                 self._record_review_processing()
@@ -10233,9 +10361,11 @@ class Engine:
 
             # Recover the narrow crash window after shutil.move succeeded but
             # before the worker completion record was saved.
-            for worker in state.data.setdefault("workers", {}).values():
+            for source in submitted_scope:
+                worker = self._batch_worker_state(state, source)
+                if worker is None:
+                    continue
                 target = Path(worker.get("movement_target") or "")
-                source = Path(worker.get("source_path") or "")
                 if (worker.get("movement_status") == "started"
                         and str(target) and target.is_dir()
                         and not source.is_dir()):
@@ -10257,7 +10387,9 @@ class Engine:
                     if final_path.is_dir():
                         self._audit_worker_dirs.append(final_path)
 
-            workers = worker_dirs_in(self.dir)
+            # Never re-enumerate the current Files root here. It may contain a
+            # later cohort that was not part of this paid submission.
+            workers = [worker for worker in submitted_scope if worker.is_dir()]
             total = len(workers)
             for idx, w in enumerate(workers, 1):
                 self._check_stop()
@@ -10498,14 +10630,23 @@ class Engine:
                     elif worker_state.get("movement_status") == "pending":
                         worker_state["movement_status"] = "not_ready"
                     worker_state["final_path"] = str(final_dir)
-                    worker_state["completed"] = True
-                    worker_state["completed_ts"] = \
-                        datetime.datetime.now().isoformat(timespec="seconds")
+                    # In move mode, a source-resident folder is not at its
+                    # captured final document root yet. Retain it as incomplete
+                    # so Check batch status can retry movement/attention rather
+                    # than producing a partial processing receipt.
+                    worker_complete = not self.move_mode or final_dir != w
+                    worker_state["completed"] = worker_complete
+                    if worker_complete:
+                        worker_state["completed_ts"] = \
+                            datetime.datetime.now().isoformat(timespec="seconds")
+                    else:
+                        worker_state.pop("completed_ts", None)
                     if not state.save():
                         raise DurableStateError(
                             "worker completion could not be persisted")
-                    self._audit_worker_dirs.append(final_dir)
-                    self._record_roster_handover(w, final_dir)
+                    if worker_complete:
+                        self._audit_worker_dirs.append(final_dir)
+                        self._record_roster_handover(w, final_dir)
                 except (StopRequested, LimitReached, CreditExhausted):
                     raise
                 except Exception as e:
@@ -10523,9 +10664,13 @@ class Engine:
                     self.log(f"  ! result for '{meta.get('path','?')}' could not "
                              f"be matched to any file (moved/deleted) - skipped")
 
-            incomplete_workers = [
-                worker for worker in state.data.get("workers", {}).values()
-                if not worker.get("completed")]
+            incomplete_workers = []
+            for source in submitted_scope:
+                worker = self._batch_worker_state(state, source)
+                if not worker or not worker.get("completed"):
+                    incomplete_workers.append(
+                        worker or {"name": source.name,
+                                   "source_path": str(source)})
             if incomplete_workers:
                 state.data["phase"] = "processing_incomplete"
                 state.save()
@@ -10540,6 +10685,19 @@ class Engine:
             self._phase_progress("processing", total, total)
             self.set_progress(total, total)
             self.manifest.save()
+            # Rebuild the final scope in the immutable submitted order. This
+            # also excludes any stale worker records from older buggy builds.
+            self._audit_worker_dirs = [
+                Path(self._batch_worker_state(state, source).get("final_path")
+                     or source)
+                for source in submitted_scope]
+            review_run_id = getattr(self, "_review_run_id", "")
+            if getattr(self, "_review_controller", None) is not None \
+                    and review_run_id:
+                workers = self._review_controller.validate_processing_scope(
+                    review_run_id, processing_root=self.dir,
+                    worker_dirs=list(self._audit_worker_dirs))
+                self._audit_worker_dirs = [Path(item) for item in workers]
             # This is the durable boundary between paid classification/
             # finishing/movement and the optional audit. It is persisted before
             # the audit starts, so a stop/crash can never repeat finishing.

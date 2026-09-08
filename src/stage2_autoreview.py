@@ -280,6 +280,31 @@ class Stage2AutoReviewController:
             _write_json_atomic(path, state)
         return self._public(state)
 
+    def validate_processing_scope(self, run_id, *, processing_root=None, worker_dirs):
+        """Check the entire Start-time scope without committing a receipt.
+
+        Engines call this before marking processing complete. In particular,
+        a per-worker exception must leave a resumable processing checkpoint,
+        not an immutable partial receipt followed by a paid partial audit.
+        Document-level errors remain eligible for the audit once all worker
+        folders have actually completed.
+        """
+        _path, state = self._locate(run_id, processing_root)
+        return self._validate_final_scope(state["snapshot"], worker_dirs)
+
+    def _validate_final_scope(self, snapshot, worker_dirs):
+        workers = self._worker_dirs(worker_dirs, snapshot["document_root"], allow_empty=True)
+        expected = {name.casefold() for name in snapshot["scope_worker_names"]}
+        actual = {Path(item).name.casefold() for item in workers}
+        missing, unexpected = expected - actual, actual - expected
+        if missing or unexpected:
+            raise AutoReviewError(
+                "Processing worker scope is incomplete or different from Start "
+                f"({len(missing)} missing, {len(unexpected)} unexpected). "
+                "The full Accuracy Audit and automatic AI review cannot start. "
+                "Retain the checkpoint and finish/reconcile the original workers first.")
+        return workers
+
     def record_processing_complete(self, run_id, *, processing_root=None,
                                    worker_dirs, skipped_workers=(), errors=()):
         """Record the exact final/moved worker scope after all writers finish."""
@@ -287,9 +312,7 @@ class Stage2AutoReviewController:
         snapshot = state["snapshot"]
         error_rows = [str(item) for item in errors or ()]
         skipped = self._worker_names(skipped_workers, allow_empty=True)
-        workers = self._worker_dirs(
-            worker_dirs, snapshot["document_root"],
-            allow_empty=bool(error_rows or skipped))
+        workers = self._validate_final_scope(snapshot, worker_dirs)
         worker_names = [Path(item).name for item in workers]
         completed_keys = {name.casefold() for name in worker_names}
         receipt = {
@@ -334,6 +357,7 @@ class Stage2AutoReviewController:
         processing = state.get("processing_receipt")
         if not processing or processing.get("status") != "complete":
             raise AutoReviewError("Record processing completion and its final worker scope before the audit receipt.")
+        self._validate_final_scope(snapshot, processing.get("worker_dirs", ()))
         report = Path(report_path).resolve(strict=True)
         if not report.is_file() or report.suffix.casefold() not in (".csv", ".xlsx"):
             raise AutoReviewError("The completed audit receipt must name its exact CSV or Excel report.")
@@ -773,6 +797,10 @@ class Stage2AutoReviewController:
             raise AutoReviewError("Automatic review was not enabled with the Accuracy Audit at Start.")
         if not processing or processing.get("status") != "complete" or processing.get("run_id") != snapshot["run_id"]:
             raise AutoReviewError("Processing completion is missing or belongs to another run.")
+        workers = self._validate_final_scope(snapshot, processing.get("worker_dirs", ()))
+        if ([Path(item).name.casefold() for item in workers]
+                != [str(name).casefold() for name in processing.get("worker_names", ())]):
+            raise AutoReviewError("The processing receipt's worker names do not match its final folders.")
         if not audit or audit.get("status") != "complete" or audit.get("run_id") != snapshot["run_id"]:
             raise AutoReviewError("The matching Accuracy Audit is not exactly complete.")
         if audit.get("processing_receipt_id") != processing.get("receipt_id"):

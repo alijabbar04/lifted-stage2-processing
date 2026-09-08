@@ -2,7 +2,7 @@ STAGE 2 - PROCESSING
 ====================
 
 This credential-free public installer adds:
-  - Stage 2 v1.5.0 - Obsidian / Jade
+  - Stage 2 v1.5.1 - Obsidian / Jade (build 2026.09.08-slack1)
   - Desktop and Start Menu shortcuts
   - the in-app user guide
 
@@ -25,6 +25,15 @@ not a guessed filename or a passed-audit claim. See Guide for next steps.
 
 Existing settings, API credentials and processed documents are not removed or
 overwritten by an update.
+
+WINDOWS BATCH LOCKS
+-------------------
+The batch writer keeps the same .docreview_batch_writer.lock path while active
+and makes a best-effort cleanup after unlocking and closing it. Windows may
+retain a harmless remnant when deletion is refused by an open handle,
+permissions or synchronization software; it is retired on a later successful
+use. POSIX and request/ledger locks remain permanent. Do not delete lock files
+manually.
 
 LOCAL PAGE ORIENTATION
 ----------------------

@@ -225,19 +225,95 @@ def test_live_and_batch_binding_share_one_durable_state(setup):
     assert binding.record_audit_receipt()["state"] == "ready"
 
 
-def test_all_failed_workers_persist_explicit_empty_audit_scope(setup):
+def test_all_failed_workers_cannot_commit_a_partial_complete_receipt(setup):
+    setup.controller.commit_run(setup.snapshot)
+    with pytest.raises(AutoReviewError, match="1 missing"):
+        setup.controller.record_processing_complete(
+            "run-001", processing_root=setup.processing, worker_dirs=[],
+            errors=["Worker One failed before completion"])
+    result = setup.controller.get_status("run-001", processing_root=setup.processing)
+    assert result["processing_receipt"] is None
+    assert result["state"] == "waiting-processing"
+    # Retrying the same run after its worker succeeds can still create the
+    # original complete receipt; no partial immutable receipt blocks recovery.
+    recovered = setup.controller.record_processing_complete(
+        "run-001", processing_root=setup.processing, worker_dirs=[setup.worker])
+    assert recovered["state"] == "waiting-audit"
+
+
+def test_document_errors_do_not_block_complete_worker_scope(setup):
     setup.controller.commit_run(setup.snapshot)
     result = setup.controller.record_processing_complete(
-        "run-001", processing_root=setup.processing, worker_dirs=[],
-        errors=["Worker One failed before completion"])
-    receipt = result["processing_receipt"]
-    assert receipt["worker_dirs"] == []
-    assert receipt["unaudited_scope_worker_names"] == ["Worker One"]
-    assert receipt["errors"] == ["Worker One failed before completion"]
-    result = setup.controller.record_audit_status(
-        "run-001", "skipped", processing_root=setup.processing,
-        reason="No completed worker folders")
+        "run-001", processing_root=setup.processing, worker_dirs=[setup.worker],
+        errors=["One document needs the audit to resolve classification"])
+    assert result["processing_receipt"]["errors"]
+    assert result["processing_receipt"]["unaudited_scope_worker_names"] == []
+    assert result["state"] == "waiting-audit"
+
+
+def test_five_worker_scope_rejects_four_and_accepts_reordered_recovered_five(setup):
+    workers = [setup.worker]
+    for number in range(2, 6):
+        worker = setup.documents / f"Worker {number}"
+        worker.mkdir()
+        workers.append(worker)
+    snapshot = setup.controller.capture_snapshot(
+        run_id="run-five", processing_root=setup.processing,
+        document_root=setup.documents, care_home="Example Home",
+        worker_names=[worker.name for worker in workers], settings=setup.settings,
+        accuracy_audit_enabled=True, workflows=setup.workflows)
+    setup.controller.commit_run(snapshot)
+    with pytest.raises(AutoReviewError, match="1 missing, 0 unexpected"):
+        setup.controller.record_processing_complete(
+            "run-five", processing_root=setup.processing, worker_dirs=workers[1:])
+    recovered = setup.controller.record_processing_complete(
+        "run-five", processing_root=setup.processing, worker_dirs=list(reversed(workers)))
+    assert recovered["processing_receipt"]["unaudited_scope_worker_names"] == []
+    assert len(recovered["processing_receipt"]["worker_dirs"]) == 5
+
+
+def test_unexpected_worker_cannot_replace_or_expand_start_scope(setup):
+    setup.controller.commit_run(setup.snapshot)
+    other = setup.documents / "Other Worker"
+    other.mkdir()
+    for workers in ([other], [setup.worker, other]):
+        with pytest.raises(AutoReviewError, match="unexpected"):
+            setup.controller.validate_processing_scope(
+                "run-001", processing_root=setup.processing, worker_dirs=workers)
+    assert setup.controller.get_status(
+        "run-001", processing_root=setup.processing)["processing_receipt"] is None
+
+
+def test_legacy_partial_receipt_cannot_arm_or_launch_review(setup):
+    arm(setup)
+    state_path = setup.controller._state_path(setup.processing, "run-001")
+    # Simulate a v1.5.0 partial receipt on disk; keep it immutable, do not
+    # silently upgrade it into a full completion on reopening.
+    def make_partial(state):
+        state["processing_receipt"]["worker_dirs"] = []
+        state["processing_receipt"]["worker_names"] = []
+        state["audit_receipt"]["worker_dirs"] = []
+    setup.controller._mutate(state_path, make_partial, "legacy-partial-fixture")
+    with pytest.raises(AutoReviewError, match="1 missing"):
+        setup.controller.record_audit_receipt(
+            "run-001", processing_root=setup.processing,
+            report_path=setup.audit, status="complete")
+    result = setup.controller.maybe_launch(
+        "run-001", processing_root=setup.processing,
+        workflows=setup.workflows, review_helper=setup.helper)
     assert result["state"] == "needs-attention"
+    assert setup.workflows.launches == 0
+    assert result["processing_receipt"]["worker_dirs"] == []
+
+
+def test_final_scope_must_still_exist_before_launch(setup):
+    arm(setup)
+    setup.worker.rmdir()
+    result = setup.controller.maybe_launch(
+        "run-001", processing_root=setup.processing,
+        workflows=setup.workflows, review_helper=setup.helper)
+    assert result["state"] == "needs-attention"
+    assert setup.workflows.launches == 0
 
 
 @pytest.mark.parametrize("status", ["pending", "failed", "skipped", "disabled"])

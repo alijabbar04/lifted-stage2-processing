@@ -11,6 +11,7 @@ import queue
 import re
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 import stage2_ai_workflows as workflows
@@ -901,44 +902,155 @@ class AutoReviewSettingsDialog(_Dialog):
 
 class NotificationSettingsDialog(_Dialog):
     def __init__(self, app, namespace):
-        super().__init__(app, namespace, "Notifications", "Receive concise progress and outcome updates. Worker names and document contents are never sent.", height=760)
+        super().__init__(app, namespace, "Notifications", "Receive concise progress and outcome updates. Worker names and document contents are never sent.", height=790)
         saved = notifications.normalize_settings(app.cfg.get("notifications"))
         self.test_service = None
         self._test_statuses = []
         self.channel_vars = {}
-        for channel in ("discord", "telegram"):
-            values = saved[channel]
+        self.credential_labels = {}
+        self.channel_test_buttons = {}
+        # Keep this list explicit so a public build that is being upgraded can
+        # still present the optional Slack setup before it has saved settings.
+        # The transport exports the same list for delivery.
+        self.channels = tuple(getattr(notifications, "CHANNELS", ("discord", "telegram", "slack")))
+        for channel in self.channels:
+            values = saved.get(channel, self._channel_defaults(channel))
             variables = {key: tk.StringVar(value=values[key]) for key in ("destination", "credential_file", "token_env", "credential_ref")}
             variables["enabled"] = tk.BooleanVar(value=values["enabled"])
             variables["new_token"] = tk.StringVar()
             self.channel_vars[channel] = variables
-            _check(self.body, f"Send updates to {channel.title()}", variables["enabled"]).pack(fill="x", pady=(6, 6))
-            self._field("Discord channel ID" if channel == "discord" else "Telegram chat ID or @channel", variables["destination"])
-            self._field("Existing local .env credential file (optional)", variables["credential_file"],
-                        browse=lambda name=channel: self._browse_credential(name))
-            row = tk.Frame(self.body, bg=BG)
-            row.pack(fill="x", pady=(0, 10))
-            _label(row, "Token environment-variable name", small=True).pack(anchor="w", pady=(0, 4))
-            _entry(row, variables["token_env"]).pack(fill="x", ipady=7)
-            self._field("New bot token · optional, stored only in the OS credential store", variables["new_token"], show="•")
-            _label(self.body, "Leave the new token blank to retain the existing credential. A saved OS credential takes precedence over environment and .env references.", small=True).pack(fill="x", pady=(0, 10))
+            self._channel_card(channel, variables)
         self.progress_var = tk.BooleanVar(value=saved["progress_enabled"])
         self.wait_var = tk.StringVar(value=str(saved["wait_minutes"]))
         _check(self.body, "Include aggregate progress at 25%, 50%, 75% and 100%", self.progress_var).pack(fill="x", pady=5)
         self._field("First long-wait update after this many minutes (1–120; then at most every 30 minutes)", self.wait_var)
-        _label(self.body, "Phase changes, submitted batches, attention needed and completion remain enabled. Delivery is best-effort; failures never stop processing. Telegram needs an explicit recipient—none is guessed.", small=True).pack(fill="x", pady=(0, 8))
+        _label(self.body, "Phase changes, submitted batches, attention needed and completion remain enabled. Delivery is best-effort; failures never stop processing. Discord and Telegram need an explicit recipient—none is guessed. A Slack webhook posts to the channel selected when that webhook was created.", small=True).pack(fill="x", pady=(0, 8))
         self.save_button = _button(self.footer, "Save settings", self._save, primary=True)
         self.save_button.pack(side="right")
         self.test_button = _button(self.footer, "Test enabled channels", self._test)
         self.test_button.pack(side="left")
         self.status.set("Changes are not saved until Save settings. Test reports delivery asynchronously, not just queue acceptance.")
 
+    @staticmethod
+    def _channel_defaults(channel):
+        """Safe UI fallback while reading a pre-Slack settings file."""
+        defaults = notifications.default_settings().get(channel, {})
+        return {
+            "enabled": bool(defaults.get("enabled", False)),
+            "destination": str(defaults.get("destination", "")),
+            "credential_file": str(defaults.get("credential_file", "")),
+            "token_env": str(defaults.get("token_env", "SLACK_WEBHOOK_URL" if channel == "slack" else "")),
+            "credential_ref": str(defaults.get("credential_ref", channel)),
+        }
+
+    def _channel_card(self, channel, variables):
+        """Build one compact dark card without pretending Slack has a routed ID."""
+        card = tk.Frame(self.body, bg=RAISED, highlightthickness=1, highlightbackground=BORDER)
+        card.pack(fill="x", pady=(4, 10), padx=(0, 4))
+        content = tk.Frame(card, bg=RAISED)
+        content.pack(fill="x", padx=12, pady=(10, 8))
+        tk.Checkbutton(content, text=f"Send updates to {channel.title()}", variable=variables["enabled"],
+                       bg=RAISED, fg=FG, selectcolor=PANEL, activebackground=RAISED,
+                       activeforeground=FG, font=("Segoe UI", 10), anchor="w",
+                       highlightthickness=0).pack(fill="x", pady=(0, 6))
+        if channel == "slack":
+            self._card_field(content, "Slack channel label (optional · display only)", variables["destination"])
+            self._card_label(content, "The incoming webhook already belongs to the Slack channel chosen in Slack. This label does not route messages or reveal the webhook.").pack(fill="x", pady=(0, 8))
+        else:
+            self._card_field(content, "Discord channel ID" if channel == "discord" else "Telegram chat ID or @channel", variables["destination"])
+        self._card_field(content, "Existing local .env credential file (optional)", variables["credential_file"],
+                         browse=lambda name=channel: self._browse_credential(name))
+        row = tk.Frame(content, bg=RAISED)
+        row.pack(fill="x", pady=(0, 10))
+        self._card_label(row, "Webhook environment-variable name" if channel == "slack" else "Token environment-variable name").pack(anchor="w", pady=(0, 4))
+        _entry(row, variables["token_env"]).pack(fill="x", ipady=7)
+        token_label = "New webhook URL · optional, stored only in the OS credential store" if channel == "slack" else "New bot token · optional, stored only in the OS credential store"
+        self._card_field(content, token_label, variables["new_token"], show="•")
+        self._card_label(content, "Leave this blank to retain the existing credential. A saved OS credential takes precedence over environment and .env references.").pack(fill="x", pady=(0, 3))
+        status = self._card_label(content, "Credential status: Not checked yet")
+        status.pack(fill="x")
+        self.credential_labels[channel] = status
+        # Keyring and local .env reads may block. Do not perform either from a
+        # Tk variable trace while the user is typing.
+        variables["new_token"].trace_add("write", lambda *_args, name=channel: self._new_credential_changed(name))
+        actions = tk.Frame(content, bg=RAISED)
+        actions.pack(fill="x", pady=(8, 0))
+        test_button = _button(actions, f"Test {channel.title()}", lambda name=channel: self._test_channel(name))
+        test_button.pack(side="left")
+        self.channel_test_buttons[channel] = test_button
+        _button(actions, "Check credential status", lambda name=channel: self._check_credential_status(name)).pack(side="left", padx=(8, 0))
+        if channel == "slack":
+            _button(content, "Slack incoming webhook setup", self._open_slack_setup).pack(anchor="w", pady=(8, 0))
+
+    def _card_field(self, parent, label, variable, *, browse=None, show=None):
+        row = tk.Frame(parent, bg=RAISED)
+        row.pack(fill="x", pady=(0, 10))
+        self._card_label(row, label).pack(anchor="w", pady=(0, 4))
+        control = tk.Frame(row, bg=RAISED)
+        control.pack(fill="x")
+        if browse:
+            _button(control, "Browse", browse).pack(side="right", padx=(8, 0))
+        entry = _entry(control, variable, show=show)
+        entry.pack(side="left", fill="x", expand=True, ipady=7)
+        return entry
+
+    @staticmethod
+    def _card_label(parent, text):
+        return tk.Label(parent, text=text, bg=RAISED, fg=MUTED, font=("Segoe UI", 9),
+                        anchor="w", justify="left", wraplength=650)
+
+    def _new_credential_changed(self, channel):
+        label = self.credential_labels.get(channel)
+        if label:
+            label.configure(text=("Credential status: Save this new credential first"
+                                  if self.channel_vars[channel]["new_token"].get().strip()
+                                  else "Credential status: Not checked yet"))
+
+    def _check_credential_status(self, channel):
+        """Read keyring/.env asynchronously only after an explicit action."""
+        label = self.credential_labels.get(channel)
+        if not label or self._operation_busy:
+            return
+        if self.channel_vars[channel]["new_token"].get().strip():
+            self._new_credential_changed(channel)
+            self.status.set("Save the new credential first; checking only reads saved credentials.")
+            return
+        try:
+            raw = {channel: {key: value.get() for key, value in self.channel_vars[channel].items()
+                             if key != "new_token"}}
+        except (tk.TclError, KeyError):
+            return
+        def checked(value):
+            checked_channel, status = value
+            current = self.credential_labels.get(checked_channel)
+            if current:
+                current.configure(text="Credential status: " + status)
+            self.status.set("Credential status checked locally; no message was sent.")
+        def work():
+            try:
+                return channel, notifications.credentials_status(channel, raw)
+            except Exception:
+                return channel, "Credential status could not be checked"
+        self._background(work, checked, f"Checking {channel.title()} credential status locally…")
+
+    def _open_slack_setup(self):
+        # This guide is public and does not contain a workspace-specific secret.
+        guide = "https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/"
+        try:
+            opened = webbrowser.open(guide, new=2)
+            if opened:
+                self.status.set("Opened Slack's incoming webhook setup guide in your browser.")
+            else:
+                self.status.set("Could not open the browser. Visit docs.slack.dev to set up an incoming webhook.")
+        except Exception:
+            self.status.set("Could not open the browser. Visit docs.slack.dev to set up an incoming webhook.")
+
     def _browse_credential(self, channel):
         value = filedialog.askopenfilename(parent=self, title="Select an existing local bot credential file", filetypes=[("Environment files", "*.env .env"), ("All files", "*.*")])
         if value:
             self.channel_vars[channel]["credential_file"].set(value)
 
-    def _values(self):
+    def _values(self, validate_channel=None):
         try:
             minutes = int(self.wait_var.get())
         except (ValueError, TypeError):
@@ -949,7 +1061,9 @@ class NotificationSettingsDialog(_Dialog):
         tokens = {}
         for channel, variables in self.channel_vars.items():
             raw[channel] = {key: variable.get() for key, variable in variables.items() if key != "new_token"}
-            if raw[channel]["enabled"] and not notifications._valid_destination(channel, raw[channel]["destination"]):
+            if (channel != "slack" and raw[channel]["enabled"]
+                    and validate_channel in (None, channel)
+                    and not notifications._valid_destination(channel, raw[channel]["destination"])):
                 raise workflows.WorkflowError(f"Enter a valid {channel.title()} destination before enabling it.")
             tokens[channel] = variables["new_token"].get().strip()
         return notifications.normalize_settings(raw), tokens
@@ -961,6 +1075,8 @@ class NotificationSettingsDialog(_Dialog):
         return values
 
     def _save(self):
+        if self._operation_busy:
+            return
         try:
             values, tokens = self._values()
         except workflows.WorkflowError as exc:
@@ -968,7 +1084,11 @@ class NotificationSettingsDialog(_Dialog):
             return
         self.save_button.configure(state="disabled")
         self.test_button.configure(state="disabled")
-        self._background(lambda: self._store_tokens(values, tokens), self._saved_values, "Saving any new bot token in the OS credential store…")
+        for button in self.channel_test_buttons.values():
+            button.configure(state="disabled")
+        saving = ("Saving the new Slack credential in the OS credential store…" if tokens.get("slack")
+                  else "Saving any new bot token in the OS credential store…")
+        self._background(lambda: self._store_tokens(values, tokens), self._saved_values, saving)
 
     def _saved_values(self, values):
         previous = self.app.cfg.get("notifications")
@@ -978,7 +1098,7 @@ class NotificationSettingsDialog(_Dialog):
                 self.app.cfg.pop("notifications", None)
             else:
                 self.app.cfg["notifications"] = previous
-            self.status.set("Settings could not be saved. Any newly stored bot token remains in the OS credential store; notification settings were not changed.")
+            self.status.set("Settings could not be saved. Any newly stored credential remains in the OS credential store; notification settings were not changed.")
         else:
             service = getattr(self.app, "notification_service", None)
             if service:
@@ -989,24 +1109,55 @@ class NotificationSettingsDialog(_Dialog):
         self._on_error()
 
     def _test(self):
+        if self._operation_busy:
+            return
         try:
             values, tokens = self._values()
         except workflows.WorkflowError as exc:
             self.status.set(str(exc))
             return
-        if not any(values[channel]["enabled"] for channel in ("discord", "telegram")):
-            self.status.set("Enable at least one channel and enter its destination to send a test.")
+        if not any(values[channel]["enabled"] for channel in self.channels):
+            self.status.set("Enable at least one channel to send a test. Discord and Telegram also need a destination.")
             return
         if any(tokens.values()):
-            self.status.set("Save the new bot token first, then Test. A test never silently changes stored credentials.")
+            self.status.set("Save the new Slack credential first, then Test. A test never silently changes stored credentials."
+                            if tokens.get("slack") else "Save the new bot token first, then Test. A test never silently changes stored credentials.")
             return
+        self._start_test(values)
+
+    def _test_channel(self, channel):
+        """Test one provider without changing the user's enabled-channel choices."""
+        if self._operation_busy:
+            return
+        try:
+            values, tokens = self._values(validate_channel=channel)
+        except workflows.WorkflowError as exc:
+            self.status.set(str(exc))
+            return
+        if tokens.get(channel):
+            self.status.set(f"Save the new {channel.title()} credential first, then Test. A test never silently changes stored credentials.")
+            return
+        if channel != "slack" and not notifications._valid_destination(channel, values[channel]["destination"]):
+            self.status.set(f"Enter a valid {channel.title()} destination before testing it.")
+            return
+        isolated = {key: (dict(value) if isinstance(value, dict) else value)
+                    for key, value in values.items()}
+        for name in self.channels:
+            isolated[name]["enabled"] = name == channel
+        self._start_test(isolated, channel=channel)
+
+    def _start_test(self, values, channel=None):
         if self.test_service:
             self.test_service.close()
         self.test_service = notifications.NotificationService(values)
         self._test_statuses = []
         self.test_button.configure(state="disabled")
+        for button in self.channel_test_buttons.values():
+            button.configure(state="disabled")
         queued = self.test_service.emit("test", run_id="settings-test")
-        self.status.set("Test queued. Waiting for the actual delivery result…" if queued else "No test was queued. Check enabled channels.")
+        target = f"{channel.title()} test" if channel else "Test"
+        self.status.set(f"{target} queued for delivery confirmation…" if queued
+                        else "No test was queued. Check the enabled channel settings.")
 
     def _poll_extra(self):
         if self.test_service:
@@ -1016,10 +1167,14 @@ class NotificationSettingsDialog(_Dialog):
                 self.status.set("\n".join(self._test_statuses[-4:]))
             if self.test_service.is_idle():
                 self.test_button.configure(state="normal")
+                for button in self.channel_test_buttons.values():
+                    button.configure(state="normal")
 
     def _on_error(self):
         self.save_button.configure(state="normal")
         self.test_button.configure(state="normal")
+        for button in self.channel_test_buttons.values():
+            button.configure(state="normal")
 
     def _close(self):
         if not self._operation_busy and self.test_service:

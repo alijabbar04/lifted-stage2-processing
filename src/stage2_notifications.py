@@ -8,6 +8,7 @@ separate from the processing result and never raise into a processing callback.
 from __future__ import annotations
 
 import collections
+import decimal
 import hashlib
 import json
 import math
@@ -17,14 +18,17 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Callable
 
 
 KEYRING_SERVICE = "Lifted.Stage2.Notifications"
+CHANNELS = ("discord", "telegram", "slack")
 MAX_PENDING = 64
 MAX_ATTEMPTS = 3
 REQUEST_TIMEOUT = 15
+MAX_RETRY_DELAY = 30
 PHASES = {
     "preparing": "Preparing documents", "processing": "Processing documents",
     "scanning": "Local document scanning and orientation checks",
@@ -61,6 +65,10 @@ def default_settings() -> dict:
                     "token_env": "DISCORD_BOT_TOKEN", "credential_ref": "discord"},
         "telegram": {"enabled": False, "destination": "", "credential_file": "",
                      "token_env": "TELEGRAM_BOT_TOKEN", "credential_ref": "telegram"},
+        # A Slack incoming webhook is already bound to its workspace/channel.
+        # destination is an optional display label and is never used for routing.
+        "slack": {"enabled": False, "destination": "", "credential_file": "",
+                  "token_env": "SLACK_WEBHOOK_URL", "credential_ref": "slack"},
         "progress_enabled": True, "wait_minutes": 10,
     }
 
@@ -77,7 +85,7 @@ def normalize_settings(settings=None) -> dict:
     result = default_settings()
     if not isinstance(settings, dict):
         return result
-    for channel in ("discord", "telegram"):
+    for channel in CHANNELS:
         source = settings.get(channel, {})
         if not isinstance(source, dict):
             continue
@@ -85,6 +93,12 @@ def normalize_settings(settings=None) -> dict:
         for key in ("destination", "credential_file", "token_env", "credential_ref"):
             value = source.get(key, result[channel][key])
             result[channel][key] = str(value or "").strip()[:1024]
+        if channel == "slack" and re.search(
+                r"(?i)(?:[a-z][a-z0-9+.-]*://|hooks\.slack(?:-gov)?\.com(?:/|$))",
+                result[channel]["destination"]):
+            # destination is persisted as a human-readable label. If a webhook
+            # is pasted into that field, discard it rather than save a secret.
+            result[channel]["destination"] = ""
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,99}", result[channel]["token_env"]):
             result[channel]["token_env"] = default_settings()[channel]["token_env"]
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", result[channel]["credential_ref"]):
@@ -96,14 +110,17 @@ def normalize_settings(settings=None) -> dict:
 
 def set_bot_token(channel: str, token: str, credential_ref: str | None = None) -> None:
     """Store in the existing OS credential store; never fall back to plaintext."""
-    if channel not in ("discord", "telegram"):
-        raise ValueError("Choose Discord or Telegram.")
+    if channel not in CHANNELS:
+        raise ValueError("Choose Discord, Telegram or Slack.")
     ref = credential_ref or channel
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", ref):
         raise ValueError("Invalid credential reference.")
-    token = str(token or "").strip()
+    raw_token = str(token or "")
+    token = raw_token.strip()
     if not token or any(c.isspace() for c in token):
-        raise ValueError("Enter a valid bot token without spaces.")
+        raise ValueError("Enter a valid notification credential without spaces.")
+    if channel == "slack" and (raw_token != token or not _valid_slack_webhook(token)):
+        raise ValueError("Enter a valid Slack incoming webhook URL.")
     try:
         import keyring
         keyring.set_password(KEYRING_SERVICE, ref, token)
@@ -117,12 +134,13 @@ def _resolve_token(channel: str, settings: dict) -> str:
         import keyring
         value = keyring.get_password(KEYRING_SERVICE, ref)
         if value:
-            return value.strip()
+            return value if channel == "slack" else value.strip()
     except Exception:
         pass
     env_key = settings.get("token_env", default_settings()[channel]["token_env"])
-    if os.environ.get(env_key, "").strip():
-        return os.environ[env_key].strip()
+    environment_value = os.environ.get(env_key, "")
+    if environment_value.strip():
+        return environment_value if channel == "slack" else environment_value.strip()
     credential_file = settings.get("credential_file", "")
     if credential_file:
         try:
@@ -139,7 +157,16 @@ def _resolve_token(channel: str, settings: dict) -> str:
 
 def credentials_status(channel: str, settings: dict) -> str:
     """Read-only local check. Does not send a message or reveal the token."""
+    if channel not in CHANNELS:
+        raise ValueError("Unknown notification channel.")
     config = normalize_settings(settings)[channel]
+    if channel == "slack":
+        webhook = _resolve_token(channel, config)
+        if not webhook:
+            return "Slack webhook URL not found"
+        if not _valid_slack_webhook(webhook):
+            return "Slack webhook URL format is not valid"
+        return "Credential available (use Test to verify delivery)"
     if not config["destination"]:
         return "Destination not configured"
     if not _valid_destination(channel, config["destination"]):
@@ -148,8 +175,28 @@ def credentials_status(channel: str, settings: dict) -> str:
 
 
 def _valid_destination(channel, destination):
+    if channel == "slack":
+        # Incoming webhooks choose their channel during Slack authorization.
+        return len(str(destination)) <= 1024
     pattern = r"\d{5,25}" if channel == "discord" else r"(?:-?\d{1,25}|@[A-Za-z][A-Za-z0-9_]{4,63})"
     return bool(re.fullmatch(pattern, str(destination)))
+
+
+def _valid_slack_webhook(value) -> bool:
+    """Accept only Slack's secret incoming-webhook endpoints, never arbitrary URLs."""
+    value = str(value)
+    if not value or any(ord(character) <= 32 or ord(character) == 127 for character in value):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme != "https" or parsed.username or parsed.password or
+                parsed.port is not None or parsed.query or parsed.fragment):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if parsed.hostname not in {"hooks.slack.com", "hooks.slack-gov.com"}:
+        return False
+    return bool(re.fullmatch(r"/services/[A-Za-z0-9]+/[A-Za-z0-9]+/[A-Za-z0-9_-]+", parsed.path))
 
 
 def _phase(value):
@@ -261,7 +308,76 @@ def _post_json(url, headers, payload):
         raise DeliveryError("Notification service could not be reached.", retry=True, delay=2) from None
 
 
+def _post_slack(webhook_url, payload):
+    """Post to a validated Slack webhook and require its exact documented success."""
+    if not _valid_slack_webhook(webhook_url):
+        raise DeliveryError("Slack webhook URL format is invalid.")
+    request = urllib.request.Request(
+        webhook_url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "LiftedStage2/1.0"},
+        method="POST")
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
+            body = response.read(4096)
+            status = response.getcode()
+            if status == 200 and body == b"ok":
+                return
+            if status is not None and status >= 500:
+                raise DeliveryError("Slack notification service returned a temporary error.", retry=True, delay=2)
+            raise DeliveryError("Slack returned an unexpected response; delivery was not verified.")
+    except urllib.error.HTTPError as error:
+        code = error.code
+        delay = 2
+        retry = code >= 500
+        if code == 429:
+            try:
+                value = decimal.Decimal(str(error.headers.get("Retry-After", "")))
+                if not value.is_finite() or value <= 0:
+                    raise ValueError
+                if value > MAX_RETRY_DELAY:
+                    # Keep even extremely large values as Decimal: no enormous
+                    # integer allocation and no loss of the provider's value.
+                    delay = value
+                else:
+                    delay = int(value.to_integral_value(rounding=decimal.ROUND_CEILING))
+            except (AttributeError, decimal.InvalidOperation, TypeError, ValueError):
+                delay = 2
+            # Keep the queue moving. A longer provider delay is reported rather
+            # than shortened into an unsafe, potentially duplicate retry.
+            retry = delay <= MAX_RETRY_DELAY
+        if code in (401, 403):
+            label = "Slack rejected the webhook or permission to post."
+        elif code in (404, 410):
+            label = "The Slack webhook or its bound channel is no longer available."
+        elif code == 400:
+            label = "Slack rejected the notification payload."
+        elif code == 429:
+            label = "Slack rate limit reached."
+        elif code >= 500:
+            label = "Slack notification service returned a temporary error."
+        else:
+            label = f"Slack returned HTTP {code}."
+        raise DeliveryError(label, retry=retry, delay=delay) from None
+    except DeliveryError:
+        raise
+    except Exception:
+        # A webhook URL is itself a secret; never include urllib error details.
+        raise DeliveryError("Slack notification service could not be reached.", retry=True, delay=2) from None
+
+
 def _send(channel, config, message, event_id):
+    if channel not in CHANNELS:
+        raise DeliveryError("Unknown notification channel.")
+    if channel == "slack":
+        webhook = _resolve_token(channel, config)
+        if not webhook:
+            raise DeliveryError("Slack webhook URL was not found. Configure it in Settings.")
+        if not _valid_slack_webhook(webhook):
+            raise DeliveryError("Slack webhook URL format is invalid.")
+        # Do not include destination: Slack binds routing into the secret URL.
+        _post_slack(webhook, {"text": message})
+        return
     if not _valid_destination(channel, config["destination"]):
         raise DeliveryError("Notification destination is missing or invalid.")
     token = _resolve_token(channel, config)
@@ -323,7 +439,7 @@ class NotificationService:
         with self._condition:
             if self._stopping.is_set():
                 return False
-            channels = [name for name in ("discord", "telegram") if self._settings[name]["enabled"]]
+            channels = [name for name in CHANNELS if self._settings[name]["enabled"]]
             if not channels:
                 return False
             identity = (str(run_id), phase)
@@ -423,7 +539,7 @@ class NotificationService:
                         last_error = str(exc)
                         if not exc.retry or attempt + 1 == MAX_ATTEMPTS:
                             break
-                        if self._stopping.wait(min(30, max(1, exc.delay, 2 ** attempt))):
+                        if self._stopping.wait(min(MAX_RETRY_DELAY, max(1, exc.delay, 2 ** attempt))):
                             break
                     except Exception:
                         # Callers/transport must not leak tokens in error text.

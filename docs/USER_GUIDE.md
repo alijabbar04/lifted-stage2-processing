@@ -1,6 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.5.0 Obsidian / Jade
+## User guide | v1.5.1 Obsidian / Jade
 
 Obsidian / Jade edition. A practical guide to processing documents, checking the result, and turning verified corrections into better software.
 
@@ -30,10 +30,10 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 | Naming collisions, ranking and review quality | 8 |
 | Learning from corrections and changing code | 9 |
 | Settings and API usage | 10 |
-| Discord and Telegram updates | 11 |
+| Discord, Telegram and Slack updates | 11 |
 | Troubleshooting and completion checklist | 12 |
 
-Edition: 7 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
+Edition: 8 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
 
 <!-- pagebreak -->
 
@@ -54,7 +54,7 @@ when relevant.
 | AI Document Review | Prepare an account-selected document review. |
 | Improve Stage 2 | Prepare a software-learning review of accumulated correction evidence. |
 
-The v1.5.0 presentation uses Graphite surfaces, restrained Deep Jade accents,
+The v1.5.1 presentation uses Graphite surfaces, restrained Deep Jade accents,
 real buttons and progressive active panels. **Accuracy Audit** finds possible
 mistakes; **AI Document Review** checks pages; **Improve Stage 2** studies the
 ledger for justified software changes. Corrections never grant code authority.
@@ -351,7 +351,7 @@ classification. Theme choices are **A · Deep jade**, **B · Graphite**, and
 | PDF conversion | Converts supported formats; LibreOffice enables supported full Office conversion, but does not guarantee content/layout fidelity. |
 | File movement | Moves finished workers to the chosen destination, or processes in place when disabled. |
 | Accuracy audit after processing | Runs the optional report-only check, subject to remaining budget and successful completion. |
-| Notifications... | Opens Discord and Telegram delivery settings. |
+| Notifications... | Opens Discord, Telegram and Slack delivery settings. |
 
 ### Understanding API Usage
 
@@ -363,19 +363,19 @@ not an invoice, prepaid balance or record of external subscription sessions.
 
 <!-- pagebreak -->
 
-## 10. Discord and Telegram updates
+## 10. Discord, Telegram and Slack updates
 
-Open **Settings > Notifications...**. Enable Discord, Telegram, both or neither. Notifications report meaningful lifecycle events; they do not upload reports, attach documents or start an AI review automatically.
+Open **Settings > Notifications...**. Enable any combination of Discord, Telegram and Slack, or none. Updates report lifecycle events; they do not upload documents or start an AI review.
 
 ### Configure and test
 
-1. Enable the channel you want and enter its exact destination: a Discord channel ID or a Telegram chat ID/channel.
-2. Reference an existing local credential file and its token variable, or enter a new bot token for storage in the operating system credential store.
-3. Leave **New bot token** blank to keep the existing credential. A saved OS credential takes precedence over environment/file references.
-4. Choose whether to include aggregate progress updates and how long a wait should be before its first update.
-5. Press **Save settings**, then **Test enabled channels**. Wait for the actual delivery result; “queued” is not “delivered”.
+1. For Discord or Telegram, enter the exact channel/chat ID and a bot credential.
+2. For Slack, create an app at **api.slack.com/apps**, enable **Incoming Webhooks**, and add a webhook to the exact workspace/channel. If approval is required, request it from an app administrator first; a pending request is not connected.
+3. Paste Slack's URL into **New webhook URL**, or reference **SLACK_WEBHOOK_URL** in an existing local credential file. Slack's label is for reference only: the webhook's channel is chosen in Slack.
+4. New credentials use the OS credential store. Leave the masked field blank to keep the saved credential, which takes precedence over environment/file references.
+5. Enable your channels, choose progress/wait preferences, save, then test. Wait for **delivered**, not just **queued**, and check the intended channel.
 
-An existing Claudius Messenger configuration can be referenced locally. Bot tokens must not go into source code, screenshots, public installers or this guide. Telegram requires an explicit destination; the app does not guess who should receive the messages.
+Existing Claudius Messenger credentials can be referenced locally. Never share tokens or webhook URLs in chat, screenshots or public builds. Slack needs no separate bot server.
 
 ### What messages mean
 
@@ -393,7 +393,7 @@ An existing Claudius Messenger configuration can be referenced locally. Bot toke
 
 Messages use aggregate information, not worker names, document text, filenames, full paths, prompts or credentials. Duplicate events are suppressed where possible.
 
-Delivery is best-effort. A channel failure does not stop document processing or the other channel. Check the in-app delivery result when a test fails. Unsent updates can be lost when the app closes; provider retries can occasionally duplicate a message. The application records and reports remain the authoritative run evidence.
+Delivery is best-effort. A channel failure does not stop processing or other channels. Closing the app can lose unsent updates; retries can duplicate messages. Application records and reports remain authoritative.
 
 <!-- pagebreak -->
 
@@ -406,6 +406,7 @@ Delivery is best-effort. A channel failure does not stop document processing or 
 | A limit or insufficient remaining budget | Read the estimate/status and decide whether to change the relevant limit. A skipped audit is not a passed audit. |
 | Cloud-only or missing files | Make the files available locally, then retry the appropriate unfinished work. |
 | A file was changed or moved after submission | Restore/reconcile it before recovery or review. Do not force a stale plan to apply. |
+| A writer-lock file remains | Windows removes it after release when possible. Open handles, permissions or sync may prevent cleanup. Check run status; do not delete it. Other lock types can be permanent. |
 | Review cannot open while Stage 2 is busy | Wait for processing, recovery and scanning to finish. The current run has not been interrupted. |
 | Wrong account, unavailable model or unsupported effort | Open the intended account in AI Account Manager/provider, verify sign-in and select explicitly. No fallback is chosen for you. |
 | Review requires a source checkout | Select current Stage 2 source: the transaction helper and naming code. |
@@ -414,19 +415,15 @@ Delivery is best-effort. A channel failure does not stop document processing or 
 
 ### Before Stage 3 uploads
 
-- Confirm all intended worker folders completed, including any follow-up work.
-- Review skipped, unknown, unconverted and error cases in **Details & full log**.
-- Compare key source/output content; preserve originals and escalate loss. Renaming cannot fix conversion damage.
-- Confirm whether the optional accuracy audit completed; do not infer it from a full processing bar.
-- Check and reconcile the external document-review result if you launched one.
-- Confirm Stage 3's processed folder and roster; resolve roster-refresh warnings before assuming upload readiness.
+- Confirm all workers and follow-up work completed. Inspect skipped, unknown, unconverted and error cases in **Details & full log**.
+- Compare source/output content and preserve originals. Renaming cannot fix conversion damage.
+- Verify actual accuracy-audit completion and reconcile any external document review.
+- Confirm Stage 3's processed folder and roster; resolve roster-refresh warnings.
 
 ### Before calling a software improvement finished
 
-Check the learning report, evidence, tests and uncertainties. Code edits or terminal success do not update the desktop app: verify the build, installer, installed executable, shortcut and GitHub release separately.
+Check the learning evidence and tests. Verify the build, installer, installed executable, shortcut and GitHub release separately; code edits do not update the app.
 
 ### Further reference
 
-In the source checkout, see **docs/ai-review/WORKFLOW_GUIDE.md**, its review/naming/learning rules, **docs/TROUBLESHOOTING.md**, **docs/NOTIFICATIONS.md**, **docs/AI_WORKFLOW_INTEGRATION.md** and, for vocabulary changes, **docs/VOCABULARY_GUIDE.md**.
-
-Update **docs/USER_GUIDE.md**; run **tools/build_user_guide.py** and check pages/contents. Builds only bundle the PDF: release both. **docs/INSTALL.md** lists tests and four checksum artifacts.
+See **docs/ai-review/WORKFLOW_GUIDE.md** and its rules, **docs/TROUBLESHOOTING.md**, **docs/NOTIFICATIONS.md**, **docs/AI_WORKFLOW_INTEGRATION.md** and **docs/VOCABULARY_GUIDE.md**. Update this Markdown guide, rebuild with **tools/build_user_guide.py**, and check every page. Release both source and PDF; **docs/INSTALL.md** lists release checks.

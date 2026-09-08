@@ -203,6 +203,16 @@ twice.
 Do not delete that file while a batch is outstanding, or the app loses track of
 work you have already paid for.
 
+### A `.docreview_batch_writer.lock` file remains after Windows work
+
+The batch writer deliberately keeps this same path while it is working. On
+Windows, Stage 2 unlocks and closes the file before making a best-effort
+unlink. Another standard Python holder or contender may still have it open, so
+Windows can refuse deletion; that remnant is harmless and is retired on a
+later successful use. POSIX locks and request/ledger locks remain permanent by
+design. Do not delete a lock manually or use its presence alone to diagnose a
+failed batch; check the saved batch state and current operation instead.
+
 While that state is pending or ambiguous, Stage 2 blocks all live processing
 for the same folder. This is deliberate: a live fallback could duplicate paid
 work. Use **Check batch status** to retrieve/complete it or resolve the retained
@@ -329,3 +339,13 @@ Include: what you were doing, the exact error text, the model and mode
 
 **Never attach real worker documents, or any file from
 `%APPDATA%\DocReviewAIStation\`** — they contain personal data.
+
+## Slack notifications need workspace approval
+
+If Slack shows **Request to Add New Webhook**, ask an app administrator to approve
+the notification app. A submitted request does not generate a webhook or send a
+message. After approval, finish installation for the intended channel, save its
+webhook in **Settings > Notifications > Slack**, enable Slack and test delivery.
+The optional label in Stage 2 does not change Slack's channel. A saved credential
+is not a confirmed connection; **queued** is not **delivered**. A notification
+failure does not mean document processing failed. See [notification setup](NOTIFICATIONS.md).

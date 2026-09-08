@@ -1,4 +1,4 @@
-Stage 2 - Processing v1.5.0 - Obsidian / Jade
+Stage 2 - Processing v1.5.1 - Obsidian / Jade (build 2026.09.08-slack1)
 ===========================
 
 Stage 2 classifies, ranks and organises worker documents for Stage 3, with
@@ -16,6 +16,12 @@ API calls are made. Automatic high-confidence correction is opt-in in Settings.
 The app stores its Anthropic API key in Windows Credential Manager. If this is
 a new installation, open Settings (the cog) and enter the key once. Updating the
 app does not erase an existing key.
+
+On Windows, the batch writer keeps the same `.docreview_batch_writer.lock`
+path while work is active and makes a best-effort cleanup after unlocking and
+closing it. Another standard Python holder can keep the file open, leaving a
+harmless remnant for the next successful use. POSIX and request/ledger locks
+remain permanent; never delete lock files manually.
 
 LibreOffice is recommended for Office documents:
   winget install --id TheDocumentFoundation.LibreOffice -e

@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.5.1 — 2026-09-08 — Slack notifications and reliable review handoff
+
+- Add optional Slack incoming-webhook delivery alongside Discord and Telegram,
+  with masked local credential entry, channel-specific tests, truthful delivery
+  status and setup guidance. A display label never overrides Slack's bound channel.
+- Keep notifications aggregate, background-delivered and separate from processing
+  outcomes. Handle Slack plain-text responses and bounded rate-limit retries.
+- Bind batch recovery and completion to the full captured worker scope before
+  automatic review can begin; retain incomplete work instead of approving it.
+- Resolve and verify the exact Python helper runtime for AI handoffs, with explicit
+  commands and child-only PATH configuration. Managed-session access still needs
+  its own permission check; a host preflight does not grant sandbox access.
+
+- Keep the existing `.docreview_batch_writer.lock` path while a batch writer is
+  active, then unlock/close it and make a best-effort Windows cleanup attempt.
+- Treat a Windows deletion refusal from another standard Python holder as a
+  harmless remnant retired on a later successful use; POSIX and request/ledger
+  locks remain permanent.
+- Update the public/private installer metadata, bootstrap tag and frozen-app
+  smoke-test identity to build `2026.09.08-slack1`.
+
 ## v1.4.1 — 2026-09-07 — Obsidian Compact progress and evidence handling
 
 - Make preparation, scanning, batching, follow-up and recovery progress report

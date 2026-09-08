@@ -1,6 +1,7 @@
 """Offline recovery: never pay twice, never lose the unrendered primary tail."""
 import datetime
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -279,23 +280,26 @@ class TestPrimaryRecovery(unittest.TestCase):
             self.assertEqual(report["status"], "needs_authorization", report)
             self.assertFalse((f.root / app.CareHomeWriterLock.NAME).exists())
 
-    def test_writer_lock_releases_on_exception_and_keeps_same_file(self):
+    def test_writer_lock_releases_on_exception_and_cleans_windows_anchor(self):
         with tempfile.TemporaryDirectory() as root:
             lock_path = Path(root) / app.CareHomeWriterLock.NAME
             with self.assertRaisesRegex(RuntimeError, "synthetic"):
                 with app.CareHomeWriterLock(root):
                     raise RuntimeError("synthetic failure")
-            self.assertTrue(lock_path.exists())
-            original_identity = lock_path.stat().st_ino
+            self.assertEqual(lock_path.exists(), os.name != "nt")
             with app.CareHomeWriterLock(root):
-                self.assertEqual(lock_path.stat().st_ino, original_identity)
-            self.assertTrue(lock_path.exists())
+                self.assertTrue(lock_path.exists())
+            self.assertEqual(lock_path.exists(), os.name != "nt")
 
     def test_writer_lock_is_cross_process_and_os_releases_it_on_exit(self):
         with tempfile.TemporaryDirectory() as root:
             lock_path = Path(root) / app.CareHomeWriterLock.NAME
             code = """import os, sys
-stream = open(sys.argv[1], 'r+b')
+stream = open(sys.argv[1], 'a+b')
+stream.seek(0, 2)
+if not stream.tell():
+    stream.write(b'\\0'); stream.flush()
+stream.seek(0)
 try:
     if os.name == 'nt':
         import msvcrt
@@ -315,8 +319,10 @@ os._exit(0)
                                    capture_output=True, timeout=10)
             self.assertEqual(child.returncode, 0, child.stderr)
             # os._exit above deliberately bypassed application cleanup.
+            self.assertTrue(lock_path.exists())
             with app.CareHomeWriterLock(root):
                 self.assertTrue(lock_path.exists())
+            self.assertEqual(lock_path.exists(), os.name != "nt")
 
 
 if __name__ == "__main__":
