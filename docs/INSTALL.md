@@ -1,7 +1,7 @@
 # Installing Stage 2 — Processing
 
-This guide applies to the v1.5.2 Obsidian / Jade release (build
-2026.09.08-ranking1).
+This guide applies to the v1.5.3 Obsidian / Jade release (build
+2026.09.08-state1).
 
 This guide assumes no technical knowledge. Follow it top to bottom.
 

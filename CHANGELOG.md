@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.5.3 — 2026-09-08 — Windows orientation-state recovery
+
+- Retry only transient Windows sharing/access-denied failures encountered while
+  atomically replacing the local orientation-state file. The retry sequence is
+  bounded to 12 delays totalling 4.12 seconds; unrelated errors propagate
+  immediately.
+- Preserve the previous valid state and atomic replacement guarantees while a
+  retry is pending. If contention persists, processing still fails visibly and
+  cleans only its owned temporary file.
+- Do not monitor a live run by reading its active hidden JSON state. Use the
+  progress shown in Stage 2; even read handles configured for delete sharing
+  can still block replacement on some Windows systems.
+- This recovery change does not alter orientation decisions, classification,
+  naming, ranking, GUI behaviour or model accuracy.
+
 ## v1.5.2 — 2026-09-08 — Ranking attention and bounded recovery
 
 - Preserve exact-path classification evidence when rebuilding records after

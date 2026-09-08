@@ -13,6 +13,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -206,8 +207,65 @@ def orientation_decision(prediction: dict, evidence: dict, *, mode: str,
     }
 
 
-def atomic_write_json(path: Path, data: dict):
-    """Durably replace a JSON state file from a same-directory temporary."""
+# ---- durable JSON state replacement ---------------------------------------
+# On Windows ``os.replace`` (MoveFileExW with MOVEFILE_REPLACE_EXISTING) fails
+# with ERROR_ACCESS_DENIED (WinError 5) for as long as another process holds
+# the destination open without FILE_SHARE_DELETE -- a PowerShell ``Get-Content``
+# or .NET ``FileShare.Read`` reader, an editor or a sync client -- and with
+# ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION (33) for other short
+# sharing conflicts.  Short-lived readers may finish promptly, so the fsynced
+# temporary is kept and only the replacement step is retried a bounded number
+# of times before the original error is raised.  A genuine permission problem
+# (ACL, read-only attribute) reports the same code and still surfaces once the
+# bounded back-off is exhausted; the destination is never rewritten in place
+# and the previous valid state stays intact throughout.
+_WINDOWS = os.name == "nt"
+_sleep = time.sleep
+TRANSIENT_REPLACE_WINERRORS = frozenset({5, 32, 33})
+# 12 retries: 20 ms doubling to a 500 ms cap, at most 4.12 s of waiting.
+REPLACE_RETRY_DELAYS = (0.02, 0.04, 0.08, 0.16, 0.32,
+                        0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+
+
+def is_transient_replace_error(exc) -> bool:
+    """True only for a Windows sharing/access conflict on the replace target."""
+    return (_WINDOWS and isinstance(exc, OSError)
+            and getattr(exc, "winerror", None) in TRANSIENT_REPLACE_WINERRORS)
+
+
+def replace_with_retry(source, destination, *, retry_delays=None,
+                       sleep=None) -> int:
+    """``os.replace`` with bounded retries for transient Windows contention.
+
+    Returns the number of retries that were needed (0 for a clean replace).
+    Any error that is not a transient sharing conflict, and a conflict that
+    outlives the schedule, propagates unchanged.
+    """
+    delays = (REPLACE_RETRY_DELAYS if retry_delays is None
+              else tuple(retry_delays))
+    wait = _sleep if sleep is None else sleep
+    retries = 0
+    while True:
+        try:
+            os.replace(source, destination)
+            return retries
+        except OSError as exc:
+            if retries >= len(delays) or not is_transient_replace_error(exc):
+                raise
+            wait(delays[retries])
+            retries += 1
+
+
+def atomic_write_json(path: Path, data: dict, *, retry_delays=None,
+                      sleep=None) -> int:
+    """Durably replace a JSON state file from a same-directory temporary.
+
+    The temporary is fully written and fsynced before a single atomic
+    ``os.replace``; only that replacement is retried on transient Windows
+    sharing contention.  On any failure the owned temporary is removed, the
+    previous file is left untouched and the error is raised.  Returns the
+    number of replacement retries used (0 for a clean save).
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
@@ -217,7 +275,8 @@ def atomic_write_json(path: Path, data: dict):
             json.dump(data, handle, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
+        return replace_with_retry(tmp_name, path, retry_delays=retry_delays,
+                                  sleep=sleep)
     except Exception:
         try:
             os.unlink(tmp_name)

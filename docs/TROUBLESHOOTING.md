@@ -277,6 +277,23 @@ python tools\orientation_benchmark.py C:\path\to\reviewed-test-set `
   --output C:\Temp\orientation-results.xlsx
 ```
 
+### Local orientation state could not save
+
+Windows can temporarily refuse the atomic replacement of the hidden local
+orientation-state file while another program is reading it. Stage 2 retries
+only the relevant sharing/access-denied failures for a bounded period. The
+previous valid state remains intact while it retries. If contention persists,
+the save still fails visibly and only the temporary file owned by that save is
+cleaned up.
+
+Do not monitor a live run by repeatedly opening or reading its active hidden
+JSON state. Use the progress shown in Stage 2. Close any editor, shell command,
+previewer, scanner or synchronisation tool that may be holding the state file,
+wait until the run is idle, and then retry the unfinished operation. A handle
+that requests delete sharing can still block replacement on some Windows
+systems, so it is not a reliable workaround. Permanent permission or storage
+errors are not ignored.
+
 ---
 
 ## Tools, guides and the GUI

@@ -1,6 +1,6 @@
 # Stage 2 — Processing
 
-## v1.5.2 Obsidian / Jade ranking recovery — build 2026.09.08-ranking1
+## v1.5.3 Obsidian / Jade state-write recovery — build 2026.09.08-state1
 
 The current UI direction is **Graphite + Deep Jade**: a near-black/graphite
 surface with restrained jade accents, real filled/outlined buttons, a clean
@@ -361,7 +361,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.2 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.3 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

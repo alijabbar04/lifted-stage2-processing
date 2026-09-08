@@ -1,6 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.5.2 Obsidian / Jade
+## User guide | v1.5.3 Obsidian / Jade
 
 Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Stage 3 uploads the prepared folders. Completing Stage 2 does not itself upload anything.
 
@@ -53,7 +53,7 @@ when relevant.
 | AI Document Review | Prepare an account-selected document review. |
 | Improve Stage 2 | Prepare a software-learning review of accumulated correction evidence. |
 
-The v1.5.2 presentation uses Graphite surfaces, restrained Deep Jade accents,
+The v1.5.3 presentation uses Graphite surfaces, restrained Deep Jade accents,
 real buttons and progressive active panels. **Accuracy Audit** finds possible
 mistakes; **AI Document Review** checks pages; **Improve Stage 2** studies the
 ledger for justified software changes. Corrections never grant code authority.
@@ -448,6 +448,7 @@ Delivery is best-effort. A channel failure does not stop processing or other cha
 | Cloud-only or missing files | Make the files available locally, then retry the appropriate unfinished work. |
 | A file was changed or moved after submission | Restore/reconcile it before recovery or review. Do not force a stale plan to apply. |
 | A writer-lock file remains | Windows removes it after release when possible. Open handles, permissions or sync may prevent cleanup. Check run status; do not delete it. Other lock types can be permanent. |
+| Local orientation state could not save | Stop reading active JSON; monitor app progress. Retry when idle. Brief Windows contention is retried; persistent failure preserves the previous state. See troubleshooting. |
 | Review cannot open while Stage 2 is busy | Wait for processing, recovery and scanning to finish. The current run has not been interrupted. |
 | Wrong account, unavailable model or unsupported effort | Open the intended account in AI Account Manager/provider, verify sign-in and select explicitly. No fallback is chosen for you. |
 | Review requires a source checkout | Select current Stage 2 source: the transaction helper and naming code. |
@@ -465,6 +466,4 @@ Delivery is best-effort. A channel failure does not stop processing or other cha
 
 Check the learning evidence and tests. Verify the build, installer, installed executable, shortcut and GitHub release separately; code edits do not update the app.
 
-### Further reference
-
-See **docs/ai-review/WORKFLOW_GUIDE.md** and its rules, **docs/TROUBLESHOOTING.md**, **docs/NOTIFICATIONS.md**, **docs/AI_WORKFLOW_INTEGRATION.md** and **docs/VOCABULARY_GUIDE.md**. Update this Markdown guide, rebuild with **tools/build_user_guide.py**, and check every page. Release both source and PDF; **docs/INSTALL.md** lists release checks.
+Further reference: **docs/ai-review/WORKFLOW_GUIDE.md**, **docs/TROUBLESHOOTING.md**, **docs/NOTIFICATIONS.md**, **docs/AI_WORKFLOW_INTEGRATION.md** and **docs/VOCABULARY_GUIDE.md**. Rebuild guide edits with **tools/build_user_guide.py** and check every page. Release source and PDF; see **docs/INSTALL.md**.
