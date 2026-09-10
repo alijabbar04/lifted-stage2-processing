@@ -142,6 +142,9 @@ from stage2_compact_ui import CompactDashboard
 from stage2_notifications import NotificationService, normalize_settings
 import stage2_ai_workflows as ai_workflows
 from stage2_theme import PALETTES, resolve_palette
+from stage2_run_observer import observe_engine_operation
+from stage2_run_state import RunObserver
+import stage2_diagnostics
 from stage2_locking import (DOCUMENT_WRITER_LOCK, PathWriterLock,
                             WriterLockBusy)
 from local_orientation import (
@@ -1388,8 +1391,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.5.4"
-APP_BUILD = "2026.09.10-audit1"
+APP_VERSION = "1.5.5"
+APP_BUILD = "2026.09.10-session1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -4140,7 +4143,10 @@ def quality_evidence(answer):
             "note": str(answer.get("note", "") or "").strip()}
 
 
-AUDIT_HANDBOOK_RELEVANCE_REVIEW_MAX = 20
+# Low-relevance finishing evidence is a review signal, not a classification.
+# Wrong-family members may be marked incomplete, so completeness must not be
+# a prerequisite. Genuine incomplete handbooks can also be flagged for review.
+AUDIT_HANDBOOK_RELEVANCE_REVIEW_MAX = 40
 
 
 def _audit_quality_evidence(answer):
@@ -4224,16 +4230,19 @@ def audit_finishing_quality_concern(current_type, evidence):
     """Whether finishing evidence contradicts a blind handbook agreement.
 
     A low score alone can describe a poor scan, stale content, or another
-    quality issue. Requiring the copy to be both legible and complete narrows
-    the conflict signal, but does not identify the score's causal dimension.
-    This is a human-review trigger only, never a proposed replacement name or
+    quality issue. Requiring the copy to be legible excludes scan-quality
+    causes, but the finishing `complete` flag is deliberately NOT required:
+    the finishing prompt judges completeness against the claimed family, so a
+    single-subject policy filed as a handbook is reported as legible and
+    incomplete - exactly the case this signal exists to surface. This is a
+    human-review trigger only, never a proposed replacement name or
     classification confidence.
     """
     evidence = _audit_quality_evidence(evidence)
     return bool(evidence
                 and _norm_type(current_type) == _norm_type("Employee Handbook")
                 and evidence["score"] <= AUDIT_HANDBOOK_RELEVANCE_REVIEW_MAX
-                and evidence["legible"] and evidence["complete"])
+                and evidence["legible"])
 
 
 def parse_date(s: str):
@@ -5251,6 +5260,7 @@ class CareHomeWriterLock:
 
 def _care_home_writer_operation(method):
     """Serialize actual writes, while recovery assessment stays read-only."""
+    method = observe_engine_operation(method)
     @functools.wraps(method)
     def guarded(self, *args, **kwargs):
         recovery = method.__name__ == "recover_primary_submission"
@@ -6948,7 +6958,9 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
                 continue
             if same and audit_finishing_quality_concern(fname_base,
                                                         quality_hint):
-                score = quality_evidence(quality_hint)["score"]
+                hint_evidence = quality_evidence(quality_hint)
+                score = hint_evidence["score"]
+                finishing_note = hint_evidence["note"][:80]
                 row["Review Status"] = "Unable To Determine"
                 row["Missing Information"] = (
                     "The audit classification and the earlier finishing "
@@ -6956,9 +6968,12 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
                     "document type.")
                 row["Reason For Concern"] = (
                     f"The independent audit repeated '{fname_base}', but the "
-                    f"completed finishing assessment scored this legible, "
-                    f"complete copy {score}/100 for that family. The finishing "
-                    "score is a review signal, not classification confidence.")
+                    f"completed finishing assessment scored this legible copy "
+                    f"{score}/100 for that family"
+                    + (f" (finishing note: '{finishing_note}')"
+                       if finishing_note else "")
+                    + ". The finishing score is a review signal, not "
+                    "classification confidence.")
                 notes.append("byte-bound finishing quality/relevance conflict")
             elif not (same or (fn_other and pr_other)):
                 # prospective mismatch -> adjudicate before flagging
@@ -8062,6 +8077,12 @@ class Engine:
     # ---- optional post-run accuracy audit ----
     def _activity(self, event):
         """Emit structured UI/notification facts without changing processing."""
+        publisher = getattr(self, "_run_publisher", None)
+        if publisher is not None:
+            try:
+                publisher.event(dict(event))
+            except Exception:
+                pass
         if event.get("phase") == "audit":
             self._audit_progress_snapshot = dict(event)
         callback = getattr(self, "on_activity", None)
@@ -13763,6 +13784,10 @@ class JobsDialog(tk.Toplevel):
         tk.Label(head, text="\U0001F4C8  Processing jobs", bg=RIBBON,
                  fg=RIBBON_FG, font=("Segoe UI", 13, "bold")).pack(
             side="left", padx=14, pady=10)
+        sessions = tk.Button(head, text="Running & saved sessions",
+                             command=master._open_sessions)
+        style_button(sessions, PANEL, PANEL2)
+        sessions.pack(side="right", padx=12, pady=8)
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=14, pady=12)
@@ -14522,6 +14547,9 @@ class DevConsole(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._diagnostics = stage2_diagnostics.install()
+        self._diagnostics.attach_tk(self)
+        self._session_dialog = None
         # capture stdout/stderr/logging into the dev-console buffer as early as
         # possible so start-up diagnostics are not lost
         install_console_capture()
@@ -14585,6 +14613,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close_app)
+        self.after(500, self._offer_saved_sessions)
         self.after(1000, self._poll_notifications)
         if self.cfg.get("_budget_safety_reset"):
             backup = self.cfg.pop("_budget_safety_reset")
@@ -14883,6 +14912,7 @@ class App(tk.Tk):
         open_notification_settings(self, globals())
 
     def _close_app(self):
+        self._diagnostics.record("close_requested", busy=self.dashboard.is_busy())
         if self._review_busy:
             if not messagebox.askyesno("Close the dashboard?",
                     "AI Document Review is running in its own process. Closing "
@@ -14896,10 +14926,13 @@ class App(tk.Tk):
             self.destroy()
             return
         if self.dashboard.is_busy():
-            if not messagebox.askyesno("Stop and close?",
-                    "A Stage 2 operation is running. Stop safely after the current "
-                    "request, then close?\n\nAn interrupted accuracy audit must be "
-                    "run again; this is not pause/resume.", parent=self):
+            from stage2_session_ui import ask_close_running
+            action = ask_close_running(self, globals())
+            self._diagnostics.record("close_choice", action=action)
+            if action == "minimise":
+                self.iconify()
+                return
+            if action != "stop":
                 return
             self._closing = True
             if self._scan_cancel is not None:
@@ -15035,6 +15068,24 @@ class App(tk.Tk):
             self._jobs_win.lift()
             return
         self._jobs_win = JobsDialog(self)
+
+    def _open_sessions(self, care_home_dir=None):
+        """Attach a read-only viewer; never reconstruct an Engine or submit work."""
+        if self._session_dialog is not None and self._session_dialog.winfo_exists():
+            self._session_dialog.deiconify()
+            self._session_dialog.lift()
+            return
+        from stage2_session_ui import open_sessions
+        self._session_dialog = open_sessions(self, globals(), care_home_dir)
+
+    def _offer_saved_sessions(self):
+        try:
+            records = RunObserver().list_runs()
+            if any(row.get("display_state") in ("running", "stale-unverified")
+                   for row in records):
+                self._open_sessions()
+        except Exception as exc:
+            self._diagnostics.record("session_discovery_failed", type=type(exc).__name__)
 
     def _open_reports(self):
         """Choose audit output or the reviewers' cumulative correction records."""
@@ -15442,6 +15493,18 @@ class App(tk.Tk):
                 or getattr(self, "_review_busy", False):
             messagebox.showwarning(
                 "Busy", "Another run, scan, recovery check or AI Document Review is already in progress.")
+            return True
+        try:
+            active = RunObserver().active_for(self.care_home_dir, exclude_pid=os.getpid())
+        except Exception as exc:
+            active = []
+            self._diagnostics.record("session_guard_unavailable", type=type(exc).__name__)
+        if active:
+            messagebox.showinfo("Existing operation found",
+                "Another process owns a saved operation for this folder. "
+                "Opening its read-only progress view. No new work was started. "
+                "The original process and its writer lock remain in control.", parent=self)
+            self._open_sessions(self.care_home_dir)
             return True
         return False
 

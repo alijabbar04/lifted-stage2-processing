@@ -2,7 +2,7 @@ STAGE 2 - PROCESSING
 ====================
 
 This credential-free public installer adds:
-  - Stage 2 v1.5.4 - Obsidian / Jade (build 2026.09.10-audit1)
+  - Stage 2 v1.5.5 - Obsidian / Jade (build 2026.09.10-session1)
   - Desktop and Start Menu shortcuts
   - the in-app user guide
 

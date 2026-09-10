@@ -1,6 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.5.4 Obsidian / Jade
+## User guide | v1.5.5 Obsidian / Jade
 
 Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Stage 3 uploads the prepared folders. Completing Stage 2 does not itself upload anything.
 
@@ -24,13 +24,14 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 | Live processing, batches and recovery | 4 |
 | Ranking needs attention and targeted recovery | 5 |
 | Reading progress and the post-run audit | 6 |
-| Reports: audit versus review ledger | 7 |
-| Launching the document review | 8 |
-| Naming collisions, ranking and review quality | 9 |
-| Learning from corrections and changing code | 10 |
-| Settings and API usage | 11 |
-| Discord, Telegram and Slack updates | 12 |
-| Troubleshooting and completion checklist | 13 |
+| Reopening a window and watching saved sessions | 7 |
+| Reports: audit versus review ledger | 8 |
+| Launching the document review | 9 |
+| Naming collisions, ranking and review quality | 10 |
+| Learning from corrections and changing code | 11 |
+| Settings and API usage | 12 |
+| Discord, Telegram and Slack updates | 13 |
+| Troubleshooting and completion checklist | 14 |
 
 Edition: 10 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
 
@@ -53,7 +54,7 @@ when relevant.
 | AI Document Review | Prepare an account-selected document review. |
 | Improve Stage 2 | Prepare a software-learning review of accumulated correction evidence. |
 
-The v1.5.4 presentation uses Graphite surfaces, restrained Deep Jade accents,
+The v1.5.5 presentation uses Graphite surfaces, restrained Deep Jade accents,
 real buttons and progressive active panels. **Accuracy Audit** finds possible
 mistakes; **AI Document Review** checks pages; **Improve Stage 2** studies the
 ledger for justified software changes. Corrections never grant code authority.
@@ -211,13 +212,16 @@ When enabled and affordable within the remaining run budget, it re-examines the 
 ### Completion, skipping and interruption
 
 For the Employee Handbook finishing path, completed SHA-bound evidence lets the
-audit mark **UnableToDetermine** at 20 or below when both typed `legible` and
-`complete` flags are true. It does not launch an audit, rename documents, or
-make an extra API call; configured scope controls intake. Select all-flags to
+audit mark **UnableToDetermine** at 40 or below when the typed `legible` flag is
+true; the finishing `complete` flag is not required, because a wrong-type
+document is reported as incomplete for the claimed family. It does not launch an
+audit, rename documents, or make an extra API call; configured scope controls
+intake. Select all-flags to
 include confidence-0 results; legacy >80-only excludes them. Processing and
 ranking are unchanged; empty-worker and campaign safeguards are inherited.
-The GUI cannot reattach to a detached run; this release does not ship a
-reconnect fix.
+This is a review-only signal. A genuine but incomplete handbook may also be
+flagged. It does not establish classification accuracy or automatically correct
+the document.
 
 **Audit complete** means the audit finished its attempts and wrote the report. It can still contain errors, unreadable inputs or incorrect AI judgements. Open **Reports** and check statuses and Notes; do not treat completion as a passed accuracy test. The naming audit examines resulting documents, not a complete source-to-output fidelity comparison.
 
@@ -225,9 +229,42 @@ reconnect fix.
 
 **Stopped or failed** means the audit is incomplete. Do not submit a partial report as if every document was checked. Restarting the audit checks documents again and can consume additional API usage; the Stop button is not a pause/resume mechanism.
 
-### If the bar stops moving
+<!-- pagebreak -->
 
-Check the current step, elapsed wait, recent activity and **Details & full log**. A slow model response is different from a recorded error. Do not repeatedly click Start, cancel and retry, or launch an external correction review while the app is still processing the same documents.
+## Reopening a window without restarting processing
+
+If the bar stops moving, check the current step, elapsed wait and **Details &
+full log**. A slow model response is not a recorded failure. Do not repeatedly
+click Start or begin a correction review while documents are still processing.
+
+Open **Jobs > Running & saved sessions**. The app also opens this read-only view
+when it discovers an active saved operation at startup. It shows the original
+process, source folder, phase, counts, cost estimate and last heartbeat. It does
+not submit, apply, stop or take ownership of that process. Choose a saved session
+to watch it; reopening the viewer does not create another paid run.
+
+**Running** means the recorded owner identity and recent heartbeat agree.
+**Stale-unverified** means the evidence is old or the owner cannot be verified;
+it is not proof of failure. **Owner-ended** means the recorded owner has ended
+or its PID was reused. **Operation-ended** only means that local operation ended:
+provider work, applying results, the accuracy audit or AI review may still remain.
+**Failed** reports a recorded operation failure. Read the outcome and normal
+batch status before deciding what remains; none of these labels proves accuracy.
+
+When you close a busy dashboard, **Minimise and keep running** is the default.
+The process stays open on the taskbar. **Stop safely and close** requests the
+existing safe stop, then closes when idle; a stopped audit is not resumable.
+**Cancel** keeps the window open. This release does not turn a GUI-owned thread
+into a separate background service: ending the process, signing out, restarting
+or shutting down still interrupts it. Sleeping pauses local work.
+
+Saved progress is stored under `%LOCALAPPDATA%/Lifted/Stage2/runs`, never in the
+worker folders. Diagnostics under `%LOCALAPPDATA%/Lifted/Stage2Diagnostics` record
+window lifecycle and Python/Tk/thread failures without copying document content.
+They help diagnose future unexpected exits; no specific historical crash cause
+has been established. Runs already started by older versions cannot acquire
+the new progress publisher retrospectively. Do not delete native batch state or
+writer locks to force a second run.
 
 <!-- pagebreak -->
 

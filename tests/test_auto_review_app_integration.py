@@ -200,7 +200,7 @@ def test_close_review_requires_confirmation_without_cancelling_the_external_sess
     engine = SimpleNamespace(stop=Mock())
     app = SimpleNamespace(_review_busy=True, dashboard=SimpleNamespace(is_busy=lambda: False),
                           notification_service=SimpleNamespace(close=Mock()), destroy=Mock(),
-                          engine=engine, _closing=False)
+                          engine=engine, _closing=False, _diagnostics=Mock())
     module.App._close_app(app)
     ask.assert_called_once()
     engine.stop.assert_not_called()

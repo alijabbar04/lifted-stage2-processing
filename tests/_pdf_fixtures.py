@@ -73,6 +73,21 @@ def encrypted_pdf_bytes(text="synthetic encrypted", password="synthetic-pw"):
     return buffer.getvalue()
 
 
+def owner_locked_pdf_bytes(text="synthetic owner-locked",
+                           owner_password="synthetic-owner"):
+    """A permissions-locked PDF with an EMPTY user password: anyone can open
+    and render it, only the owner password unlocks editing permissions. This
+    is how TCPDF-style generated e-learning certificates are commonly written;
+    pypdf still reports `is_encrypted`, while PyMuPDF needs no password."""
+    from pypdf import PdfReader, PdfWriter
+    writer = PdfWriter()
+    writer.append(PdfReader(io.BytesIO(pdf_bytes(text))))
+    writer.encrypt(user_password="", owner_password=owner_password)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
 def corrupt_pdf_bytes(text="synthetic corrupt"):
     """Starts like a PDF but is unparseable and unrenderable."""
     return (b"%PDF-1.7\n% " + text.encode() + b"\n"

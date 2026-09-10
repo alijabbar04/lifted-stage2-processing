@@ -1,18 +1,30 @@
 # Stage 2 — Processing
 
-## v1.5.4 Obsidian / Jade audit evidence — build 2026.09.10-audit1
+## v1.5.5 Obsidian / Jade saved sessions — build 2026.09.10-session1
 
 This release carries completed SHA-bound low-quality Employee Handbook
 finishing evidence so the audit can mark an **UnableToDetermine** result when
-the score is 20 or below and both typed `legible` and `complete` flags are
-true. It does not launch an audit automatically, rename documents, or make an
-extra API call. Review intake remains controlled by the configured review
+the score is 40 or below and the typed `legible` flag is true (the finishing
+`complete` flag is not required, because a wrong-type document is reported as
+incomplete for the claimed family). It does not launch an audit automatically,
+rename documents, or make an extra API call. Review intake remains controlled by the configured review
 scope. Use the all-flags review option to include confidence-0 results; the
 legacy >80-only filter excludes them. Processing and ranking are unchanged,
 and this makes no broad accuracy claim. Empty-worker and campaign
 finishing-bridge safeguards are also included.
-The GUI still cannot reattach to an already-running session; no reconnect fix
-is shipped.
+**Jobs > Running & saved sessions** now shows progress published by another
+Stage 2 process, without creating an Engine, taking its lock or submitting work.
+Reopening the app discovers active sessions automatically. The original owner
+must still be alive: this is a read-only attachment, not migration of a worker
+into the new window. Closing an active GUI offers **Minimise and keep running**,
+**Stop safely and close**, or **Cancel**. Minimising does not stop processing;
+ending its process, signing out or shutting down still interrupts it.
+
+Snapshots and bounded activity logs live in `%LOCALAPPDATA%/Lifted/Stage2/runs`,
+outside document folders. Persistent crash/window diagnostics live in
+`%LOCALAPPDATA%/Lifted/Stage2Diagnostics`. An ended operation is not evidence of
+a verified-complete pipeline. Runs started before this release cannot publish
+the new registry retrospectively; use their existing logs and saved-state checks.
 
 The current UI direction is **Graphite + Deep Jade**: a near-black/graphite
 surface with restrained jade accents, real filled/outlined buttons, a clean
@@ -373,7 +385,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.4 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.5 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

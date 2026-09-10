@@ -440,9 +440,12 @@ def page_reference_limit(path):
     integer limit with status 'ok' for parseable PDFs and single images,
     (None, 'unvalidated') for formats whose pagination cannot be established
     from bytes (no fictional one-page count), and (None, 'encrypted') /
-    (None, 'unreadable') for evidence that cannot be verified at all. A
-    parseable page count is an upper-bound plausibility check only - it never
-    proves a page was rendered, legible or actually inspected."""
+    (None, 'unreadable') for evidence that cannot be verified at all. A PDF
+    protected only by an owner/permissions password (empty user password)
+    is readable evidence and counts as parseable; 'encrypted' is reserved for
+    a PDF that genuinely needs a user password. A parseable page count is an
+    upper-bound plausibility check only - it never proves a page was rendered,
+    legible or actually inspected."""
     path = Path(path)
     suffix = path.suffix.casefold()
     if suffix in IMAGE_EXTENSIONS:
@@ -473,12 +476,18 @@ def page_reference_limit(path):
     if reader is not None:
         try:
             parsed = reader(str(path))
-            if parsed.is_encrypted:
+            # A PDF whose only password is an OWNER (permissions) password
+            # opens for anyone with the empty user password - generated
+            # e-learning certificates are commonly written this way. Its
+            # pages are real, renderable evidence bound to these bytes, so
+            # only a PDF that still refuses the empty password is unverifiable.
+            if parsed.is_encrypted and not parsed.decrypt(""):
                 return None, "encrypted"
             return len(parsed.pages), "ok"
         except Exception:
-            # PyMuPDF is the renderer used by Stage 2.  A parse failure in
-            # pypdf is not by itself proof that the exact bytes are unreadable.
+            # PyMuPDF is the renderer used by Stage 2.  A parse or decrypt
+            # failure in pypdf (including a missing cipher dependency) is not
+            # by itself proof that the exact bytes are unreadable.
             pass
     try:
         import fitz

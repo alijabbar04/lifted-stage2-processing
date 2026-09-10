@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.5.5 - 2026-09-10 - Saved sessions and evidence review fixes
+
+- Publish durable, atomic, read-only-observable progress outside worker folders.
+  Jobs can show an operation owned by another process; startup discovers active
+  sessions. PID plus process-creation identity guards against misleading reuse.
+  Viewing never starts, submits, applies or takes over work. Ended is not verified
+  pipeline completion. Older runs cannot gain publication retrospectively.
+- Offer Minimise and keep running, Stop safely and close, or Cancel on a busy
+  window close. This does not make a GUI worker survive process termination.
+- Add bounded persistent diagnostics for startup, window lifecycle and Python,
+  thread and Tk failures. Historical unexpected-exit cause remains unproven.
+- Accept read-accessible owner-permission PDFs with an empty user password for
+  page-evidence checks. Genuinely password-locked or unreadable files still fail
+  closed; source PDF bytes are not rewritten.
+- Broaden the hash-bound handbook finishing review signal to scores at or below
+  40 with legible=true, including incomplete documents. This only flags review;
+  no automatic rename, extra API call or proven population-accuracy gain.
+- Update the desktop build, public credential-free installer and guides.
+
 ## v1.5.4 — 2026-09-10 — SHA-bound audit quality signal
 
 - Reuse completed, SHA-bound low-quality Employee Handbook finishing evidence

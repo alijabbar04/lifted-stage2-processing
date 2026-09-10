@@ -11,7 +11,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ai_review as review
-from _pdf_fixtures import corrupt_pdf_bytes, encrypted_pdf_bytes, pdf_bytes
+from _pdf_fixtures import (corrupt_pdf_bytes, encrypted_pdf_bytes,
+                           owner_locked_pdf_bytes, pdf_bytes)
 
 
 class Fixture:
@@ -624,6 +625,61 @@ class TestAIReview(unittest.TestCase):
             f.prepare(incoming)
             with self.assertRaisesRegex(review.ReviewError, "cannot be verified"):
                 f.plan(f.decisions())
+
+    def test_owner_locked_pdf_is_verifiable_page_evidence(self):
+        # TCPDF-style generated certificates carry an owner/permissions
+        # password with an EMPTY user password: anyone can open and render
+        # them, so their bytes still bind claimed page evidence. Only a PDF
+        # that needs a real user password is unverifiable.
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            owner = base / "owner.pdf"
+            owner.write_bytes(owner_locked_pdf_bytes())
+            user = base / "user.pdf"
+            user.write_bytes(encrypted_pdf_bytes())
+            corrupt = base / "corrupt.pdf"
+            corrupt.write_bytes(corrupt_pdf_bytes())
+            plain = base / "plain.pdf"
+            plain.write_bytes(pdf_bytes("plain", pages=2))
+            self.assertEqual(review.page_reference_limit(owner), (1, "ok"))
+            self.assertEqual(review.page_reference_limit(user), (None, "encrypted"))
+            self.assertEqual(review.page_reference_limit(corrupt), (None, "unreadable"))
+            self.assertEqual(review.page_reference_limit(plain), (2, "ok"))
+            # the PyMuPDF fallback reaches the same verdicts without pypdf
+            with patch.dict(sys.modules, {"pypdf": None}):
+                self.assertEqual(review.page_reference_limit(owner), (1, "ok"))
+                self.assertEqual(review.page_reference_limit(user), (None, "encrypted"))
+                self.assertEqual(review.page_reference_limit(plain), (2, "ok"))
+
+    def test_owner_locked_ranking_peer_is_ranked_not_deferred(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = Fixture(temp)
+            existing = f.file("Worker/Overwrite Documents/DBS Document.pdf",
+                              data=owner_locked_pdf_bytes())
+            incoming = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf")
+            f.prepare(incoming)
+            existing_rel = existing.relative_to(f.documents).as_posix()
+            decisions = f.decisions(scores={
+                existing_rel: 95,
+                incoming.relative_to(f.documents).as_posix(): 40})
+            # previously: "cannot be verified against its bytes (encrypted PDF)"
+            self.assertEqual(len(f.plan(decisions)["operations"]), 2)
+        with tempfile.TemporaryDirectory() as temp:
+            # a readable owner-locked peer is still held to its real page count
+            f = Fixture(temp)
+            existing = f.file("Worker/Overwrite Documents/DBS Document.pdf",
+                              data=owner_locked_pdf_bytes())
+            incoming = f.file("Worker/Bulk/Batch 01/Other - Unknown.pdf")
+            f.prepare(incoming)
+            existing_rel = existing.relative_to(f.documents).as_posix()
+            decisions = f.decisions(scores={
+                existing_rel: 95,
+                incoming.relative_to(f.documents).as_posix(): 40})
+            for row in decisions["peer_reviews"]:
+                if row["path"] == existing_rel:
+                    row["pages_examined"] = [1, 2]
+            with self.assertRaisesRegex(review.ReviewError, "has only 1 page"):
+                f.plan(decisions)
 
 
 if __name__ == "__main__":
