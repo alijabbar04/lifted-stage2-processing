@@ -120,6 +120,127 @@ def run_apply(root, api, applied):
 
 
 class TestBatchWorkerScope(unittest.TestCase):
+    def _empty_worker_engine(self, root, worker_name="Empty Worker"):
+        worker = root / worker_name
+        worker.mkdir()
+        state = app.BatchState(root)
+        state.init("Synthetic", "claude-haiku-4-5", 1.0,
+                   {"post_run_audit": False, "move_mode": False})
+        key = str(worker.resolve()).casefold()
+        state.data["workers"][key] = {
+            "name": worker.name, "source_path": str(worker),
+            "classification_status": "complete",
+            "finishing_status": "pending", "movement_status": "pending",
+            "completed": False,
+            "approved_empty_outcome": {
+                "reason": "pre-existing empty source folder",
+                "user_authorized": True,
+                "approval_ts": "2026-09-09T12:00:00+01:00",
+            },
+            "applied_records": [],
+        }
+        engine = make_engine(root, EndedBatchAPI(), lambda *_args: None)
+        return engine, state, worker
+
+    def test_approved_genuinely_empty_worker_is_explicit_outcome(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, state, worker = self._empty_worker_engine(Path(tmp))
+            engine._validate_batch_worker_records(worker, [], state)
+            key = str(worker.resolve()).casefold()
+            self.assertEqual(
+                state.data["workers"][key]["completion_outcome"],
+                "no_documents_supplied")
+
+    def test_empty_worker_requires_approval_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, state, worker = self._empty_worker_engine(Path(tmp))
+            key = str(worker.resolve()).casefold()
+            state.data["workers"][key].pop("approved_empty_outcome")
+            with self.assertRaises(app.FinishingInputChanged):
+                engine._validate_batch_worker_records(worker, [], state)
+
+    def test_empty_worker_rejects_malformed_approval_or_collections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, state, worker = self._empty_worker_engine(Path(tmp))
+            key = str(worker.resolve()).casefold()
+            state.data["workers"][key]["approved_empty_outcome"][
+                "approval_ts"] = "not-an-iso-time"
+            with self.assertRaises(app.FinishingInputChanged):
+                engine._validate_batch_worker_records(worker, [], state)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, state, worker = self._empty_worker_engine(Path(tmp))
+            state.data["primary_inventory"] = []
+            with self.assertRaises(app.FinishingInputChanged):
+                engine._validate_batch_worker_records(worker, [], state)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, state, worker = self._empty_worker_engine(Path(tmp))
+            state.data["requests"] = {"bad": "not-a-dict"}
+            with self.assertRaises(app.FinishingInputChanged):
+                engine._validate_batch_worker_records(worker, [], state)
+
+    def test_empty_worker_with_saved_inventory_or_request_is_rejected(self):
+        for collection in ("primary_inventory", "requests"):
+            with self.subTest(collection=collection), tempfile.TemporaryDirectory() as tmp:
+                engine, state, worker = self._empty_worker_engine(Path(tmp))
+                state.data[collection] = {
+                    "saved": {"worker_dir": str(worker), "path": str(worker / "x.pdf")}}
+                with self.assertRaises(app.FinishingInputChanged):
+                    engine._validate_batch_worker_records(worker, [], state)
+
+    def test_missing_folder_or_unsupported_descendant_is_not_empty_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, state, worker = self._empty_worker_engine(Path(tmp))
+            worker.rmdir()
+            with self.assertRaises(app.FinishingInputChanged):
+                engine._validate_batch_worker_records(worker, [], state)
+
+    def test_approved_empty_worker_does_not_increment_worker_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worker = root / "Empty Worker"
+            worker.mkdir()
+            state = app.BatchState(root)
+            state.init("Synthetic", "claude-haiku-4-5", 1.0,
+                       {"post_run_audit": False, "move_mode": False})
+            key = str(worker.resolve()).casefold()
+            state.data["submitted_worker_scope"] = [
+                {"name": worker.name, "source_path": str(worker.resolve())}]
+            state.data["workers"][key] = {
+                "name": worker.name, "source_path": str(worker),
+                "classification_status": "complete",
+                "finishing_status": "pending", "movement_status": "pending",
+                "completed": False, "applied_records": [],
+                "approved_empty_outcome": {
+                    "reason": "pre-existing empty source folder",
+                    "user_authorized": True,
+                    "approval_ts": "2026-09-09T12:00:00+01:00",
+                },
+            }
+            state.add_batch("primary", 0, "ended", request_ids=[])
+            state.data["primary_submission_complete"] = True
+            state.save()
+            api = EndedBatchAPI()
+            api.results = []
+            engine, statuses = run_apply(root, api, [])
+            self.assertEqual(engine.stats["workers"], 0)
+            self.assertTrue(statuses[-1].startswith("batch_applied:"))
+
+    def test_approved_empty_worker_rejects_hidden_or_underscore_descendant(self):
+        for filename in (".hidden", "_internal.pdf"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                engine, state, worker = self._empty_worker_engine(Path(tmp))
+                (worker / filename).write_text("residue", encoding="utf-8")
+                with self.assertRaises(app.FinishingInputChanged):
+                    engine._validate_batch_worker_records(worker, [], state)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, state, worker = self._empty_worker_engine(Path(tmp))
+            (worker / "unnoticed.txt").write_text("unsupported", encoding="utf-8")
+            with self.assertRaises(app.FinishingInputChanged):
+                engine._validate_batch_worker_records(worker, [], state)
+
     def test_submit_persists_review_id_and_exact_five_before_failed_post(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

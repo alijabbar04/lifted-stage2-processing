@@ -1388,8 +1388,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.5.3"
-APP_BUILD = "2026.09.08-state1"
+APP_VERSION = "1.5.4"
+APP_BUILD = "2026.09.10-audit1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -4140,6 +4140,102 @@ def quality_evidence(answer):
             "note": str(answer.get("note", "") or "").strip()}
 
 
+AUDIT_HANDBOOK_RELEVANCE_REVIEW_MAX = 20
+
+
+def _audit_quality_evidence(answer):
+    """Parse persisted finishing evidence without coercing malformed flags."""
+    if not isinstance(answer, dict):
+        return None
+    for key in ("legible", "complete"):
+        if key in answer and not isinstance(answer[key], bool):
+            return None
+    try:
+        return quality_evidence(answer)
+    except (OverflowError, TypeError, ValueError):
+        # Persisted audit evidence is optional; malformed/non-finite scores
+        # must not abort the audit or become a zero-quality signal.
+        return None
+
+
+def audit_finishing_quality_hints(batch_state_data):
+    """Return byte-bound finishing evidence that may qualify an audit match.
+
+    Batch finishing has already paid for a quality/relevance assessment of
+    every member of a duplicate family. Reuse only completed, valid answers
+    that are bound to a SHA-256 member in a completed Employee Handbook
+    family. Paths are deliberately not used: a worker may have been moved
+    between finishing and audit, while its bytes (and therefore its hash) stay
+    the same. A low score may reflect relevance, recency, or another quality
+    dimension; it is only a human-review signal, not classification confidence.
+    Conflicting assessments for identical bytes are excluded.
+    """
+    data = batch_state_data if isinstance(batch_state_data, dict) else {}
+    hints, conflicted = {}, set()
+    workers = data.get("workers") or {}
+    if not isinstance(workers, dict):
+        return {}
+    for worker in workers.values():
+        if not isinstance(worker, dict):
+            continue
+        operations = worker.get("finishing_operations") or {}
+        families = worker.get("ranking_families") or {}
+        if not isinstance(operations, dict) or not isinstance(families, dict):
+            continue
+        for family_name, family in families.items():
+            if (not isinstance(family_name, str)
+                    or _norm_type(family_name) != _norm_type("Employee Handbook")
+                    or not isinstance(family, dict)
+                    or family.get("status") != "complete"):
+                continue
+            members = family.get("members")
+            if not isinstance(members, list):
+                continue
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                raw_hash = member.get("hash")
+                if not isinstance(raw_hash, str):
+                    continue
+                digest = raw_hash.strip().casefold()
+                if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    continue
+                operation = operations.get(f"quality:{family_name}:{digest}")
+                if not isinstance(operation, dict):
+                    continue
+                if operation.get("status") != "complete":
+                    continue
+                evidence = _audit_quality_evidence(operation.get("result"))
+                if evidence is None or digest in conflicted:
+                    continue
+                prior = hints.get(digest)
+                core = (evidence["score"], evidence["legible"],
+                        evidence["complete"])
+                if prior is not None and core != (
+                        prior["score"], prior["legible"], prior["complete"]):
+                    hints.pop(digest, None)
+                    conflicted.add(digest)
+                else:
+                    hints[digest] = evidence
+    return hints
+
+
+def audit_finishing_quality_concern(current_type, evidence):
+    """Whether finishing evidence contradicts a blind handbook agreement.
+
+    A low score alone can describe a poor scan, stale content, or another
+    quality issue. Requiring the copy to be both legible and complete narrows
+    the conflict signal, but does not identify the score's causal dimension.
+    This is a human-review trigger only, never a proposed replacement name or
+    classification confidence.
+    """
+    evidence = _audit_quality_evidence(evidence)
+    return bool(evidence
+                and _norm_type(current_type) == _norm_type("Employee Handbook")
+                and evidence["score"] <= AUDIT_HANDBOOK_RELEVANCE_REVIEW_MAX
+                and evidence["legible"] and evidence["complete"])
+
+
 def parse_date(s: str):
     """Parse a YYYY-MM-DD-ish string to a date; return None on failure."""
     if not s:
@@ -6752,12 +6848,16 @@ def audit_adjudicate(api, vocab, path, resolution, current_base,
 def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
                        resolution, log=lambda m: None,
                        emit_cost=None, check_stop=lambda: None,
-                       orientation_rows=None, on_progress=None):
+                       orientation_rows=None, on_progress=None,
+                       finishing_quality_hints=None):
     """Audit every document under `worker_dirs`; write the workbook into
     `out_dir`. Returns (rows, xlsx_path). See the section comment above for
-    the method. Flags are conservative: nothing is flagged unless the
-    adjudicator confidently agrees the filename is wrong."""
+    the method. Flags are conservative: a proposed replacement requires the
+    adjudicator to confidently agree the filename is wrong; a narrow conflict
+    with completed, byte-bound finishing evidence is surfaced without a
+    proposed replacement as Unable To Determine."""
     vocab = kb.vocabulary_block()
+    finishing_quality_hints = finishing_quality_hints or {}
     docs = []
     for w in worker_dirs:
         w = Path(w)
@@ -6820,6 +6920,15 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
             pr_other = (pred_group == "Other") or \
                 pred_base.strip().lower().startswith("other")
             same = _norm_type(pred_base) == _norm_type(fname_base)
+            quality_hint = None
+            if same and finishing_quality_hints:
+                try:
+                    quality_hint = finishing_quality_hints.get(
+                        file_hash(p).casefold())
+                except Exception:
+                    # Classification evidence still stands on its own if the
+                    # optional byte-bound finishing hint cannot be resolved.
+                    quality_hint = None
             # CUSTOM HUMAN FILENAMES: a name that is neither a controlled
             # type nor 'Other - ...' (e.g. 'J Smith - Payslip 31 Jan 2026')
             # was chosen by a person deliberately - it can never 'match' a
@@ -6837,7 +6946,21 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
                     log(f"  [audit] {i}/{len(docs)} checked "
                         f"({n_flag} flagged so far)")
                 continue
-            if not (same or (fn_other and pr_other)):
+            if same and audit_finishing_quality_concern(fname_base,
+                                                        quality_hint):
+                score = quality_evidence(quality_hint)["score"]
+                row["Review Status"] = "Unable To Determine"
+                row["Missing Information"] = (
+                    "The audit classification and the earlier finishing "
+                    "relevance assessment conflict; a human must decide the "
+                    "document type.")
+                row["Reason For Concern"] = (
+                    f"The independent audit repeated '{fname_base}', but the "
+                    f"completed finishing assessment scored this legible, "
+                    f"complete copy {score}/100 for that family. The finishing "
+                    "score is a review signal, not classification confidence.")
+                notes.append("byte-bound finishing quality/relevance conflict")
+            elif not (same or (fn_other and pr_other)):
                 # prospective mismatch -> adjudicate before flagging
                 progress("adjudicating", i - 1, p, worker)
                 adj = audit_adjudicate(adjudicator_api, vocab, p, resolution,
@@ -8068,7 +8191,9 @@ class Engine:
                 self.api, adjudicator, self.kb, self._audit_worker_dirs,
                 out_dir, resolution=self.resolution, log=self.log,
                 emit_cost=self._emit_cost, check_stop=self._check_stop,
-                orientation_rows=orientation_rows, on_progress=self._activity)
+                orientation_rows=orientation_rows, on_progress=self._activity,
+                finishing_quality_hints=audit_finishing_quality_hints(
+                    batch_state.data if batch_state is not None else {}))
             flagged = sum(1 for r in rows
                           if r["Review Status"] not in ("Correct",
                                                         "Custom Name"))
@@ -9253,6 +9378,65 @@ class Engine:
         least one good record is not proof that the worker is complete.
         """
         docs = list_worker_docs(worker_dir)
+        worker = self._batch_worker_state(state, worker_dir) or {}
+        saved_rows = worker.get("applied_records") or []
+        # An explicitly approved, pre-existing empty worker is the only
+        # permitted zero-record exception. Keep this narrow: the directory
+        # must contain no descendant files at all, and neither the frozen
+        # inventory nor submitted requests may name this worker.
+        approved_empty = worker.get("approved_empty_outcome")
+        literal_empty = False
+        try:
+            literal_empty = (worker_dir.is_dir() and not worker_dir.is_symlink()
+                             and not any(worker_dir.iterdir()))
+        except OSError:
+            literal_empty = False
+        approval_ts = str(approved_empty.get("approval_ts") or "") \
+            if isinstance(approved_empty, dict) else ""
+        try:
+            datetime.datetime.fromisoformat(approval_ts.replace("Z", "+00:00"))
+            valid_approval_ts = bool(approval_ts)
+        except (TypeError, ValueError):
+            valid_approval_ts = False
+        if (not docs and not records and not saved_rows and literal_empty
+                and isinstance(approved_empty, dict)
+                and str(approved_empty.get("reason") or "").strip()
+                and approved_empty.get("user_authorized") is True
+                and valid_approval_ts):
+            worker_path = worker_dir.resolve()
+            worker_key = str(worker_path).casefold()
+            for collection_name in ("primary_inventory", "requests"):
+                collection = state.data.get(collection_name)
+                if collection is None:
+                    collection = {}
+                if not isinstance(collection, dict):
+                    raise FinishingInputChanged(
+                        f"{collection_name} metadata is malformed")
+                for meta in collection.values():
+                    if not isinstance(meta, dict):
+                        raise FinishingInputChanged(
+                            f"{collection_name} metadata entry is malformed")
+                    associated = False
+                    worker_text = str(meta.get("worker_dir") or "").strip()
+                    path_text = str(meta.get("path") or "").strip()
+                    name_text = str(meta.get("worker") or "").strip()
+                    if worker_text:
+                        associated = (str(Path(worker_text).resolve()).casefold()
+                                      == worker_key)
+                    if path_text:
+                        try:
+                            associated = associated or Path(path_text).resolve().is_relative_to(worker_path)
+                        except (OSError, RuntimeError, ValueError):
+                            raise FinishingInputChanged(
+                                f"{collection_name} metadata path is malformed")
+                    associated = associated or (name_text.casefold()
+                                                == worker_dir.name.casefold())
+                    if associated:
+                        raise FinishingInputChanged(
+                            "approved empty worker has saved inventory or "
+                            "submitted requests")
+            worker["completion_outcome"] = "no_documents_supplied"
+            return
         doc_keys = {str(path.resolve()).casefold(): path for path in docs}
         record_keys = {}
         for record in records:
@@ -9284,8 +9468,6 @@ class Engine:
                 raise FinishingInputChanged(
                     f"current file cannot be hashed: {path.name}") from exc
             current_hashes.append(current_hash.casefold())
-        worker = self._batch_worker_state(state, worker_dir) or {}
-        saved_rows = worker.get("applied_records") or []
         saved_hashes = [str(row.get("hash") or "").casefold()
                         for row in saved_rows if isinstance(row, dict)]
         if (saved_rows and saved_hashes
@@ -11562,7 +11744,9 @@ class Engine:
                             raise FinishingAmbiguous(
                                 "worker finishing completed but its durable "
                                 "completion marker could not be written")
-                    self.stats["workers"] += 1
+                    if worker_state.get("completion_outcome") != \
+                            "no_documents_supplied":
+                        self.stats["workers"] += 1
                     final_dir = w
                     # move mode: relocate the fully-processed worker (as live)
                     if self.move_mode and batch_worker_ready_to_move(w, records):

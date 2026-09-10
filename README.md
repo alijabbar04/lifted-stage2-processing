@@ -1,6 +1,18 @@
 # Stage 2 — Processing
 
-## v1.5.3 Obsidian / Jade state-write recovery — build 2026.09.08-state1
+## v1.5.4 Obsidian / Jade audit evidence — build 2026.09.10-audit1
+
+This release carries completed SHA-bound low-quality Employee Handbook
+finishing evidence so the audit can mark an **UnableToDetermine** result when
+the score is 20 or below and both typed `legible` and `complete` flags are
+true. It does not launch an audit automatically, rename documents, or make an
+extra API call. Review intake remains controlled by the configured review
+scope. Use the all-flags review option to include confidence-0 results; the
+legacy >80-only filter excludes them. Processing and ranking are unchanged,
+and this makes no broad accuracy claim. Empty-worker and campaign
+finishing-bridge safeguards are also included.
+The GUI still cannot reattach to an already-running session; no reconnect fix
+is shipped.
 
 The current UI direction is **Graphite + Deep Jade**: a near-black/graphite
 surface with restrained jade accents, real filled/outlined buttons, a clean
@@ -361,7 +373,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.3 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.4 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

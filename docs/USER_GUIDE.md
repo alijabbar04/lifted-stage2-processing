@@ -1,6 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.5.3 Obsidian / Jade
+## User guide | v1.5.4 Obsidian / Jade
 
 Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Stage 3 uploads the prepared folders. Completing Stage 2 does not itself upload anything.
 
@@ -32,7 +32,7 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 | Discord, Telegram and Slack updates | 12 |
 | Troubleshooting and completion checklist | 13 |
 
-Edition: 8 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
+Edition: 10 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
 
 <!-- pagebreak -->
 
@@ -53,7 +53,7 @@ when relevant.
 | AI Document Review | Prepare an account-selected document review. |
 | Improve Stage 2 | Prepare a software-learning review of accumulated correction evidence. |
 
-The v1.5.3 presentation uses Graphite surfaces, restrained Deep Jade accents,
+The v1.5.4 presentation uses Graphite surfaces, restrained Deep Jade accents,
 real buttons and progressive active panels. **Accuracy Audit** finds possible
 mistakes; **AI Document Review** checks pages; **Improve Stage 2** studies the
 ledger for justified software changes. Corrections never grant code authority.
@@ -209,6 +209,15 @@ When enabled and affordable within the remaining run budget, it re-examines the 
 | Needs review | Flagged results to inspect; not a count of confirmed mistakes. |
 
 ### Completion, skipping and interruption
+
+For the Employee Handbook finishing path, completed SHA-bound evidence lets the
+audit mark **UnableToDetermine** at 20 or below when both typed `legible` and
+`complete` flags are true. It does not launch an audit, rename documents, or
+make an extra API call; configured scope controls intake. Select all-flags to
+include confidence-0 results; legacy >80-only excludes them. Processing and
+ranking are unchanged; empty-worker and campaign safeguards are inherited.
+The GUI cannot reattach to a detached run; this release does not ship a
+reconnect fix.
 
 **Audit complete** means the audit finished its attempts and wrote the report. It can still contain errors, unreadable inputs or incorrect AI judgements. Open **Reports** and check statuses and Notes; do not treat completion as a passed accuracy test. The naming audit examines resulting documents, not a complete source-to-output fidelity comparison.
 

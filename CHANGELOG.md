@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.5.4 — 2026-09-10 — SHA-bound audit quality signal
+
+- Reuse completed, SHA-bound low-quality Employee Handbook finishing evidence
+  so the audit can mark an `UnableToDetermine` result when the score is 20 or
+  below and both typed `legible`/`complete` flags are true. This does not
+  launch an audit, rename documents, or make an extra API call; review intake
+  remains controlled by configured scope. The all-flags review option includes
+  confidence-0 results, while the legacy >80-only filter excludes them.
+  Processing and ranking are unchanged.
+- Carry forward the empty-worker and campaign finishing-bridge safeguards.
+- The GUI cannot reattach to an already-running session; no reconnect fix is
+  shipped in this release.
+
 ## v1.5.3 — 2026-09-08 — Windows orientation-state recovery
 
 - Retry only transient Windows sharing/access-denied failures encountered while
