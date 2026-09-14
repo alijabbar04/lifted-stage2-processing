@@ -1,0 +1,152 @@
+# Keeps the colleague-facing install path working.
+#
+#   validate  - on every push / PR touching the install path, parse the scripts
+#               and run tests/test_installer_functions.ps1. That suite covers
+#               the failures that actually reached a colleague's PC: the
+#               Microsoft Store Python alias, checksum handling, and the
+#               PowerShell 5.1 native-argument quoting bug that silently broke
+#               Python detection.
+#
+#   attach    - when a release is published, upload install.ps1 and install.cmd
+#               to it, then FAIL if the release is missing anything the
+#               installer needs. A release that looks fine but cannot actually
+#               be installed from is worse than no release, because the
+#               one-line command in the README always points at "latest".
+#
+# The application binaries (Stage2_Processing.exe, the Setup, the guide and
+# SHA256SUMS.txt) are still built and uploaded by the maintainer - they need
+# PyInstaller and Inno Setup on a real Windows build machine.
+
+name: Install assets
+
+on:
+  push:
+    paths:
+      - 'install.ps1'
+      - 'install.cmd'
+      - 'setup.ps1'
+      - 'README.md'
+      - 'tests/test_installer_functions.ps1'
+      - '.github/workflows/install-assets.yml'
+  pull_request:
+    paths:
+      - 'install.ps1'
+      - 'install.cmd'
+      - 'setup.ps1'
+      - 'tests/test_installer_functions.ps1'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    # Windows PowerShell 5.1 is what a colleague actually has, and it differs
+    # from PowerShell 7 in ways that have already bitten us - so the checks run
+    # on Windows, under the same engine.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse the install scripts
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($file in 'install.ps1', 'setup.ps1', 'tests\test_installer_functions.ps1') {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file), [ref]$null, [ref]$errors)
+            if ($errors.Count) {
+              Write-Host "::error file=$file::$($errors[0].Message)"
+              $failed = $true
+            } else {
+              Write-Host "OK  $file parses"
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Installer and setup function tests
+        shell: powershell
+        run: .\tests\test_installer_functions.ps1
+
+      - name: The install path must stay prerequisite-free
+        shell: powershell
+        run: |
+          # Stage 2's repository is public. Anything that drags a colleague
+          # back into GitHub accounts, sign-ins or permanent policy changes is
+          # a regression, so fail the build on it rather than reviewing for it.
+          $script = Get-Content -LiteralPath 'install.ps1' -Raw
+          $failed = $false
+          foreach ($forbidden in 'gh auth', 'gh release', 'git clone', 'Set-ExecutionPolicy') {
+            if ($script -match [regex]::Escape($forbidden)) {
+              Write-Host "::error::install.ps1 must not use '$forbidden'"
+              $failed = $true
+            }
+          }
+          # A pinned tag means the README goes stale on every release.
+          if ($script -match '(?m)^\s*\$Tag\s*=\s*[''"]v?\d') {
+            Write-Host '::error::install.ps1 must not hard-code a release tag'
+            $failed = $true
+          }
+          if ($script -notmatch 'releases/latest') {
+            Write-Host '::error::install.ps1 must resolve the latest published release'
+            $failed = $true
+          }
+          if ($failed) { exit 1 }
+          Write-Host 'OK  no GitHub CLI, no Git, no policy change, no pinned version'
+
+  attach:
+    if: github.event_name == 'release'
+    needs: validate
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      # Check out the tag being released, not the default branch, so the
+      # uploaded scripts are exactly the ones this release was cut from.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Attach the install scripts
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" install.ps1 install.cmd --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: A published release must be installable
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          $names = @(gh release view $tag --json assets --jq '.assets[].name')
+          Write-Host "Assets on $tag :"
+          $names | ForEach-Object { Write-Host "  $_" }
+
+          # Every one of these is fetched by install.ps1. Missing any of them
+          # means the one-line command in the README is broken for everybody,
+          # so this is a hard failure rather than a warning.
+          $required = 'install.ps1', 'install.cmd', 'Stage2_Processing.exe',
+                      'Stage2_Guide_AI_Processing.pdf', 'SHA256SUMS.txt'
+          $missing = @($required | Where-Object { $names -notcontains $_ })
+          if ($missing.Count) {
+            Write-Host "::error::release $tag is missing: $($missing -join ', ')"
+            exit 1
+          }
+
+          # The checksum list has to actually cover what the installer verifies.
+          gh release download $tag --pattern SHA256SUMS.txt --dir sums --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $manifest = Get-Content -LiteralPath 'sums\SHA256SUMS.txt' -Raw
+          foreach ($asset in 'Stage2_Processing.exe', 'Stage2_Guide_AI_Processing.pdf') {
+            if ($manifest -notmatch ('(?m)^[0-9a-fA-F]{64} \*' + [regex]::Escape($asset) + '$')) {
+              Write-Host "::error::SHA256SUMS.txt has no entry for $asset"
+              exit 1
+            }
+          }
+          Write-Host "OK  release $tag is complete and installable"

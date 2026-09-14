@@ -70,6 +70,32 @@ class TestWinHttpBatchTransport(unittest.TestCase):
         other_transport.assert_not_called()
         com.CoUninitialize.assert_called_once()
 
+    def test_status_read_exception_is_distinct_after_one_send(self):
+        com, client, request = fake_com()
+        class BadStatus:
+            def __int__(self):
+                raise RuntimeError("status-secret")
+        request.Status = BadStatus()
+        with patch.object(batch_transport, "_load_com", return_value=(com, client)):
+            with self.assertRaises(batch_transport.BatchTransportError) as caught:
+                batch_transport.winhttp_post_batch(URL, {}, b"{}")
+        self.assertIn("batch status failed", str(caught.exception))
+        self.assertNotIn("status-secret", str(caught.exception))
+        request.Send.assert_called_once()
+
+    def test_response_read_exception_is_distinct_after_one_send(self):
+        com, client, request = fake_com()
+        class BadResponse:
+            def __str__(self):
+                raise RuntimeError("response-secret")
+        request.ResponseText = BadResponse()
+        with patch.object(batch_transport, "_load_com", return_value=(com, client)):
+            with self.assertRaises(batch_transport.BatchTransportError) as caught:
+                batch_transport.winhttp_post_batch(URL, {}, b"{}")
+        self.assertIn("batch response failed", str(caught.exception))
+        self.assertNotIn("response-secret", str(caught.exception))
+        request.Send.assert_called_once()
+
     def test_option_setup_failure_never_sends_and_releases_com(self):
         com, client, request = fake_com()
         request._oleobj_.InvokeTypes.side_effect = RuntimeError("bad property")

@@ -240,6 +240,46 @@ class TestPrimaryRecovery(unittest.TestCase):
             self.assertTrue(any(message.startswith("Uploading recovery chunk")
                                 and "MiB" in message for message in statuses))
 
+    def test_recovery_excludes_newly_unrenderable_tail_without_rebuilding_requests(self):
+        with tempfile.TemporaryDirectory() as root:
+            f = RecoveryFixture(root, inventory=True)
+            bad = Path(f.meta[f.ids[2]]["path"])
+            f.state.data["requests"].pop(f.ids[2])
+            f.state.data["primary_submission"]["request_identities"] = [f.ids[3]]
+            f.state.save()
+            f.engine._batch_classification_view = Mock(
+                side_effect=lambda path: ([], "", [0], 1, False)
+                if Path(path) == bad
+                else ([], "synthetic document", [0], 1, False))
+            report = f.engine.recover_primary_submission(True)
+            self.assertEqual(report["status"], "submitted", report)
+            saved = app.BatchState(f.root).data
+            self.assertIn(f.ids[2], saved["primary_render_exclusions"])
+            self.assertNotIn(f.ids[2], saved["requests"])
+            sent = [row["custom_id"] for call in f.api.submit_batch.call_args_list
+                    for row in call.args[0]]
+            self.assertEqual(sent, [f.ids[3]])
+
+    def test_recovery_all_excluded_is_source_attention_without_provider_submit(self):
+        with tempfile.TemporaryDirectory() as root:
+            f = RecoveryFixture(root, inventory=True)
+            f.state.data["requests"] = {}
+            f.state.data["batches"] = []
+            f.state.data["primary_submission"] = {}
+            f.state.data["primary_submission_complete"] = False
+            f.state.save()
+            state = app.BatchState(f.root)
+            for cid in f.ids:
+                f.engine._record_primary_source_exception(
+                    state, cid, state.data["primary_inventory"][cid],
+                    "unreadable_source", "synthetic exclusion")
+                state = app.BatchState(f.root)
+            report = f.engine.recover_primary_submission(True)
+            self.assertEqual(report["status"], "source_attention", report)
+            f.api.submit_batch.assert_not_called()
+            self.assertEqual(f.statuses[-1].split(":", 1)[0],
+                             "batch_source_attention")
+
     def test_single_request_above_target_is_allowed_without_downsampling(self):
         with tempfile.TemporaryDirectory() as root:
             f = RecoveryFixture(root)

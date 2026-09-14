@@ -684,6 +684,13 @@ class TestDiscountedFollowupState(unittest.TestCase):
                      patch.object(second, "_maybe_fix_rotation",
                                   return_value=None):
                     second.run_batch_apply()
+                if label == "no-result":
+                    # A finished batch must still expose one JSONL row per
+                    # saved request; an empty response is partial/corrupt and
+                    # must fail closed rather than silently applying fallback.
+                    self.assertTrue(second_statuses[-1].startswith(
+                        "batch_apply_failed:"))
+                    continue
                 self.assertTrue(second_statuses[-1].startswith(
                     "batch_applied:"))
                 self.assertTrue((worker / expected_name).exists())

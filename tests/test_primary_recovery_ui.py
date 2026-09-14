@@ -45,7 +45,8 @@ class TestPrimaryRecoveryUI(unittest.TestCase):
         app.App._refresh_run_controls(ui, pending={"batches": [{"id": "saved"}]})
         ui.start_btn.configure.assert_called_once_with(state="disabled")
         ui.flatten_btn.configure.assert_called_once_with(state="disabled")
-        ui.batch_btn.configure.assert_called_once_with(state="normal")
+        ui.batch_btn.configure.assert_any_call(state="normal")
+        ui.batch_btn.configure.assert_any_call(text="Check batch status")
         ui.pick_btn.configure.assert_called_once_with(state="normal")
 
     def test_cleared_pending_state_reenables_normal_actions(self):
@@ -53,14 +54,15 @@ class TestPrimaryRecoveryUI(unittest.TestCase):
         app.App._refresh_run_controls(ui, pending={})
         ui.start_btn.configure.assert_called_once_with(state="normal")
         ui.flatten_btn.configure.assert_called_once_with(state="normal")
-        ui.batch_btn.configure.assert_called_once_with(state="disabled")
+        ui.batch_btn.configure.assert_any_call(state="disabled")
 
     def test_recovery_check_disables_conflicting_actions(self):
         ui = controls()
         ui._recovery_busy = True
         app.App._refresh_run_controls(ui, pending={"batches": [{"id": "saved"}]})
-        for button in (ui.start_btn, ui.flatten_btn, ui.pick_btn, ui.batch_btn):
+        for button in (ui.start_btn, ui.flatten_btn, ui.pick_btn):
             button.configure.assert_called_once_with(state="disabled")
+        ui.batch_btn.configure.assert_any_call(state="disabled")
 
     def test_header_reflects_followup_and_cleared_state_after_operation(self):
         with tempfile.TemporaryDirectory() as folder:

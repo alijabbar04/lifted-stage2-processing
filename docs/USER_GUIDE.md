@@ -1,6 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.5.5 Obsidian / Jade
+## User guide | v1.5.6 Obsidian / Jade
 
 Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Stage 3 uploads the prepared folders. Completing Stage 2 does not itself upload anything.
 
@@ -8,12 +8,10 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 
 ### Your usual route
 
-1. Choose the care home's **[Files]** folder and confirm the **[Processed]** destination.
-2. Check Settings, start processing, and review the run estimate.
-3. Let processing and any pending batch follow-up finish.
-4. Let the optional **Accuracy Audit** finish, then open **Reports**.
-5. Use **AI Document Review** to have the selected model check the real documents and record decisions.
-6. Use **Improve Stage 2** to have the selected learning model assess justified software improvements.
+1. Choose **[Files]**, confirm **[Processed]**, check Settings and the run estimate.
+2. Let processing, follow-up batches and the optional **Accuracy Audit** finish.
+3. Open **Reports**, then **AI Document Review** to check evidence and record decisions.
+4. Use **Improve Stage 2** for a separate review of justified software improvements.
 
 ### Find the right page
 
@@ -32,8 +30,9 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 | Settings and API usage | 12 |
 | Discord, Telegram and Slack updates | 13 |
 | Troubleshooting and completion checklist | 14 |
+| Reliable recovery and source exceptions | 15 |
 
-Edition: 10 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
+Edition: 14 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
 
 <!-- pagebreak -->
 
@@ -54,7 +53,7 @@ when relevant.
 | AI Document Review | Prepare an account-selected document review. |
 | Improve Stage 2 | Prepare a software-learning review of accumulated correction evidence. |
 
-The v1.5.5 presentation uses Graphite surfaces, restrained Deep Jade accents,
+The v1.5.6 presentation uses Graphite surfaces, restrained Deep Jade accents,
 real buttons and progressive active panels. **Accuracy Audit** finds possible
 mistakes; **AI Document Review** checks pages; **Improve Stage 2** studies the
 ledger for justified software changes. Corrections never grant code authority.
@@ -161,8 +160,8 @@ Completed workers may already be in **Processed**; that does not mean the
 captured processing scope finished. The full **Accuracy Audit** and automatic
 **AI Document Review** wait until the captured scope is complete and durable.
 
-For a Batch run, use **Check batch status**. It reuses saved answers and
-explains unresolved checks. If a confirmed failed finishing check is eligible
+For a Batch run, the button becomes **Recover final checks** when checks are
+deferred. It inspects saved evidence before downloading results. If a confirmed failed finishing check is eligible
 for another attempt, the app asks separately before sending new paid finishing
 requests and shows an estimate. Declining preserves unfinished work for later.
 An uncertain provider outcome is not retried this way: reconcile whether it was
@@ -513,3 +512,52 @@ Delivery is best-effort. A channel failure does not stop processing or other cha
 Check the learning evidence and tests. Verify the build, installer, installed executable, shortcut and GitHub release separately; code edits do not update the app.
 
 Further reference: **docs/ai-review/WORKFLOW_GUIDE.md**, **docs/TROUBLESHOOTING.md**, **docs/NOTIFICATIONS.md**, **docs/AI_WORKFLOW_INTEGRATION.md** and **docs/VOCABULARY_GUIDE.md**. Rebuild guide edits with **tools/build_user_guide.py** and check every page. Release source and PDF; see **docs/INSTALL.md**.
+
+<!-- pagebreak -->
+
+## 13. Reliable recovery and source exceptions
+
+### Retrieving saved batch results
+
+**Retrieving saved batch results** downloads existing answers, not new document
+submissions. Its counter measures verified result batches, not completed workers.
+Temporary connection failures receive a bounded retry. Validated complete batches
+are cached locally so an interrupted download or later finishing retry can reuse
+them. Incomplete, wrong-identity or corrupted cached data is not trusted.
+
+If downloading stops, keep the saved state and use **Check batch status** again.
+Do not submit the whole run again. A cache is an aid to recovery, not a replacement
+for the saved request history or original documents.
+
+### Exact duplicates and interrupted final checks
+
+Stage 2 records its exact duplicate-removal plan before removing redundant copies.
+It retains original classification history separately and checkpoints the surviving
+documents before final checks. Recovery can finish an interrupted recorded removal
+without treating those duplicates as lost documents. Missing unique content or
+unexplained changes still block recovery. Old runs without this journal are not
+automatically rewritten to pretend an unexplained mismatch is safe.
+
+### Source exceptions are not completed workers
+
+**No documents supplied** identifies an empty input folder. It is not proof that
+the worker is compliant or processed. Supply the missing originals, or explicitly
+resolve the intentionally empty folder outside the completed-document count.
+
+**Unreadable source document** means Stage 2 could not obtain usable evidence.
+Its original identity is retained; other readable requests can continue. The worker
+stays incomplete. **View source issues** reopens a source-only outcome without an
+API key or new request. Obtain a complete original; do not overwrite an active or
+pending source. Replacements need a deliberate new/reconciled processing scope.
+
+### Network errors: what the app can and cannot fix
+
+Upload diagnostics now separate sending, HTTP-status access and response reading,
+with numeric Windows causes where available. A missing upload acknowledgement
+still needs provider reconciliation before another paid submission. The app cannot
+guarantee an uninterrupted internet connection or infer acceptance from an error.
+Failed final checks use the separate costed recovery confirmation on page 5.
+
+No model, image resolution or naming/ranking policy was reduced by these changes.
+Computer sleep still pauses local processing; keep the computer awake and online
+for unattended local work. Provider-side batch work may continue while it sleeps.

@@ -26,6 +26,7 @@ api_key.local
 *.log
 logs/
 .docreview_batch_state.json
+.batch-result-cache/
 .docreview_manifest.json
 Filename Identification Record*.xlsx
 Doc Review AI filename change record*.xlsx

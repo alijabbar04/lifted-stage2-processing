@@ -3,6 +3,96 @@
 Failure modes below are taken from the app's own error handling. Each entry says
 what you will actually see, why, and what to do.
 
+[Installation](#installation) comes first; everything after it is about running
+the app.
+
+---
+
+## Installation
+
+The installer stops with **PROBLEM:** and a **What to do** list rather than a
+Windows error. This section is the longer version, plus the older errors that
+still appear in notes and emails.
+
+Every install writes a log to `%LOCALAPPDATA%\Lifted\Logs\Stage2-install.log`.
+Send that to the maintainer if you are stuck — it contains no API key, no
+password and no document content.
+
+### "PROBLEM: SECURITY CHECK FAILED"
+
+A downloaded file did not match the SHA-256 the release publishes. The files
+were deleted and nothing was installed. Usually a corrupted or truncated
+download — run the command again.
+
+If it happens **twice**, stop and tell the maintainer before retrying, and do
+not install Stage 2 from anywhere else in the meantime.
+
+### "PROBLEM: Release ... is missing ..."
+
+Nothing is wrong with your PC. The release is incomplete — tell the maintainer.
+
+### "PROBLEM: 'Stage 2 - Processing' is open at the moment"
+
+Setup cannot replace files that are in use. Close Stage 2 and run the command
+again. Nothing was changed.
+
+### "PROBLEM: The download ... was interrupted"
+
+Network, VPN or proxy. Check the connection and run the command again — it
+starts over cleanly, and it never installs a partly-downloaded file.
+
+### LibreOffice did not install
+
+Stage 2 still works. What you lose is proper conversion of Word, Excel and
+PowerPoint files: they are read as plain text only, which classifies them
+noticeably worse. PDFs and images are unaffected.
+
+Fix it any time with one line, then restart Stage 2:
+
+```powershell
+winget install --id TheDocumentFoundation.LibreOffice -e
+```
+
+Stage 2 finds it automatically afterwards — there is nothing to configure, and
+you do **not** need to reinstall Stage 2 or restart PowerShell. The app looks
+in the Windows registry as well as the usual folders, so it does not care
+whether LibreOffice ended up on your PATH.
+
+To install Stage 2 without it deliberately: `install.cmd -SkipLibreOffice`.
+
+### "winget is not recognized"
+
+The PC is missing **App Installer**, so LibreOffice cannot be added
+automatically. Stage 2 itself installs fine. Get LibreOffice from
+<https://www.libreoffice.org/download> when convenient.
+
+### Older errors (these should no longer happen)
+
+**"install.ps1 cannot be loaded because running scripts is disabled" /
+`PSSecurityException`**
+
+You do **not** need to change that setting, and you should not. The install
+command launches the installer with
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File`, which applies to
+that one process and nothing else. Never run `Set-ExecutionPolicy Unrestricted`
+to install this app.
+
+**"gh: command not found" / "To get started with GitHub CLI, please run: gh auth login"**
+
+Gone. Stage 2's repository is public, so the installer downloads over ordinary
+HTTPS. There is no GitHub CLI, no account and no sign-in in the install path.
+
+**"git is not recognized"**
+
+Stage 2 never needed Git. It is only for developers working on the source.
+
+**"Found Python" followed by a crash on `.Split()`**
+
+That was developer setup meeting the Microsoft Store's `python.exe` stub — a
+zero-byte placeholder that exists only to open the Store. `setup.ps1` now runs
+a candidate interpreter and checks what it reports before believing it, so a
+stub is rejected instead of half-accepted.
+
 ---
 
 ## API key and billing

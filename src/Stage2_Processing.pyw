@@ -128,6 +128,9 @@ import uuid
 import urllib.request
 import urllib.error
 import urllib.parse
+import http.client
+import ssl
+from email.utils import parsedate_to_datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -147,6 +150,7 @@ from stage2_run_state import RunObserver
 import stage2_diagnostics
 from stage2_locking import (DOCUMENT_WRITER_LOCK, PathWriterLock,
                             WriterLockBusy)
+import batch_result_cache
 from local_orientation import (
     MODEL_NAME as ORIENTATION_MODEL_NAME,
     MODEL_REVISION as ORIENTATION_MODEL_REVISION,
@@ -1391,8 +1395,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.5.5"
-APP_BUILD = "2026.09.10-session1"
+APP_VERSION = "1.5.6"
+APP_BUILD = "2026.09.14-recovery1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -2072,6 +2076,44 @@ class PdfConverter:
 
     # ---- LibreOffice discovery ----
     @staticmethod
+    def _windows_registry_soffice():
+        """LibreOffice locations recorded in the Windows registry.
+
+        PATH is not enough on Windows: the winget package (which the installer
+        now uses to add LibreOffice automatically) does not put soffice on
+        PATH at all, and a process that was already running holds a stale copy
+        of PATH anyway. The registry answers correctly either way, so a user
+        who installs LibreOffice never has to restart anything.
+        """
+        if sys.platform != "win32":
+            return []
+        try:
+            import winreg
+        except ImportError:
+            return []
+        found = []
+        lookups = [
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\soffice.exe", None),
+            (winreg.HKEY_CURRENT_USER,
+             r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\soffice.exe", None),
+            # LibreOffice records its own program directory here.
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\LibreOffice\UNO\InstallPath", "soffice.exe"),
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\WOW6432Node\LibreOffice\UNO\InstallPath", "soffice.exe"),
+        ]
+        for hive, subkey, append in lookups:
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    value, _ = winreg.QueryValueEx(key, "")
+            except OSError:
+                continue
+            if not value:
+                continue
+            found.append(str(Path(value) / append) if append else str(value))
+        return found
+
+    @staticmethod
     def soffice_path():
         if PdfConverter._soffice != "__unset__":
             return PdfConverter._soffice
@@ -2083,8 +2125,20 @@ class PdfConverter:
                 found = p
                 break
         if not found:
-            # common install locations (Windows / macOS / Linux)
-            candidates = [
+            candidates = PdfConverter._windows_registry_soffice()
+            # Program Files is read from the environment rather than hardcoded:
+            # it is not always on C:, and a per-user install lands elsewhere
+            # entirely.
+            for var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+                base = os.environ.get(var)
+                if base:
+                    candidates.append(str(Path(base) / "LibreOffice" / "program" / "soffice.exe"))
+            local = os.environ.get("LOCALAPPDATA")
+            if local:
+                candidates.append(
+                    str(Path(local) / "Programs" / "LibreOffice" / "program" / "soffice.exe"))
+            candidates += [
+                # kept as a last resort for an unusual environment block
                 r"C:\Program Files\LibreOffice\program\soffice.exe",
                 r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
                 "/Applications/LibreOffice.app/Contents/MacOS/soffice",
@@ -2093,7 +2147,7 @@ class PdfConverter:
                 "/opt/libreoffice/program/soffice",
             ]
             for c in candidates:
-                if Path(c).exists():
+                if c and Path(c).exists():
                     found = c
                     break
         PdfConverter._soffice = found
@@ -3081,6 +3135,12 @@ class UnreadableDocumentError(Exception):
         self.reason = str(self)
 
 
+PRIMARY_SOURCE_EXCEPTION_SCHEMA = "stage2-primary-source-exception/v1"
+PRIMARY_SOURCE_EXCEPTION_REASONS = frozenset({
+    "unreadable_source", "source_missing", "source_changed",
+})
+
+
 def _sanitize_api_error(status: int, raw_body: str):
     """Return (label, detail) describing an API error.
     label  : short, safe text mapped from the status code (for the activity log).
@@ -3895,6 +3955,9 @@ class ClaudeAPI:
     BATCH_MAX_REQUESTS = 100_000
     BATCH_MAX_BYTES = 256 * 1024 * 1024
     BATCH_SIZE_HEADROOM = 0.95      # aim for <=95% of the byte ceiling per batch
+    RESULT_MAX_RETRIES = 3          # read-only results GETs only
+    RESULT_RETRY_BASE_DELAY = 1.5
+    RESULT_RETRY_MAX_DELAY = 30.0
 
     @classmethod
     def _check_host(cls, url: str):
@@ -4030,21 +4093,112 @@ class ClaudeAPI:
         return self._http("POST",
                           f"{self.BATCH_URL}/{urllib.parse.quote(batch_id)}/cancel")
 
-    def batch_results(self, results_url: str):
-        """Download a finished batch's results (JSONL) and yield one parsed dict
-        per line. Streams so a large result set is not all held in memory."""
+    @classmethod
+    def _result_retry_after(cls, headers):
+        """Return a bounded Retry-After delay, or None when absent/invalid."""
+        if headers is None:
+            return None
+        value = headers.get("Retry-After")
+        if not value:
+            return None
+        try:
+            return max(0.0, min(cls.RESULT_RETRY_MAX_DELAY, float(value)))
+        except (TypeError, ValueError):
+            try:
+                when = parsedate_to_datetime(str(value))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=datetime.timezone.utc)
+                return max(0.0, min(cls.RESULT_RETRY_MAX_DELAY,
+                                    when.timestamp() - time.time()))
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    @classmethod
+    def _result_retry_delay(cls, attempt, headers=None):
+        retry_after = cls._result_retry_after(headers)
+        if retry_after is not None:
+            return retry_after
+        return min(cls.RESULT_RETRY_MAX_DELAY,
+                   cls.RESULT_RETRY_BASE_DELAY * (2 ** attempt))
+
+    def batch_results(self, results_url: str, *, on_retry=None,
+                      stop_check=None):
+        """Download and parse a complete finished-batch JSONL response.
+
+        This is a read-only GET. Transient HTTP/network/read failures retry
+        with bounded backoff; malformed JSON is fatal so callers cannot apply
+        a silently partial result set. A list is returned for compatibility
+        with existing iterating call sites and to support durable caching.
+        """
         self._check_host(results_url)
-        req = urllib.request.Request(results_url, method="GET")
-        self._headers(req)
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            for raw in resp:
-                line = raw.decode("utf-8", "ignore").strip()
-                if not line:
-                    continue
+        retryable_statuses = {408, 429, 500, 502, 503, 504, 529}
+        for attempt in range(self.RESULT_MAX_RETRIES + 1):
+            if callable(stop_check):
+                stop_check()
+            req = urllib.request.Request(results_url, method="GET")
+            self._headers(req)
+            try:
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    raw = resp.read()
+                    headers = getattr(resp, "headers", None)
                 try:
-                    yield json.loads(line)
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise APIError(0, "batch results response was not UTF-8",
+                                   str(exc)[:160]) from None
+                rows = []
+                for line_number, line in enumerate(text.splitlines(), 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (TypeError, ValueError) as exc:
+                        raise APIError(
+                            0, "batch results response was malformed",
+                            f"invalid JSONL at line {line_number}: {str(exc)[:120]}") from None
+                    if not isinstance(row, dict):
+                        raise APIError(0, "batch results response was malformed",
+                                       f"line {line_number} is not an object")
+                    rows.append(row)
+                return rows
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                headers = getattr(exc, "headers", None)
+                try:
+                    raw_body = exc.read().decode("utf-8", "ignore")[:1000]
                 except Exception:
-                    print(f"[batch] skipped an unparseable results line: {line[:120]!r}")
+                    raw_body = ""
+                label, detail = _sanitize_api_error(status, raw_body)
+                if status in retryable_statuses and attempt < self.RESULT_MAX_RETRIES:
+                    delay = self._result_retry_delay(attempt, headers)
+                    if callable(on_retry):
+                        try:
+                            on_retry(attempt + 1, delay, status)
+                        except Exception:
+                            pass
+                    if callable(stop_check):
+                        stop_check()
+                    time.sleep(delay)
+                    continue
+                raise APIError(status, label, detail) from None
+            except (urllib.error.URLError, TimeoutError, ConnectionResetError,
+                    ConnectionAbortedError, BrokenPipeError,
+                    http.client.IncompleteRead, http.client.RemoteDisconnected,
+                    ssl.SSLError, OSError) as exc:
+                if attempt < self.RESULT_MAX_RETRIES:
+                    delay = self._result_retry_delay(attempt)
+                    if callable(on_retry):
+                        try:
+                            on_retry(attempt + 1, delay, "network")
+                        except Exception:
+                            pass
+                    if callable(stop_check):
+                        stop_check()
+                    time.sleep(delay)
+                    continue
+                reason = getattr(exc, "reason", exc)
+                raise APIError(0, "batch results network/read failure",
+                               str(reason)[:200]) from None
 
 
 # ====================================================================
@@ -4587,6 +4741,281 @@ def _base_label(stem: str) -> str:
     return re.sub(r"\s*\(\d+\)\s*$", "", stem).strip().lower()
 
 
+DEDUP_TRANSITION_SCHEMA = "stage2-dedup-transition/v1"
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    """True for symlinks and Windows junctions/reparse directories."""
+    return path.is_symlink() or bool(
+        getattr(path, "is_junction", lambda: False)())
+
+
+def _dedup_document_inventory(worker_dir: Path) -> list:
+    """Return the exact direct-document inventory without mutating the tree.
+
+    Deduplication historically operates on direct children only.  At its
+    boundary the worker has already been flattened; a nested document or any
+    linked/reparse content is therefore drift, not something to silently skip.
+    """
+    root = Path(worker_dir)
+    if not root.is_dir() or _is_link_or_junction(root):
+        raise FinishingInputChanged(
+            "dedup worker is unavailable or is a linked/reparse directory")
+    resolved_root = root.resolve()
+    documents = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            children = list(directory.iterdir())
+        except OSError as exc:
+            raise FinishingInputChanged(
+                "dedup worker contents could not be enumerated") from exc
+        for path in children:
+            if _is_link_or_junction(path):
+                raise FinishingInputChanged(
+                    "linked/reparse content blocks deduplication")
+            if path.is_dir():
+                pending.append(path)
+                continue
+            if (not path.is_file() or path.suffix.lower() not in DOC_EXT
+                    or is_program_file(path)):
+                continue
+            resolved = path.resolve()
+            if not resolved.is_relative_to(resolved_root):
+                raise FinishingInputChanged(
+                    "dedup document escapes its worker directory")
+            if resolved.parent != resolved_root:
+                raise FinishingInputChanged(
+                    "nested documents block the pre-organisation dedup transition")
+            try:
+                digest = file_hash(resolved).casefold()
+            except Exception as exc:
+                raise FinishingInputChanged(
+                    f"dedup document could not be hashed: {resolved.name}") from exc
+            documents.append({"path": str(resolved), "hash": digest})
+    return sorted(documents, key=lambda row: (
+        natural_key(Path(row["path"]).name), row["path"].casefold()))
+
+
+def _dedup_binding(value) -> str:
+    serial = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=True)
+    return hashlib.sha256(serial.encode("utf-8")).hexdigest()
+
+
+def _build_dedup_transition(worker_dir: Path) -> dict:
+    """Build an exact, deterministic plan.  This function never deletes."""
+    root = Path(worker_dir).resolve()
+    before = _dedup_document_inventory(root)
+    grouped = {}
+    for row in before:
+        path = Path(row["path"])
+        key = (_base_label(path.stem), path.suffix.casefold(), row["hash"])
+        grouped.setdefault(key, []).append(row)
+    groups, removed_paths = [], set()
+    for (label, suffix, digest), rows in sorted(grouped.items()):
+        if len(rows) < 2:
+            continue
+        ordered = sorted(rows, key=lambda row: (
+            len(Path(row["path"]).name),
+            natural_key(Path(row["path"]).name), row["path"].casefold()))
+        survivor, duplicates = ordered[0], ordered[1:]
+        groups.append({"base_label": label, "suffix": suffix,
+                       "hash": digest, "survivor": copy.deepcopy(survivor),
+                       "duplicates": copy.deepcopy(duplicates)})
+        removed_paths.update(row["path"].casefold() for row in duplicates)
+    after = [copy.deepcopy(row) for row in before
+             if row["path"].casefold() not in removed_paths]
+    bound = {"schema": DEDUP_TRANSITION_SCHEMA, "worker": str(root),
+             "before": before, "after": after, "groups": groups,
+             "classification_binding_sha256": _dedup_binding([])}
+    bound["binding_sha256"] = _dedup_binding(bound)
+    return bound
+
+
+def _validate_dedup_transition(worker_dir: Path, transition: dict) -> dict:
+    """Validate a persisted plan independently of current filesystem state."""
+    required = {"schema", "worker", "before", "after", "groups",
+                "classification_binding_sha256", "binding_sha256",
+                "status", "prepared_ts"}
+    allowed = required | {"completed_ts", "removed_count",
+                          "current_applied_records"}
+    if not isinstance(transition, dict) or not required.issubset(transition) \
+            or set(transition) - allowed:
+        raise FinishingInputChanged("dedup transition schema is invalid")
+    root = Path(worker_dir).resolve()
+    if (transition.get("schema") != DEDUP_TRANSITION_SCHEMA
+            or Path(str(transition.get("worker") or "")).resolve() != root
+            or transition.get("status") not in ("prepared", "complete")):
+        raise FinishingInputChanged("dedup transition binding is invalid")
+    core = {key: copy.deepcopy(transition[key]) for key in
+            ("schema", "worker", "before", "after", "groups",
+             "classification_binding_sha256")}
+    if transition.get("binding_sha256") != _dedup_binding(core):
+        raise FinishingInputChanged("dedup transition digest is invalid")
+    if not re.fullmatch(
+            r"[0-9a-f]{64}", str(core["classification_binding_sha256"])):
+        raise FinishingInputChanged(
+            "dedup classification provenance binding is invalid")
+
+    def rows(value, label):
+        if not isinstance(value, list):
+            raise FinishingInputChanged(f"dedup {label} inventory is invalid")
+        out, paths = [], set()
+        for row in value:
+            if not isinstance(row, dict) or set(row) != {"path", "hash"}:
+                raise FinishingInputChanged(f"dedup {label} row is invalid")
+            raw = Path(str(row.get("path") or ""))
+            digest = str(row.get("hash") or "").casefold()
+            if (not raw.is_absolute()
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                raise FinishingInputChanged(f"dedup {label} row is unbound")
+            path = raw.resolve()
+            if path.parent != root:
+                raise FinishingInputChanged(
+                    f"dedup {label} row is outside the worker root")
+            key = str(path).casefold()
+            if key in paths:
+                raise FinishingInputChanged(
+                    f"dedup {label} inventory contains duplicate paths")
+            paths.add(key)
+            out.append({"path": str(path), "hash": digest})
+        return out
+
+    before = rows(core["before"], "before")
+    after = rows(core["after"], "after")
+    before_map = {row["path"].casefold(): row for row in before}
+    after_map = {row["path"].casefold(): row for row in after}
+    if not set(after_map).issubset(before_map):
+        raise FinishingInputChanged("dedup after inventory is not a subset")
+    for key, row in after_map.items():
+        if row != before_map[key]:
+            raise FinishingInputChanged("dedup survivor hash changed in plan")
+    if not isinstance(core["groups"], list):
+        raise FinishingInputChanged("dedup groups are invalid")
+    planned_removed = set()
+    for group in core["groups"]:
+        if (not isinstance(group, dict) or set(group) != {
+                "base_label", "suffix", "hash", "survivor", "duplicates"}
+                or not isinstance(group["duplicates"], list)
+                or not group["duplicates"]):
+            raise FinishingInputChanged("dedup group schema is invalid")
+        survivor = group["survivor"]
+        members = [survivor, *group["duplicates"]]
+        if any(not isinstance(row, dict) or set(row) != {"path", "hash"}
+               for row in members):
+            raise FinishingInputChanged("dedup group member is invalid")
+        for index, row in enumerate(members):
+            key = str(Path(str(row["path"])).resolve()).casefold()
+            path = Path(before_map.get(key, {}).get("path") or "")
+            if (key not in before_map or before_map[key] != row
+                    or row.get("hash") != group.get("hash")
+                    or path.suffix.casefold() != group.get("suffix")
+                    or _base_label(path.stem) != group.get("base_label")):
+                raise FinishingInputChanged("dedup group membership is unbound")
+            if index:
+                if key in planned_removed:
+                    raise FinishingInputChanged("dedup path is removed twice")
+                planned_removed.add(key)
+            elif key not in after_map:
+                raise FinishingInputChanged("dedup survivor is not retained")
+    if planned_removed != set(before_map) - set(after_map):
+        raise FinishingInputChanged("dedup removal plan is incomplete")
+    if transition["status"] == "prepared":
+        if any(key in transition for key in
+               ("completed_ts", "removed_count", "current_applied_records")):
+            raise FinishingInputChanged(
+                "prepared dedup transition contains completion claims")
+    else:
+        removed_count = transition.get("removed_count")
+        current_rows = transition.get("current_applied_records")
+        if (not isinstance(transition.get("completed_ts"), str)
+                or not transition["completed_ts"]
+                or isinstance(removed_count, bool)
+                or removed_count != len(planned_removed)
+                or not isinstance(current_rows, list)):
+            raise FinishingInputChanged(
+                "completed dedup transition evidence is incomplete")
+        current_paths, current_hashes = set(), []
+        for row in current_rows:
+            if (not isinstance(row, dict)
+                    or set(row) != {"path", "hash", "name", "group"}):
+                raise FinishingInputChanged(
+                    "completed dedup applied row is invalid")
+            raw = Path(str(row.get("path") or ""))
+            value = str(row.get("hash") or "").casefold()
+            if (not raw.is_absolute()
+                    or not raw.resolve().is_relative_to(root)
+                    or not re.fullmatch(r"[0-9a-f]{64}", value)
+                    or not str(row.get("name") or "")
+                    or not str(row.get("group") or "")):
+                raise FinishingInputChanged(
+                    "completed dedup applied row is unbound")
+            key = str(raw.resolve()).casefold()
+            if key in current_paths:
+                raise FinishingInputChanged(
+                    "completed dedup applied paths are not unique")
+            current_paths.add(key)
+            current_hashes.append(value)
+        if sorted(current_hashes) != sorted(row["hash"] for row in after):
+            raise FinishingInputChanged(
+                "completed dedup applied hashes differ from the plan")
+    return {"core": core, "before": before, "after": after,
+            "before_map": before_map, "after_map": after_map,
+            "removed_paths": planned_removed}
+
+
+def _apply_dedup_transition(worker_dir: Path, transition: dict,
+                            log=lambda m: None) -> int:
+    """Idempotently complete one already-persisted deletion plan."""
+    checked = _validate_dedup_transition(worker_dir, transition)
+    if transition.get("status") != "prepared":
+        return 0
+    current = _dedup_document_inventory(worker_dir)
+    current_map = {row["path"].casefold(): row for row in current}
+    if set(current_map) - set(checked["before_map"]):
+        raise FinishingInputChanged("new content appeared during dedup transition")
+    for key, row in current_map.items():
+        if row != checked["before_map"][key]:
+            raise FinishingInputChanged("content changed during dedup transition")
+    missing_required = set(checked["after_map"]) - set(current_map)
+    missing_other = (set(checked["before_map"]) - set(current_map)
+                     - checked["removed_paths"])
+    if missing_required or missing_other:
+        raise FinishingInputChanged(
+            "non-duplicate content disappeared during dedup transition")
+    deleted = 0
+    for group in checked["core"]["groups"]:
+        keep = Path(group["survivor"]["path"])
+        for row in group["duplicates"]:
+            duplicate = Path(row["path"])
+            if not duplicate.exists():
+                continue
+            try:
+                safe = (not _is_link_or_junction(duplicate)
+                        and duplicate.is_file()
+                        and duplicate.resolve().parent == Path(worker_dir).resolve()
+                        and file_hash(duplicate).casefold() == row["hash"])
+            except Exception as exc:
+                raise FinishingInputChanged(
+                    f"planned duplicate cannot be revalidated: {duplicate.name}") from exc
+            if not safe:
+                raise FinishingInputChanged(
+                    f"planned duplicate changed before removal: {duplicate.name}")
+            try:
+                duplicate.unlink()
+            except Exception as exc:
+                raise FinishingInputChanged(
+                    f"planned duplicate could not be removed: {duplicate.name}") from exc
+            deleted += 1
+            log(f"    x duplicate removed: {duplicate.name}  (kept {keep.name})")
+    if _dedup_document_inventory(worker_dir) != checked["after"]:
+        raise FinishingInputChanged(
+            "dedup filesystem result differs from its durable plan")
+    return deleted
+
+
 def dedup_worker(worker_dir: Path, log=lambda m: None):
     """Remove exact-duplicate documents in the worker folder, keeping one of
     each. Files are compared by exact byte content (SHA-256). Only files that
@@ -4597,43 +5026,10 @@ def dedup_worker(worker_dir: Path, log=lambda m: None):
 
     The kept copy is renamed to the clean base label when possible
     (e.g. the surviving 'Passport (2).pdf' becomes 'Passport.pdf')."""
-    files = [p for p in worker_dir.iterdir()
-             if p.is_file() and p.suffix.lower() in DOC_EXT
-             and not is_program_file(p)]
-    # group by (base label, extension)
-    groups = {}
-    for p in files:
-        key = (_base_label(p.stem), p.suffix.lower())
-        groups.setdefault(key, []).append(p)
-
-    deleted = 0
-    for (label, ext), members in groups.items():
-        if len(members) < 2:
-            continue
-        # within the name-group, sub-group by content hash
-        by_hash = {}
-        for p in members:
-            try:
-                hsh = file_hash(p)
-            except Exception as e:
-                log(f"    ! could not read {p.name} for dedup: {e}")
-                hsh = f"__unreadable__{p.name}"
-            by_hash.setdefault(hsh, []).append(p)
-
-        for hsh, copies in by_hash.items():
-            if hsh.startswith("__unreadable__") or len(copies) < 2:
-                continue
-            # keep the one with the shortest/cleanest name (prefers 'DBS' over 'DBS (2)')
-            copies.sort(key=lambda p: (len(p.name), natural_key(p.name)))
-            keep = copies[0]
-            for dup in copies[1:]:
-                try:
-                    dup.unlink()
-                    deleted += 1
-                    log(f"    x duplicate removed: {dup.name}  (kept {keep.name})")
-                except Exception as e:
-                    log(f"    ! could not delete duplicate {dup.name}: {e}")
-    return deleted
+    transition = _build_dedup_transition(worker_dir)
+    transition.update({"status": "prepared", "prepared_ts":
+                       datetime.datetime.now().isoformat(timespec="seconds")})
+    return _apply_dedup_transition(worker_dir, transition, log)
 
 
 def organize_worker(worker_dir: Path, log=lambda m: None, on_move=None):
@@ -5051,6 +5447,7 @@ class BatchState:
                     or primary_submit.get("status") in (
                         "submission_started", "ambiguous")
                     or self.data.get("primary_submission_complete") is False
+                    or self.data.get("primary_render_exclusions")
                     or (self.data.get("processing_complete")
                         and audit.get("status") not in (
                             "complete", "skipped", "disabled")))
@@ -5067,6 +5464,7 @@ class BatchState:
             "submitted_ts": datetime.datetime.now().isoformat(timespec="seconds"),
             "batches": [],          # [{"id","n","status_at_submit"}]
             "requests": {},         # custom_id -> {path, worker, worker_dir, fhash, pages}
+            "primary_render_exclusions": {},  # cid -> hash-bound provider-free outcome
             "est_gbp": 0.0,
             "est_input_tokens": 0,
             "est_output_tokens": 0,
@@ -9372,6 +9770,240 @@ class Engine:
         return vocab
 
     # ---- shared worker tail: dedupe -> second pass -> organise ----
+    @staticmethod
+    def _dedup_applied_rows(worker_dir: Path, records: list):
+        """Hash-bind current records to every document in the worker tree."""
+        root = Path(worker_dir).resolve()
+        if not root.is_dir() or _is_link_or_junction(root):
+            raise FinishingInputChanged(
+                "dedup worker is unavailable or linked")
+        rows, record_paths = [], set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise FinishingInputChanged("dedup applied record is invalid")
+            raw = Path(str(record.get("path") or ""))
+            if not raw.is_absolute():
+                raise FinishingInputChanged(
+                    "dedup applied record path is not absolute")
+            path = raw.resolve()
+            if (not path.is_relative_to(root) or not path.is_file()
+                    or _is_link_or_junction(path)):
+                raise FinishingInputChanged(
+                    "dedup applied record is missing or unsafe")
+            key = str(path).casefold()
+            if key in record_paths:
+                raise FinishingInputChanged(
+                    "dedup applied records contain a duplicate path")
+            record_paths.add(key)
+            try:
+                digest = file_hash(path).casefold()
+            except Exception as exc:
+                raise FinishingInputChanged(
+                    f"dedup applied record could not be hashed: {path.name}") from exc
+            name = str(record.get("name") or "")
+            group = str(record.get("group") or "")
+            if not name or not group:
+                raise FinishingInputChanged(
+                    "dedup applied record has no classification label")
+            rows.append({"path": str(path), "hash": digest,
+                         "name": name, "group": group})
+
+        document_paths = set()
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            for path in directory.iterdir():
+                if _is_link_or_junction(path):
+                    raise FinishingInputChanged(
+                        "linked/reparse content blocks dedup checkpointing")
+                if path.is_dir():
+                    pending.append(path)
+                elif (path.is_file() and path.suffix.lower() in DOC_EXT
+                      and not is_program_file(path)):
+                    resolved = path.resolve()
+                    if not resolved.is_relative_to(root):
+                        raise FinishingInputChanged(
+                            "dedup document escapes its worker")
+                    document_paths.add(str(resolved).casefold())
+        if record_paths != document_paths:
+            raise FinishingInputChanged(
+                "dedup records do not cover the exact current worker documents")
+        return sorted(rows, key=lambda row: row["path"].casefold())
+
+    @staticmethod
+    def _validate_saved_applied_rows(saved, current):
+        """Require a legacy/current applied checkpoint to match exact rows."""
+        if not isinstance(saved, list) or len(saved) != len(current):
+            raise FinishingInputChanged(
+                "saved applied records do not match the pre-dedup inventory")
+        normalised = []
+        for row in saved:
+            if not isinstance(row, dict):
+                raise FinishingInputChanged("saved applied record is invalid")
+            raw = Path(str(row.get("path") or ""))
+            value = str(row.get("hash") or "").casefold()
+            if (not raw.is_absolute()
+                    or not re.fullmatch(r"[0-9a-f]{64}", value)
+                    or not str(row.get("name") or "")
+                    or not str(row.get("group") or "")):
+                raise FinishingInputChanged("saved applied record is unbound")
+            normalised.append({"path": str(raw.resolve()), "hash": value,
+                               "name": str(row["name"]),
+                               "group": str(row["group"])})
+        if sorted(normalised, key=lambda row: row["path"].casefold()) != current:
+            raise FinishingInputChanged(
+                "saved applied records differ from current pre-dedup records")
+        return copy.deepcopy(normalised)
+
+    @staticmethod
+    def _validate_classification_provenance(worker: dict, checked: dict):
+        """Keep the original classified rows immutable after dedup starts."""
+        rows = worker.get("classification_applied_records")
+        if not isinstance(rows, list):
+            raise FinishingInputChanged(
+                "dedup classification provenance is unavailable")
+        paths, bound = set(), []
+        for row in rows:
+            if (not isinstance(row, dict)
+                    or set(row) != {"path", "hash", "name", "group"}):
+                raise FinishingInputChanged(
+                    "dedup classification provenance row is invalid")
+            raw = Path(str(row.get("path") or ""))
+            digest = str(row.get("hash") or "").casefold()
+            if (not raw.is_absolute()
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or not str(row.get("name") or "")
+                    or not str(row.get("group") or "")):
+                raise FinishingInputChanged(
+                    "dedup classification provenance row is unbound")
+            key = str(raw.resolve()).casefold()
+            if key in paths:
+                raise FinishingInputChanged(
+                    "dedup classification provenance paths are not unique")
+            paths.add(key)
+            bound.append((key, digest))
+        expected = sorted((row["path"].casefold(), row["hash"])
+                          for row in checked["before"])
+        if (sorted(bound) != expected
+                or _dedup_binding(rows) != checked["core"].get(
+                    "classification_binding_sha256")):
+            raise FinishingInputChanged(
+                "dedup classification provenance differs from the original plan")
+
+    def _checkpoint_dedup_survivors(self, worker_dir: Path, records: list,
+                                    state=None):
+        """Refresh surviving applied rows after dedup/ranking renames."""
+        state = state or self._finishing_state()
+        if state is None:
+            return records
+        worker = self._batch_worker_state(state, worker_dir)
+        transition = (worker or {}).get("dedup_transition")
+        if not transition:
+            return records
+        checked = _validate_dedup_transition(worker_dir, transition)
+        if transition.get("status") != "complete":
+            raise FinishingInputChanged(
+                "dedup survivor checkpoint requested before deletion completed")
+        current = self._dedup_applied_rows(worker_dir, records)
+        expected_hashes = sorted(row["hash"] for row in checked["after"])
+        if sorted(row["hash"] for row in current) != expected_hashes:
+            raise FinishingInputChanged(
+                "current worker content differs from completed dedup inventory")
+        if (worker.get("applied_records") != current
+                or transition.get("current_applied_records") != current):
+            worker["applied_records"] = copy.deepcopy(current)
+            transition["current_applied_records"] = copy.deepcopy(current)
+            if not state.save():
+                raise DurableStateError(
+                    "dedup survivor checkpoint could not be persisted")
+        return records
+
+    def _durable_dedup_worker(self, worker_dir: Path, records: list,
+                              state=None):
+        """Finish an exact persisted dedup plan before any ranking operation."""
+        state = state or self._finishing_state()
+        if state is None:
+            removed = dedup_worker(worker_dir, self.log)
+            rebuilt = self._rebuild_records(worker_dir, records) if removed else records
+            return rebuilt, removed
+        worker_key = str(Path(worker_dir).resolve()).casefold()
+        worker = state.data.setdefault("workers", {}).setdefault(
+            worker_key, {"name": Path(worker_dir).name,
+                         "source_path": str(worker_dir)})
+        transition = worker.get("dedup_transition")
+        if transition:
+            checked = _validate_dedup_transition(worker_dir, transition)
+            self._validate_classification_provenance(worker, checked)
+            if transition.get("status") == "complete":
+                rebuilt = self._rebuild_records(worker_dir, records)
+                self._checkpoint_dedup_survivors(
+                    worker_dir, rebuilt, state=state)
+                return rebuilt, 0
+        else:
+            current_rows = self._dedup_applied_rows(worker_dir, records)
+            saved_rows = worker.get("applied_records")
+            original_rows = (self._validate_saved_applied_rows(
+                saved_rows, current_rows) if saved_rows else
+                copy.deepcopy(current_rows))
+            prior_original = worker.get("classification_applied_records")
+            if prior_original is not None and prior_original != original_rows:
+                raise FinishingInputChanged(
+                    "immutable classification provenance changed")
+            transition = _build_dedup_transition(worker_dir)
+            if ([{"path": row["path"], "hash": row["hash"]}
+                 for row in current_rows] != sorted(
+                    transition["before"], key=lambda row: row["path"].casefold())):
+                raise FinishingInputChanged(
+                    "classification records and dedup inventory differ")
+            transition["classification_binding_sha256"] = _dedup_binding(
+                original_rows)
+            transition["binding_sha256"] = _dedup_binding({
+                key: copy.deepcopy(transition[key]) for key in
+                ("schema", "worker", "before", "after", "groups",
+                 "classification_binding_sha256")})
+            transition.update({
+                "status": "prepared",
+                "prepared_ts": datetime.datetime.now().isoformat(
+                    timespec="seconds")})
+            worker["classification_applied_records"] = copy.deepcopy(original_rows)
+            worker["dedup_transition"] = transition
+            if not state.save():
+                raise DurableStateError(
+                    "dedup transition could not be persisted; no file was removed")
+            checked = _validate_dedup_transition(worker_dir, transition)
+
+        _apply_dedup_transition(worker_dir, transition, self.log)
+        rebuilt = self._rebuild_records(worker_dir, records)
+        current_rows = self._dedup_applied_rows(worker_dir, rebuilt)
+        if ([{"path": row["path"], "hash": row["hash"]}
+             for row in current_rows] != sorted(
+                checked["after"], key=lambda row: row["path"].casefold())):
+            raise FinishingInputChanged(
+                "surviving applied records differ from the dedup plan")
+        worker["applied_records"] = copy.deepcopy(current_rows)
+        transition.update({
+            "status": "complete", "removed_count": len(checked["removed_paths"]),
+            "completed_ts": datetime.datetime.now().isoformat(
+                timespec="seconds"),
+            "current_applied_records": copy.deepcopy(current_rows)})
+        completed = _validate_dedup_transition(worker_dir, transition)
+        self._validate_classification_provenance(worker, completed)
+        if not state.save():
+            raise DurableStateError(
+                "dedup completed on disk but its survivor checkpoint failed")
+        return rebuilt, len(checked["removed_paths"])
+
+    def _resume_prepared_dedup_transition(self, worker_dir: Path,
+                                          records: list, state):
+        """Resume only a journaled pre-ranking deletion before strict validation."""
+        worker = self._batch_worker_state(state, worker_dir) or {}
+        transition = worker.get("dedup_transition")
+        if not transition or transition.get("status") != "prepared":
+            return records
+        rebuilt, _removed = self._durable_dedup_worker(
+            worker_dir, records, state=state)
+        return rebuilt
+
     def _records_from_manifest(self, worker_dir: Path):
         """Rebuild finishing inputs after an interrupted batch-apply restart."""
         records = []
@@ -9419,6 +10051,21 @@ class Engine:
             valid_approval_ts = bool(approval_ts)
         except (TypeError, ValueError):
             valid_approval_ts = False
+        if not docs and not records and not saved_rows:
+            if self._batch_worker_has_saved_source(state, worker_dir):
+                raise FinishingInputChanged(
+                    "empty worker has saved inventory or submitted requests")
+            if not (literal_empty and isinstance(approved_empty, dict)
+                    and str(approved_empty.get("reason") or "").strip()
+                    and approved_empty.get("user_authorized") is True
+                    and valid_approval_ts):
+                if literal_empty:
+                    worker["source_outcome"] = "no_documents_supplied"
+                    if not state.save():
+                        raise DurableStateError(
+                            "empty source outcome could not be persisted")
+                raise FinishingInputChanged(
+                    "empty worker lacks an approved no_documents_supplied outcome")
         if (not docs and not records and not saved_rows and literal_empty
                 and isinstance(approved_empty, dict)
                 and str(approved_empty.get("reason") or "").strip()
@@ -9550,18 +10197,22 @@ class Engine:
         self._check_stop()
         self._phase("deduplicating", "Exact-duplicate review")
         self.log("  [review] scanning for duplicate documents")
-        removed = dedup_worker(worker_dir, self.log)
+        renamed_records, removed = self._durable_dedup_worker(
+            worker_dir, renamed_records)
         self.stats["duplicates"] += removed
         if removed:
             self.log(f"  removed {removed} duplicate file(s)")
-            # rebuild the record list to reflect deletions/renames
-            renamed_records = self._rebuild_records(worker_dir, renamed_records)
         else:
             self.log("  no duplicates found")
 
         # 3) SECOND PASS - special reviews -------------------------
         self._phase("ranking", "Dating, signed checks and ranking")
         outcome = self._second_pass(worker_dir, renamed_records) or {}
+        # Ranking can rename survivors before it defers or the process stops.
+        # Refresh only their path metadata; immutable classification provenance
+        # and the byte-hash inventory remain separate and unchanged.
+        renamed_records = self._rebuild_records(worker_dir, renamed_records)
+        self._checkpoint_dedup_survivors(worker_dir, renamed_records)
         # The second pass may legitimately see fewer live members than the
         # saved family if a file disappeared after confirmation. Do not let a
         # resulting singleton/no-op cross into irreversible organisation.
@@ -9661,6 +10312,112 @@ class Engine:
         parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         return parsed.timestamp()
 
+    @staticmethod
+    def _primary_source_exception(meta: dict, custom_id: str, reason: str,
+                                   detail: str = "") -> dict:
+        """Build the durable, provider-free record for a skipped source.
+
+        The inventory remains authoritative; this record only explains why
+        its request was intentionally not built.  In particular it is not a
+        successful classification and can never authorize worker completion.
+        """
+        reason = str(reason or "").strip()
+        if reason not in PRIMARY_SOURCE_EXCEPTION_REASONS:
+            raise ValueError("unsupported primary source exception reason")
+        path = Path(str(meta.get("path") or ""))
+        size = None
+        try:
+            if path.is_file() and not path.is_symlink():
+                size = int(path.stat().st_size)
+        except OSError:
+            size = None
+        return {
+            "schema": PRIMARY_SOURCE_EXCEPTION_SCHEMA,
+            "custom_id": str(custom_id),
+            "path": str(path),
+            "worker": str(meta.get("worker") or ""),
+            "worker_dir": str(meta.get("worker_dir") or ""),
+            "fhash": str(meta.get("fhash") or ""),
+            "size_bytes": size,
+            "reason": reason,
+            "detail": str(detail or "")[:500],
+            "provider_request_built": False,
+            "worker_completion_allowed": False,
+            "recorded_ts": datetime.datetime.now().astimezone().isoformat(
+                timespec="seconds"),
+        }
+
+    def _record_primary_source_exception(self, state: "BatchState",
+                                         custom_id: str, meta: dict,
+                                         reason: str, detail: str = ""):
+        """Persist one exact source exception without altering inventory."""
+        inventory = state.data.get("primary_inventory") or {}
+        saved = inventory.get(custom_id)
+        if (not isinstance(saved, dict)
+                or any(str(saved.get(field) or "") != str(meta.get(field) or "")
+                       for field in ("path", "worker", "worker_dir", "fhash"))):
+            raise RuntimeError("primary source exception is not inventory-bound")
+        requests = state.data.get("requests") or {}
+        if custom_id in requests:
+            raise RuntimeError("cannot exclude a source with a saved request")
+        for batch in state.data.get("batches", []) or []:
+            if custom_id in (batch.get("request_ids") or []):
+                raise RuntimeError("cannot exclude a source in an accepted batch")
+        marker = state.data.get("primary_submission") or {}
+        if (marker.get("status") in ("submission_started", "ambiguous")
+                and custom_id in (marker.get("request_identities") or [])):
+            raise RuntimeError("cannot exclude a source in an ambiguous submission")
+        path = Path(str(meta.get("path") or ""))
+        if reason == "unreadable_source":
+            if (not path.is_file() or path.is_symlink()
+                    or file_hash(path) != meta.get("fhash")):
+                raise RuntimeError("unreadable source changed before exception was saved")
+        record = self._primary_source_exception(meta, custom_id, reason, detail)
+        exclusions = state.data.setdefault("primary_render_exclusions", {})
+        if not isinstance(exclusions, dict):
+            raise RuntimeError("primary source exception ledger is malformed")
+        prior = exclusions.get(custom_id)
+        if prior is not None and prior != record:
+            raise RuntimeError("primary source exception conflicts with saved evidence")
+        exclusions[custom_id] = record
+        if not state.save():
+            raise DurableStateError("primary source exception could not be persisted")
+
+    @staticmethod
+    def _primary_excluded_ids(state: "BatchState", inventory: dict = None) -> set:
+        """Validate and return durable exclusions for a saved inventory."""
+        inventory = inventory if inventory is not None else (
+            state.data.get("primary_inventory") or {})
+        exclusions = state.data.get("primary_render_exclusions") or {}
+        if not isinstance(inventory, dict) or not isinstance(exclusions, dict):
+            raise RuntimeError("primary source exception metadata is malformed")
+        result = set()
+        requests = state.data.get("requests") or {}
+        for cid, record in exclusions.items():
+            if cid not in inventory or not isinstance(record, dict):
+                raise RuntimeError("primary source exception is outside inventory")
+            if (record.get("schema") != PRIMARY_SOURCE_EXCEPTION_SCHEMA
+                    or record.get("custom_id") != cid
+                    or record.get("reason") not in PRIMARY_SOURCE_EXCEPTION_REASONS
+                    or record.get("provider_request_built") is not False
+                    or record.get("worker_completion_allowed") is not False):
+                raise RuntimeError("primary source exception is malformed")
+            meta = inventory[cid]
+            for field in ("path", "worker", "worker_dir", "fhash"):
+                if str(record.get(field) or "") != str(meta.get(field) or ""):
+                    raise RuntimeError("primary source exception fingerprint changed")
+            if cid in requests:
+                raise RuntimeError("excluded source has a submitted request")
+            result.add(cid)
+        for batch in state.data.get("batches", []) or []:
+            if set(batch.get("request_ids") or []).intersection(result):
+                raise RuntimeError("excluded source appears in an accepted batch")
+        marker = state.data.get("primary_submission") or {}
+        if (marker.get("status") in ("submission_started", "ambiguous")
+                and set(marker.get("request_identities") or []).intersection(result)):
+            raise RuntimeError("excluded source appears in an ambiguous submission")
+        return result
+
     def _primary_provider_evidence(self, state):
         """Read-only reconciliation. An incomplete/uncertain listing fails closed."""
         marker = state.data.get("primary_submission") or {}
@@ -9752,10 +10509,16 @@ class Engine:
         requests = state.data.get("requests") or {}
         inventory = {cid: dict(meta) for cid, meta in
                      (saved if saved is not None else requests).items()}
+        excluded = self._primary_excluded_ids(state, inventory)
+        exclusion_records = state.data.get("primary_render_exclusions") or {}
         root = self.dir.resolve()
         paths = {}
         for cid, meta in inventory.items():
             path = Path(meta["path"])
+            if (cid in excluded
+                    and (exclusion_records.get(cid) or {}).get("reason") == "source_missing"
+                    and not path.exists()):
+                continue
             if (not path.is_file() or path.is_symlink() or root not in path.resolve().parents
                     or is_cloud_only_placeholder(path) or file_hash(path) != meta.get("fhash")):
                 raise RuntimeError("A saved source document is missing, moved or changed; restore or review it before recovery")
@@ -9824,7 +10587,9 @@ class Engine:
     def _resume_primary_inventory(self, state, inventory, accepted):
         """Submit only proven-unsubmitted IDs; every POST has a durable marker."""
         vocab = state.data.get("primary_vocabulary") or self.kb.vocabulary_block()
-        remaining = [cid for cid in inventory if cid not in accepted]
+        excluded = self._primary_excluded_ids(state, inventory)
+        remaining = [cid for cid in inventory
+                     if cid not in accepted and cid not in excluded]
         chunk, chunk_ids = [], []
         envelope_bytes = len(json.dumps({"requests": []}).encode("utf-8"))
         chunk_bytes = envelope_bytes
@@ -9847,6 +10612,12 @@ class Engine:
             if BatchState(self.dir).data != expected_disk:
                 raise RuntimeError("Another process changed the batch state while preparing recovery; no request sent for this chunk")
             chunk_no += 1
+            # Bind this chunk's request metadata in the same durable write as
+            # its submission_started marker. Until this point these IDs are
+            # merely in-memory preparation and cannot be mistaken for paid or
+            # ambiguous requests after a crash.
+            state.data.setdefault("requests", {}).update({
+                cid: dict(inventory[cid]) for cid in chunk_ids})
             self.set_status(f"Uploading recovery chunk {chunk_no}: {len(chunk)} document(s), "
                             f"{wire_bytes / 1048576:.1f} MiB…")
             marker = {"status": "submission_started", "submission_started": True,
@@ -9890,9 +10661,29 @@ class Engine:
             self.set_status(f"Preparing remaining primary document {index}/{len(remaining)}")
             self._phase_progress("recovery", index - 1, len(remaining))
             self.set_progress(index - 1, len(remaining))
-            imgs, text, page_idxs, total_pages, segment_view = self._batch_classification_view(path)
+            if not path.is_file() or path.is_symlink():
+                self._record_primary_source_exception(
+                    state, cid, meta, "source_missing",
+                    "source disappeared during recovery")
+                excluded.add(cid)
+                expected_disk = json.loads(json.dumps(state.data))
+                continue
+            try:
+                imgs, text, page_idxs, total_pages, segment_view = \
+                    self._batch_classification_view(path)
+            except UnreadableDocumentError as exc:
+                self._record_primary_source_exception(
+                    state, cid, meta, "unreadable_source", str(exc))
+                excluded.add(cid)
+                expected_disk = json.loads(json.dumps(state.data))
+                continue
             if not imgs and not text:
-                raise RuntimeError("A remaining document cannot be rendered; review it before recovery")
+                self._record_primary_source_exception(
+                    state, cid, meta, "unreadable_source",
+                    "no renderable page images or extracted text")
+                excluded.add(cid)
+                expected_disk = json.loads(json.dumps(state.data))
+                continue
             system, blocks, mt = self.api.classify_payload(vocab, imgs, text,
                 page_idxs=page_idxs, total_pages=total_pages, segment=segment_view)
             req = self.api.build_batch_request(cid, system, blocks, mt)
@@ -9940,9 +10731,11 @@ class Engine:
             accepted = set(evidence["accepted_ids"])
             if not accepted.issubset(inventory):
                 raise RuntimeError("Accepted provider results contain IDs outside the source inventory")
-            remaining = len(set(inventory) - accepted)
+            excluded = self._primary_excluded_ids(state, inventory)
+            remaining = len(set(inventory) - accepted - excluded)
             vocab = state.data.get("primary_vocabulary") or self.kb.vocabulary_block()
-            estimate = estimate_pipeline_costs_gbp(len(inventory), self.api.model_id,
+            billable_count = max(0, len(inventory) - len(excluded))
+            estimate = estimate_pipeline_costs_gbp(billable_count, self.api.model_id,
                 state.data.get("followup_model_id") or self.api.model_id,
                 self.resolution, vocab, batch=True, include_audit=self.post_run_audit)
             if budget and estimate["gbp"] > budget:
@@ -9951,7 +10744,7 @@ class Engine:
                 raise RuntimeError("The uncertain upload is too recent; wait at least 15 minutes before checking recovery")
             report = {"status": "needs_authorization", "remaining": remaining,
                       "accepted": len(accepted), "legacy_tail": tail_count,
-                      "estimated_remaining_gbp": round(estimate["primary_gbp"] * remaining / max(1, len(inventory)), 4),
+                      "estimated_remaining_gbp": round(estimate["primary_gbp"] * remaining / max(1, billable_count), 4),
                       "message": f"Verified {len(accepted)} accepted request(s); {remaining} remain. "
                                  f"Reconstructed {tail_count} legacy tail document(s) without changing files. "
                                  "Recovery backs up the state and submits only the verified remaining IDs."}
@@ -9977,9 +10770,16 @@ class Engine:
             for batch in evidence["matched_batches"]:
                 state.data.setdefault("batches", []).append(batch)
             state.data["primary_inventory"] = inventory
+            state.data.setdefault("primary_render_exclusions", {})
             if getattr(self, "_review_run_id", ""):
                 state.data["auto_review_run_id"] = self._review_run_id
-            state.data["requests"] = {cid: dict(meta) for cid, meta in inventory.items()}
+            # Keep only already-submitted request metadata here. Unsubmitted
+            # inventory rows are added immediately before their own durable
+            # POST marker in _resume_primary_inventory.
+            prior_requests = state.data.get("requests") or {}
+            state.data["requests"] = {
+                cid: dict(meta) for cid, meta in prior_requests.items()
+                if cid in inventory and cid not in excluded}
             state.data["primary_vocabulary"] = vocab
             state.data["primary_submission_complete"] = False
             state.data["primary_submission"] = {"status": "reconciled"}
@@ -9988,7 +10788,24 @@ class Engine:
             if not state.save():
                 raise RuntimeError("Reconciled state could not be saved; no remaining requests submitted")
             self._resume_primary_inventory(state, inventory, accepted)
-            self.on_done(self.stats, f"batch_submitted:{len(inventory)}|{len(state.batch_ids())}|"
+            excluded_after = self._primary_excluded_ids(state, inventory)
+            if (not state.batch_ids() and excluded_after
+                    and not (set(inventory) - excluded_after)):
+                state.data["phase"] = "primary_exceptions_only"
+                state.data["primary_submission_complete"] = True
+                if not state.save():
+                    raise DurableStateError(
+                        "primary exception-only state could not be persisted")
+                summary = self.source_attention_summary(state)
+                self.on_done(self.stats, "batch_source_attention:" +
+                             json.dumps(summary, sort_keys=True))
+                report.update(status="source_attention",
+                              message="No provider requests were submitted; source exceptions remain.",
+                              remaining=0, snapshot=str(backup))
+                return report
+            submitted_ids = {cid for batch in state.data.get("batches", []) or []
+                             for cid in (batch.get("request_ids") or [])}
+            self.on_done(self.stats, f"batch_submitted:{len(submitted_ids)}|{len(state.batch_ids())}|"
                          f"{estimate['primary_gbp']:.2f}|{estimate['gbp']:.2f}")
             report.update(status="submitted", message="Primary submission recovered; use Check batch status to apply when ready.",
                           remaining=0, snapshot=str(backup))
@@ -10040,6 +10857,78 @@ class Engine:
             except Exception:
                 continue
         return None
+
+    @staticmethod
+    def _batch_worker_has_saved_source(state: "BatchState", worker_dir: Path) -> bool:
+        """Whether immutable primary inventory/request evidence names worker."""
+        worker_path = worker_dir.resolve()
+        worker_key = str(worker_path).casefold()
+        for collection_name in ("primary_inventory", "requests"):
+            collection = state.data.get(collection_name) or {}
+            if not isinstance(collection, dict):
+                raise FinishingInputChanged(
+                    f"{collection_name} metadata is malformed")
+            for meta in collection.values():
+                if not isinstance(meta, dict):
+                    raise FinishingInputChanged(
+                        f"{collection_name} metadata entry is malformed")
+                worker_text = str(meta.get("worker_dir") or "").strip()
+                path_text = str(meta.get("path") or "").strip()
+                name_text = str(meta.get("worker") or "").strip()
+                if worker_text and str(Path(worker_text).resolve()).casefold() == worker_key:
+                    return True
+                if path_text:
+                    try:
+                        if Path(path_text).resolve().is_relative_to(worker_path):
+                            return True
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        raise FinishingInputChanged(
+                            f"{collection_name} metadata path is malformed") from exc
+                if name_text.casefold() == worker_dir.name.casefold():
+                    return True
+        return False
+
+    @staticmethod
+    def source_attention_summary(state: "BatchState") -> dict:
+        """Return a safe aggregate for the UI's source-exception banner."""
+        workers = state.data.get("workers") or {}
+        exclusions = state.data.get("primary_render_exclusions") or {}
+        unreadable = []
+        unreadable_workers = set()
+        for record in exclusions.values() if isinstance(exclusions, dict) else ():
+            if not isinstance(record, dict):
+                continue
+            if record.get("reason") in ("unreadable_source", "source_missing",
+                                         "source_changed"):
+                worker = str(record.get("worker") or "")
+                unreadable_workers.add(worker.casefold())
+                unreadable.append({
+                    "worker": worker,
+                    "path": str(record.get("path") or ""),
+                    "reason": str(record.get("reason")),
+                })
+        empty, incomplete, completed = [], [], 0
+        if isinstance(workers, dict):
+            for worker in workers.values():
+                if not isinstance(worker, dict):
+                    continue
+                name = str(worker.get("name") or
+                           Path(str(worker.get("source_path") or "?")).name)
+                if worker.get("completed") is True:
+                    completed += 1
+                elif (worker.get("completion_outcome") == "no_documents_supplied"
+                      or worker.get("source_outcome") == "no_documents_supplied"):
+                    empty.append(name)
+                elif name.casefold() not in unreadable_workers:
+                    incomplete.append(name)
+        return {
+            "completed_workers": completed,
+            "empty_workers": sorted(set(empty), key=str.casefold),
+            "unreadable_documents": sorted(
+                unreadable, key=lambda item: (item["worker"].casefold(),
+                                              item["path"].casefold())),
+            "other_incomplete_workers": sorted(set(incomplete), key=str.casefold),
+        }
 
     def _batch_submitted_worker_scope(self, state: "BatchState"):
         """Resolve the immutable worker cohort selected at batch submission.
@@ -10279,6 +11168,22 @@ class Engine:
             if not eligible:
                 self.log("Nothing to submit - every document is cached, skipped "
                          "or missing.")
+                literal_empty = []
+                for worker in workers:
+                    try:
+                        if (worker.is_dir() and not worker.is_symlink()
+                                and not any(worker.iterdir())):
+                            literal_empty.append(worker.name)
+                    except OSError:
+                        pass
+                if literal_empty and len(literal_empty) == len(workers):
+                    self.on_done(self.stats, "batch_source_attention:" + json.dumps({
+                        "completed_workers": 0,
+                        "empty_workers": sorted(literal_empty, key=str.casefold),
+                        "unreadable_documents": [],
+                        "other_incomplete_workers": [],
+                    }, sort_keys=True))
+                    return
                 self.on_done(self.stats, "batch_nothing_to_submit")
                 return
 
@@ -10439,6 +11344,12 @@ class Engine:
                                      state="rendering", accepted=n_accepted,
                                      operation=f"render:{i}")
                 if not f.exists():
+                    cid = next((cid for cid, item in inventory.items()
+                                if item.get("path") == str(f)), None)
+                    if cid is not None:
+                        self._record_primary_source_exception(
+                            state, cid, inventory[cid], "source_missing",
+                            "source disappeared during preparation")
                     continue
                 imgs, text, page_idxs, total_pages, segment_view = \
                     self._batch_classification_view(f)
@@ -10448,6 +11359,11 @@ class Engine:
                              f"left unchanged")
                     self.failed_log.record(self.care_home, w.name, f,
                                            "skipped: unrenderable", "")
+                    cid = next(cid for cid, item in inventory.items()
+                               if item.get("path") == str(f))
+                    self._record_primary_source_exception(
+                        state, cid, inventory[cid], "unreadable_source",
+                        "no renderable page images or extracted text")
                     continue
                 system, blocks, mt = self.api.classify_payload(
                     vocab, imgs, text, page_idxs=page_idxs,
@@ -10477,14 +11393,11 @@ class Engine:
 
             # Eligibility was decided before this bounded rendering pass.  If
             # every source disappeared or proved unrenderable here, no provider
-            # request exists to wait for or apply.  Do not retain the initial
-            # inventory as an interrupted submission: that would force the
-            # recovery flow to treat a local file problem as a possible billed
-            # upload.  Save a non-pending terminal marker first, so a failed
-            # delete cannot revive the old incomplete state; then remove the
-            # empty batch state and leave the source files untouched for retry.
+            # request exists to wait for or apply. Keep the initial inventory
+            # and the provider-free exception ledger so a restart cannot
+            # rediscover or resubmit the same source.
             if not n_built:
-                state.data.pop("primary_submission_complete", None)
+                state.data["primary_submission_complete"] = True
                 state.data["primary_submission"] = {
                     "status": "nothing_renderable",
                     "eligible": len(eligible),
@@ -10496,15 +11409,17 @@ class Engine:
                              "No provider request was sent. ***")
                     self.on_done(self.stats, "batch_state_write_failed")
                     return
-                state.delete()
                 self._phase_progress("batch", 0, len(eligible),
                                      state="attention", accepted=0,
                                      operation="no-renderable")
                 self.log("\n=== NO BATCH REQUESTS SUBMITTED: every eligible "
                          "document was missing or could not be rendered; no "
                          "provider classification result was submitted or applied ===")
+                summary = self.source_attention_summary(state)
                 self.on_done(self.stats,
-                             f"batch_no_renderable:{len(eligible)}")
+                             "batch_source_attention:" + json.dumps(summary)
+                             if summary["unreadable_documents"]
+                             else f"batch_no_renderable:{len(eligible)}")
                 return
 
             state.data["phase"] = "primary_pending"
@@ -10580,16 +11495,161 @@ class Engine:
                 counts[key] += int(rc.get(key, 0) or 0)
         return counts
 
-    def _download_batch_results(self, api, batches: list) -> dict:
-        results = {}
+    @staticmethod
+    def _expected_batch_ids(state: "BatchState", batches: list,
+                            phase: str) -> dict:
+        """Resolve saved identities, leaving legacy ownership unknown.
+
+        Counts cannot safely partition old batches, so unknown entries are
+        resolved from downloaded rows only after the complete phase union is
+        proven.
+        """
+        collection = (state.data.get("followup") or {}).get("requests", {}) \
+            if phase == "followup" else state.data.get("requests", {})
+        all_ids = list(collection) if isinstance(collection, dict) else []
+        saved_batches = ((state.data.get("followup") or {}).get("batches", [])
+                         if phase == "followup" else state.data.get("batches", []))
+        saved_by_id = {item.get("id"): item for item in saved_batches
+                       if isinstance(item, dict) and item.get("id")}
+        mapping = {}
+        used = set()
         for batch in batches:
+            bid = batch.get("id")
+            saved = saved_by_id.get(bid) or {}
+            ids = batch.get("request_ids") or saved.get("request_ids")
+            if isinstance(bid, str) and isinstance(ids, list):
+                mapping[bid] = ids
+                used.update(ids)
+            elif isinstance(bid, str):
+                mapping[bid] = None
+        if set(mapping) != {batch.get("id") for batch in batches}:
+            raise APIError(0, "saved batch request identities are incomplete")
+        explicit = [ids for ids in mapping.values() if isinstance(ids, list)]
+        if any(len(set(ids)) != len(ids) or any(cid not in all_ids for cid in ids)
+               for ids in explicit):
+            raise APIError(0, "saved batch request identities are invalid")
+        flat = [cid for ids in explicit for cid in ids]
+        if len(set(flat)) != len(flat):
+            raise APIError(0, "saved batch request identities overlap")
+        return mapping
+
+    def _download_batch_results(self, api, batches: list,
+                                expected_ids_by_batch: dict | None = None,
+                                phase_expected_ids: list | None = None) -> dict:
+        """Load complete results, resolving legacy IDs from returned rows.
+
+        Legacy batches are never partitioned by counts. Unknown batches are
+        cached only after every downloaded batch is disjoint and the complete
+        phase identity union is proven.
+        """
+        results = {}
+        downloaded = []
+        total = len(batches)
+        validated = 0
+        stop_check = (getattr(self, "_check_stop", None)
+                      if getattr(self, "_stop", None) is not None else None)
+        self._phase("downloading_results", "Downloading completed batch results")
+        self._phase_progress("downloading_results", 0, total,
+                             state="running", operation="existing_results_download")
+        for batch in batches:
+            if callable(stop_check):
+                stop_check()
+            batch_id = batch.get("id")
             url = batch.get("results_url")
-            if not url:
-                continue
-            for line in api.batch_results(url):
-                cid = line.get("custom_id")
-                if cid:
-                    results[cid] = line.get("result", {}) or {}
+            if not isinstance(batch_id, str) or not batch_id or not url:
+                self._phase_progress("downloading_results", validated, total,
+                                     state="failed", operation="existing_results_download")
+                raise APIError(0, "batch results metadata is incomplete")
+            expected = batch.get("request_ids")
+            if expected is None and expected_ids_by_batch is not None:
+                expected = expected_ids_by_batch.get(batch_id)
+            if expected is not None and not isinstance(expected, list):
+                expected = None
+            cached = (batch_result_cache.load(self.dir, batch_id, expected, url)
+                      if isinstance(expected, list) else
+                      batch_result_cache.load_candidate(self.dir, batch_id, url))
+            if cached is not None:
+                rows = cached
+                progress_state = "cache_hit"
+            else:
+                self._phase_progress("downloading_results", validated, total,
+                                     state="downloading", operation="existing_results_download")
+                try:
+                    def _retry(attempt, delay, reason):
+                        self._phase_progress(
+                            "downloading_results", validated, total,
+                            state="retrying", operation="existing_results_download",
+                            retry=attempt, retry_delay_seconds=delay,
+                            retry_reason=str(reason))
+
+                    try:
+                        rows = list(api.batch_results(
+                            url, on_retry=_retry, stop_check=stop_check))
+                    except TypeError as exc:
+                        # Preserve compatibility with test/durable adapters
+                        # implementing the original one-argument interface.
+                        if "unexpected keyword argument" not in str(exc):
+                            raise
+                        rows = list(api.batch_results(url))
+                    if expected is not None:
+                        batch_result_cache.store(self.dir, batch_id, expected, url, rows)
+                except batch_result_cache.ResultCacheError as exc:
+                    self._phase_progress("downloading_results", validated, total,
+                                         state="failed", operation="existing_results_download")
+                    raise APIError(0, "batch results were incomplete or invalid",
+                                   str(exc)) from None
+                except Exception:
+                    self._phase_progress("downloading_results", validated, total,
+                                         state="failed", operation="existing_results_download")
+                    raise
+                progress_state = "complete"
+            try:
+                if isinstance(expected, list):
+                    rows = batch_result_cache.validate_rows(rows, expected)
+                else:
+                    if not isinstance(rows, list):
+                        raise batch_result_cache.ResultCacheError("legacy result rows are not a list")
+                    seen = set()
+                    for row in rows:
+                        if not isinstance(row, dict) or not isinstance(row.get("custom_id"), str):
+                            raise batch_result_cache.ResultCacheError("legacy result identity is missing")
+                        if not isinstance(row.get("result"), dict):
+                            raise batch_result_cache.ResultCacheError("legacy result envelope is missing")
+                        if row["custom_id"] in seen:
+                            raise batch_result_cache.ResultCacheError("legacy result IDs are duplicated")
+                        seen.add(row["custom_id"])
+                    if batch.get("n") is not None and int(batch["n"]) != len(rows):
+                        raise batch_result_cache.ResultCacheError("legacy result count does not match batch n")
+                    if phase_expected_ids is None:
+                        raise batch_result_cache.ResultCacheError("legacy phase identity union is missing")
+                    if not seen.issubset(set(phase_expected_ids)):
+                        raise batch_result_cache.ResultCacheError("legacy result contains foreign custom ID")
+                    downloaded.append((batch_id, url, rows))
+            except batch_result_cache.ResultCacheError as exc:
+                self._phase_progress("downloading_results", validated, total,
+                                     state="failed", operation="existing_results_download")
+                raise APIError(0, "batch results were incomplete or invalid",
+                               str(exc)) from None
+            for line in rows:
+                cid = line["custom_id"]
+                if cid in results:
+                    self._phase_progress("downloading_results", validated, total,
+                                         state="failed", operation="existing_results_download")
+                    raise APIError(0, "batch results contain overlapping custom IDs")
+                results[cid] = line.get("result", {}) or {}
+            validated += 1
+            self._phase_progress("downloading_results", validated, total,
+                                 state=progress_state, operation="existing_results_download",
+                                 documents=len(results))
+        if phase_expected_ids is not None:
+            if set(results) != set(phase_expected_ids):
+                raise APIError(0, "batch results do not cover the complete phase identity union")
+            for batch_id, url, rows in downloaded:
+                batch_result_cache.store(self.dir, batch_id,
+                                         [row["custom_id"] for row in rows], url, rows)
+        self._phase_progress("downloading_results", validated, total,
+                             state="complete", operation="existing_results_download",
+                             documents=len(results))
         return results
 
     @staticmethod
@@ -11250,6 +12310,14 @@ class Engine:
                          "inventory before applying results or moving workers. ***")
                 self.on_done(self.stats, "batch_primary_incomplete")
                 return
+            if (not state.batch_ids()
+                    and state.data.get("primary_render_exclusions")):
+                state.data["phase"] = "processing_incomplete"
+                state.save()
+                summary = self.source_attention_summary(state)
+                self.on_done(self.stats, "batch_source_attention:" +
+                             json.dumps(summary, sort_keys=True))
+                return
             followup_submission = followup.get("submission") or {}
             if (followup.get("phase") in ("submission_started", "ambiguous")
                     or followup_submission.get("status") in
@@ -11381,7 +12449,10 @@ class Engine:
             self.set_status("Downloading batch results…")
             primary_batches = (batches if active_phase == "primary"
                                else self.poll_batches(state, "primary"))
-            results = self._download_batch_results(self.api, primary_batches)
+            results = self._download_batch_results(
+                self.api, primary_batches,
+                self._expected_batch_ids(state, primary_batches, "primary"),
+                list((state.data.get("requests") or {}).keys()))
             self.log(f"Downloaded {len(results)} primary result(s).")
             self.set_status("Checking primary batch answers for required follow-up…")
 
@@ -11428,7 +12499,9 @@ class Engine:
                                  "batch_pending:" + json.dumps(counts))
                     return
                 followup_results = self._download_batch_results(
-                    followup_api, followup_batches)
+                    followup_api, followup_batches,
+                    self._expected_batch_ids(state, followup_batches, "followup"),
+                    list((followup.get("requests") or {}).keys()))
                 self.log(f"Downloaded {len(followup_results)} follow-up "
                          "result(s).")
 
@@ -11706,6 +12779,8 @@ class Engine:
                     # partial record list must never permit the remaining files
                     # to be ranked, organised or moved as if the worker were
                     # complete.
+                    records = self._resume_prepared_dedup_transition(
+                        w, records, state)
                     self._validate_batch_worker_records(w, records, state)
 
                     # ---- shared tail: dedupe -> LIVE second pass -> organise --
@@ -11854,6 +12929,12 @@ class Engine:
             if incomplete_workers:
                 state.data["phase"] = "processing_incomplete"
                 state.save()
+                source_summary = self.source_attention_summary(state)
+                if (source_summary["empty_workers"]
+                        or source_summary["unreadable_documents"]):
+                    self.on_done(self.stats, "batch_source_attention:"
+                                 + json.dumps(source_summary, sort_keys=True))
+                    return
                 attention = self.assess_unresolved_finishing(state)
                 if attention["workers"]:
                     names = ", ".join(
@@ -14960,7 +16041,7 @@ class App(tk.Tk):
         self._poll_ai_review()
         for status in self.notification_service.drain_statuses():
             CONSOLE.add(str(status), "info")
-        if (self.dashboard.progress.phase in ("audit", "preparing", "scanning", "batch", "followup_plan", "followup_upload")
+        if (self.dashboard.progress.phase in ("audit", "preparing", "scanning", "batch", "followup_plan", "followup_upload", "downloading_results")
                 and self.dashboard.is_busy()):
             progress = self.dashboard.progress
             self._notify("long_wait", phase=progress.phase, wait_seconds=progress.wait_seconds(),
@@ -14997,7 +16078,16 @@ class App(tk.Tk):
 
     def _notify_done(self, stats, status):
         kind, _, payload = str(status or "").partition(":")
-        if kind in ("batch_submitted", "batch_followup_submitted"):
+        if kind == "batch_source_attention":
+            try:
+                info = json.loads(payload)
+                self._notify("source_attention", workers=info.get("completed_workers", 0),
+                    empty=len(info.get("empty_workers") or []),
+                    unreadable=len(info.get("unreadable_documents") or []),
+                    other=len(info.get("other_incomplete_workers") or []))
+            except (ValueError, TypeError, AttributeError):
+                self._notify("blocked", reason="general")
+        elif kind in ("batch_submitted", "batch_followup_submitted"):
             values = payload.split("|")
             try:
                 documents = int(values[0])
@@ -15213,6 +16303,16 @@ class App(tk.Tk):
                                           else "normal"))
         self.batch_btn.configure(state=("normal" if pending and not busy
                                         else "disabled"))
+        deferred = sum(1 for worker in (pending or {}).get("workers", {}).values()
+                       if worker.get("finishing_status") == "deferred"
+                       and not worker.get("completed"))
+        source_only = ((pending or {}).get("phase") in (
+            "primary_exceptions_only", "primary_nothing_renderable")
+            and not (pending or {}).get("requests")
+            and not (pending or {}).get("batches"))
+        self.batch_btn.configure(text=("View source issues" if source_only
+                                       else "Recover final checks" if deferred
+                                       else "Check batch status"))
         # Stop controls processing/audit only.  The external review session is
         # deliberately not cancelled by this control; use its viewer or cancel
         # the queue before it launches.
@@ -15521,6 +16621,14 @@ class App(tk.Tk):
             self._refresh_folder_state()
             self._refresh_run_controls(pending={})
             return
+        pend = has_pending_batch(self.care_home_dir)
+        if (pend.get("phase") in ("primary_exceptions_only", "primary_nothing_renderable")
+                and not pend.get("requests") and not pend.get("batches")):
+            # Local-only presentation: do not require an API key, create an
+            # Engine or poll a provider when there was no submitted request.
+            summary = Engine.source_attention_summary(BatchState(self.care_home_dir))
+            self._done_batch({}, "batch_source_attention:" + json.dumps(summary))
+            return
         api_key = get_api_key()
         if not api_key:
             messagebox.showwarning("API key needed",
@@ -15529,11 +16637,20 @@ class App(tk.Tk):
             return
         model_id = MODELS[self.cfg["model"]]["id"]
         # the batch was submitted with a specific model; honour it
-        pend = has_pending_batch(self.care_home_dir)
         model_id = pend.get("model_id") or model_id
         if self._primary_recovery_needed(pend):
             self.engine = self._make_engine(api_key, model_id)
             self._check_primary_recovery()
+            return
+        if retry_token is None and any(
+                worker.get("finishing_status") == "deferred"
+                and not worker.get("completed")
+                for worker in (pend.get("workers") or {}).values()):
+            # Show the saved, exact paid retry scope BEFORE downloading all
+            # results. Assessment reads local evidence only; its token is
+            # revalidated under the native writer lock before any paid call.
+            self.engine = self._make_engine(api_key, model_id)
+            self._check_finishing_recovery()
             return
         self.start_btn.configure(state="disabled")
         self.pick_btn.configure(state="disabled")
@@ -15550,6 +16667,39 @@ class App(tk.Tk):
             daemon=True)
         self.worker_thread.start()
         self._poll_stats()
+
+    def _check_finishing_recovery(self):
+        self._recovery_busy = True
+        self._refresh_run_controls(busy=True)
+        self.stop_btn.configure(state="disabled")
+        self.set_status("Inspecting saved final checks — no API requests are being sent…")
+        engine = self.engine
+
+        def check():
+            try:
+                result = engine.assess_unresolved_finishing(BatchState(engine.dir))
+            except Exception as exc:
+                result = {"error": str(exc)}
+            self.after(0, self._finishing_recovery_checked, result)
+
+        self.worker_thread = threading.Thread(target=check, daemon=True)
+        self.worker_thread.start()
+
+    def _finishing_recovery_checked(self, result):
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.after(25, self._finishing_recovery_checked, result)
+            return
+        self._recovery_busy = False
+        pending, _ = self._refresh_folder_state()
+        self._refresh_run_controls(pending=pending)
+        if result.get("error"):
+            self.set_status("Final-check recovery could not be assessed. Saved work retained.")
+            messagebox.showwarning("Recovery assessment failed", result["error"], parent=self)
+            return
+        if not result.get("workers"):
+            self.set_status("No deferred final checks remain. Check batch status again to continue.")
+            return
+        self._done_batch({}, "batch_apply_attention:" + Engine._attention_payload(result))
 
     def _check_primary_recovery(self):
         """Read-only reconciliation first; submission needs the shown plan."""
@@ -16328,6 +17478,15 @@ class App(tk.Tk):
                 "The saved state and any accepted batch IDs are retained. "
                 "Use Check batch status to verify them before continuing. "
                 "Do not start a new run or remove the state file.")
+        elif kind == "batch_source_attention":
+            from stage2_recovery_ui import source_attention_message
+            try:
+                info = json.loads(payload) if payload else {}
+                message = source_attention_message(info)
+            except (ValueError, TypeError, AttributeError):
+                message = "Source documents need attention. Open Details & full log; completed work is retained."
+            self.set_status("Source documents need attention — completed workers and saved results retained.")
+            messagebox.showwarning("Source documents need attention", message)
         elif kind == "batch_apply_attention":
             try:
                 info = json.loads(payload) if payload else {}
@@ -16340,7 +17499,7 @@ class App(tk.Tk):
                 f"    {worker.get('name', '?')}: "
                 + ", ".join(worker.get("families") or [])
                 for worker in workers) or "    (see the log)"
-            self.set_status("Ranking needs attention - unresolved finishing "
+            self.set_status("Final checks need recovery - unresolved finishing "
                             "checks; those workers were not completed or moved.")
             message = (
                 f"{len(workers)} worker folder(s) have document families whose "
@@ -16349,8 +17508,9 @@ class App(tk.Tk):
                 "the source folder and are listed in the failed-files CSV as "
                 "'ranking deferred'. No worker was marked complete, moved or "
                 "audited on their behalf, and no receipt or automatic review "
-                "was produced.\n\nCheck batch status replays saved answers "
-                "only; it never re-sends a failed request by itself.")
+                "was produced.\n\nRecover final checks inspects saved evidence "
+                "first. It never re-sends a failed request by itself; a paid retry "
+                "requires the confirmation below.")
             if info.get("stale"):
                 message = ("The confirmed retry no longer matched the saved "
                            "state, so nothing was retried.\n\n" + message)
@@ -16359,7 +17519,12 @@ class App(tk.Tk):
                             "been accepted by the provider without a saved "
                             "answer; they are never retried automatically.")
             token = str(info.get("token") or "")
-            if n_ops and token:
+            n_changed = int(info.get("changed", 0) or 0)
+            if n_changed:
+                message += (f"\n\n{n_changed} check(s) no longer match their "
+                            "saved documents/settings. Restore or reconcile "
+                            "those inputs before retrying; no stale retry is allowed.")
+            if n_ops and token and not n_changed and not n_blocked:
                 try:
                     extra = float(info.get("estimated_extra_gbp", 0) or 0)
                 except Exception:
@@ -16369,15 +17534,15 @@ class App(tk.Tk):
                             f"(estimated ~£{extra:.2f} in total). Earlier "
                             "attempts, their errors and their cost are kept "
                             "in the saved state and a snapshot.")
-                if messagebox.askyesno("Ranking needs attention", message,
+                if messagebox.askyesno("Recover failed final checks?", message,
                                        icon="warning"):
                     self.after(300, lambda: self._batch_check_status(
                         retry_token=token))
                     return
-                self.set_status("Unresolved ranking checks retained. Use Check "
-                                "batch status to see them again.")
+                self.set_status("Unresolved final checks retained. Use Recover "
+                                "final checks to see them again.")
             else:
-                messagebox.showwarning("Ranking needs attention", message)
+                messagebox.showwarning("Final checks need attention", message)
         elif kind == "batch_followup_ambiguous":
             self.set_status("Follow-up resubmission blocked.")
             messagebox.showwarning(

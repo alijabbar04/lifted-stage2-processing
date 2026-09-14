@@ -551,6 +551,7 @@ class CompactDashboard:
                       "scanning":"Scanning documents · local orientation preflight",
                       "followup_plan":"Planning stronger-model follow-up",
                       "followup_upload":"Preparing stronger-model follow-up",
+                      "downloading_results":"Retrieving saved batch results",
                       "recovery":"Recovering primary submission", "processing":"Document processing"}
             if self.progress.phase == "batch" and self.progress.state in ("submitting", "submitted"):
                 titles["batch"] = "Submitting batch requests"
@@ -594,6 +595,19 @@ class CompactDashboard:
         state = self.progress
         self.progress_label.configure(text=state.caption())
         if state.phase != "audit":
+            if state.phase == "downloading_results":
+                self.state_label.configure(text={"retrying": f"Connection interrupted · retry {state.retry}",
+                    "cache_hit": "Reusing verified results", "complete": "Results verified",
+                    "failed": "Download needs attention", "stopped": "Stopped"}.get(state.state, "Downloading results"))
+                self.wait_label.configure(text=(
+                    "Saved downloads are retained. Check batch status to resume; no resubmission is needed."
+                    if state.state in ("failed", "stopped") else
+                    f"Retry delay: {state.retry_delay_seconds:g} sec. Reading existing answers; no new submission."
+                    if state.state == "retrying" else
+                    "Read-only result retrieval. Worker finalisation comes next; no new classification requests are sent here."))
+                self.eta_label.configure(text=(f"{concise_duration(state.wait_seconds())} since last progress"
+                                              if state.wait_seconds() else ""))
+                return
             if state.phase in ("preparing", "scanning", "batch", "followup_plan", "followup_upload"):
                 labels = {"running":"Preparing", "scanning":"Scanning", "orienting":"Local orientation check",
                           "rendering":"Rendering", "submitting":"Sending to provider",
@@ -687,7 +701,7 @@ class CompactDashboard:
                 else:
                     self.add_activity(msg)
                     return
-            if self.structured_progress and self.progress.phase in ("preparing", "scanning", "batch", "followup_plan", "followup_upload"):
+            if self.structured_progress and self.progress.phase in ("preparing", "scanning", "batch", "followup_plan", "followup_upload", "downloading_results"):
                 # Structured phase facts outrank broad keyword guesses. The
                 # detailed message is still retained in the activity log.
                 self.refresh_progress()
@@ -723,7 +737,7 @@ class CompactDashboard:
         else:
             kind = str(status or "").partition(":")[0]
             if (self.structured_progress and self.progress.phase in
-                    ("preparing", "scanning", "batch", "followup_plan", "followup_upload")):
+                    ("preparing", "scanning", "batch", "followup_plan", "followup_upload", "downloading_results")):
                 # _done_main() finishes first, then a queued set_status() can
                 # arrive.  Seal the structured state so that callback cannot
                 # redraw the final UI as the previous active operation.
@@ -797,7 +811,7 @@ class CompactDashboard:
         self._sync_banner()
         self._refresh_review_summary()
         self._sync_dashboard_visibility()
-        if self.progress.phase == "audit" or (self.is_busy() and self.progress.phase in ("preparing", "scanning", "batch", "followup_plan", "followup_upload")):
+        if self.progress.phase == "audit" or (self.is_busy() and self.progress.phase in ("preparing", "scanning", "batch", "followup_plan", "followup_upload", "downloading_results")):
             self.refresh_progress()
         busy = self.is_busy()
         self.review_btn.configure(state="disabled" if busy else "normal")

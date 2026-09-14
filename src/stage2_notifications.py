@@ -34,6 +34,7 @@ PHASES = {
     "scanning": "Local document scanning and orientation checks",
     "followup_plan": "Stronger-model follow-up planning",
     "followup_upload": "Stronger-model follow-up preparation and submission",
+    "downloading_results": "Retrieving saved answers (read only; no resubmission)",
     "organising": "Organising processed files", "audit": "Post-run accuracy audit",
     "audit_review": "AI audit review", "improvement_review": "AI change review",
     "tests": "Tests", "build": "Desktop build", "batch": "Overnight batch",
@@ -49,12 +50,12 @@ REASONS = {
     "connection": "The service could not be reached after bounded retries.",
     "general": "Open Stage 2 for the details and next action.",
 }
-IMPORTANT = {"blocked", "error", "run_complete", "stopped", "audit_complete", "review_complete"}
+IMPORTANT = {"blocked", "error", "run_complete", "stopped", "audit_complete", "review_complete", "source_attention"}
 EVENTS = {
     "test", "run_started", "phase_started", "phase_complete", "progress",
     "worker_complete", "batch_submitted", "batch_waiting", "followup_submitted",
     "long_wait", "audit_started", "audit_complete", "audit_skipped",
-    "review_started", "review_complete", "blocked", "error", "stopped", "run_complete",
+    "review_started", "review_complete", "blocked", "error", "stopped", "run_complete", "source_attention",
 }
 
 
@@ -239,6 +240,11 @@ def format_event(event: str, **data) -> str:
         "error": f"{phase} did not finish. {reason} Review the application log before retrying.",
         "stopped": f"{phase} stopped. This is not a completed run. Check Stage 2 before restarting; an interrupted audit may need to be checked again.",
         "run_complete": f"Run finished: {workers:,} worker folder(s) processed. Open Reports for the run outcome.",
+        "source_attention": (f"Processing checkpoint saved: {workers:,} worker folder(s) complete. "
+            f"Source attention: {_integer(data.get('empty'))} empty folder(s), "
+            f"{_integer(data.get('unreadable'))} unreadable/missing document(s), "
+            f"{_integer(data.get('other'))} other incomplete worker(s). "
+            "Open Stage 2 for the exact source actions. These exceptions are not completed workers; no full-batch resubmission is needed."),
     }
     message = "Stage 2 | " + templates[event]
     if event == "run_complete":

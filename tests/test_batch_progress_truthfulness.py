@@ -177,6 +177,25 @@ def fixture(tmp_path, *, convert=None, orientation=None, submit=None, save_accep
     engine.BATCH_SUBMIT_MAX_BYTES = 100000
     engine.BATCH_SUBMIT_MAX_REQUESTS = 2
     engine._state_probe = state_box
+    def record_source_exception(state, cid, meta, reason, detail=""):
+        state.data.setdefault("primary_render_exclusions", {})[cid] = {
+            "schema": "stage2-primary-source-exception/v1",
+            "custom_id": cid, "path": meta["path"],
+            "worker": meta["worker"], "worker_dir": meta["worker_dir"],
+            "fhash": meta["fhash"], "size_bytes": None,
+            "reason": reason, "detail": detail,
+            "provider_request_built": False,
+            "worker_completion_allowed": False,
+        }
+        assert state.save()
+    engine._record_primary_source_exception = record_source_exception
+    engine.source_attention_summary = lambda state: {
+        "completed_workers": 0,
+        "empty_workers": [],
+        "unreadable_documents": list(
+            (state.data.get("primary_render_exclusions") or {}).values()),
+        "other_incomplete_workers": [],
+    }
     return engine, events, statuses, sent
 
 
@@ -352,13 +371,14 @@ def test_all_unrenderable_documents_need_attention_without_pending_or_submission
     engine, events, statuses, sent = fixture(tmp_path)
     engine._batch_classification_view = lambda path: ([], "", [0], 1, False)
     engine.run_batch_submit()
-    assert statuses == ["batch_no_renderable:5"]
+    assert statuses[-1].startswith("batch_source_attention:")
     assert sent == []
-    assert engine._state_probe["deletes"] == 1
-    assert not engine._state_probe["persisted"]
+    assert engine._state_probe["deletes"] == 0
+    assert engine._state_probe["persisted"]
     assert engine._state_probe["stored"]["phase"] == "primary_nothing_renderable"
     assert engine._state_probe["stored"]["primary_submission"]["status"] == "nothing_renderable"
-    assert "primary_submission_complete" not in engine._state_probe["stored"]
+    assert engine._state_probe["stored"]["primary_submission_complete"] is True
+    assert len(engine._state_probe["stored"]["primary_render_exclusions"]) == 5
     assert events[-1].get("state") == "attention"
     assert events[-1].get("accepted") == 0
     assert not any(event.get("state") == "submitted" for event in events)
@@ -379,14 +399,14 @@ def test_all_missing_documents_need_attention_and_can_retry(tmp_path):
 
     engine._phase_progress = remove_sources_before_render
     engine.run_batch_submit()
-    assert statuses == ["batch_no_renderable:5"]
-    assert sent == [] and engine._state_probe["deletes"] == 1
+    assert statuses[-1].startswith("batch_source_attention:")
+    assert sent == [] and engine._state_probe["deletes"] == 0
     for worker in tmp_path.glob("Synthetic-*"):
         (worker / "synthetic.pdf").write_bytes(b"restored synthetic only")
     engine._phase_progress = original_progress
     engine.run_batch_submit()
-    assert statuses[-1].startswith("batch_submitted:5|3|")
-    assert [len(chunk) for chunk in sent] == [2, 2, 1]
+    assert statuses[-1] == "batch_already_pending"
+    assert sent == []
 
 
 def test_retained_nothing_renderable_marker_is_nonpending_and_retryable(tmp_path):
@@ -394,15 +414,15 @@ def test_retained_nothing_renderable_marker_is_nonpending_and_retryable(tmp_path
     engine._batch_classification_view = lambda path: ([], "", [0], 1, False)
     engine.run_batch_submit()
     retained = engine._state_probe["stored"]
-    assert statuses == ["batch_no_renderable:5"]
-    assert engine._state_probe["persisted"] and engine._state_probe["deletes"] == 1
+    assert statuses[-1].startswith("batch_source_attention:")
+    assert engine._state_probe["persisted"] and engine._state_probe["deletes"] == 0
     assert retained["primary_submission"]["status"] == "nothing_renderable"
-    assert not actual_batch_state_exists(retained)
+    assert actual_batch_state_exists(retained)
     assert not actual_primary_recovery_needed(retained)
     engine._batch_classification_view = lambda path: ([], "synthetic text", [0], 1, False)
     engine.run_batch_submit()
-    assert statuses[-1].startswith("batch_submitted:5|3|")
-    assert [len(chunk) for chunk in sent] == [2, 2, 1]
+    assert statuses[-1] == "batch_already_pending"
+    assert sent == []
 
 
 def test_terminal_marker_save_failure_never_emits_success_or_provider_wait(tmp_path):

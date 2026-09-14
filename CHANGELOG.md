@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.5.6 - 2026-09-14 - Durable batch recovery
+
+- Journal exact deduplication transitions before deletion; preserve original
+  classification provenance and checkpoint survivors before resumable finishing.
+  Missing distinct content and unsupported legacy changes remain blocked.
+- Add complete, identity-bound batch-result caching and bounded read-only download
+  retries. Reject partial, duplicated or corrupted cached answers.
+- Distinguish result retrieval from new submission in dashboard progress.
+- Inspect failed final checks locally before retrieving results; show a costed
+  explicit retry confirmation and block changed/uncertain attempts.
+- Retain hash-bound unreadable-source exceptions across primary recovery; present
+  empty inputs and damaged documents as distinct incomplete outcomes.
+- Ship nested numeric WinHTTP diagnostics with separate send/status/response phases,
+  retaining single-send paid submissions and provider reconciliation requirements.
+- Include Windows installer/Python detection and LibreOffice discovery improvements,
+  refreshed guides, desktop executable and credential-free public installer.
+- No model, resolution, naming policy or accuracy benchmark change. This release
+  does not claim to eliminate external network faults or repair damaged originals.
+
 ## v1.5.5 - 2026-09-10 - Saved sessions and evidence review fixes
 
 - Publish durable, atomic, read-only-observable progress outside worker folders.

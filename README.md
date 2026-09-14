@@ -1,6 +1,25 @@
 # Stage 2 — Processing
 
-## v1.5.5 Obsidian / Jade saved sessions — build 2026.09.10-session1
+## v1.5.6 - Reliable batch recovery - build 2026.09.14-recovery1
+
+- Journal exact duplicate removal before changing files, and checkpoint surviving
+  documents before final checks. Interrupted finalisation can resume without
+  confusing authorised deduplication with missing unique content.
+- Read-only result downloads have bounded retries and validated per-batch caching.
+  The progress display distinguishes retrieving existing answers from submitting
+  documents and from completing worker folders.
+- **Recover final checks** assesses saved failures before downloading results;
+  eligible paid retries still require an explicit, costed confirmation.
+- Unreadable source exceptions survive submission recovery. Empty folders are
+  reported as **No documents supplied**, not silently counted as processed.
+- Windows upload diagnostics distinguish send, status and response failures,
+  retaining numeric nested causes. Unknown paid outcomes still require provider
+  reconciliation; no blind resubmission or transport fallback was added.
+
+Models, page evidence and naming/ranking policy are unchanged. Reliability tests
+are not an accuracy benchmark. Keep original documents and read the updated Guide.
+
+### Retained features from v1.5.5
 
 This release carries completed SHA-bound low-quality Employee Handbook
 finishing evidence so the audit can mark an **UnableToDetermine** result when
@@ -184,42 +203,82 @@ mirror is generated into [`vocabulary/`](vocabulary/).
 
 ---
 
-## Install the app (start here)
+## Install on Windows
 
-This gives you the app with Desktop and Start Menu shortcuts, plus the user
-guide wired up to the in-app **Guide** button. No admin rights and no Python
-needed.
+**You need:** a Windows 10 or 11 PC. That is the whole list — no GitHub
+account, no sign-in, no Git, no Python, and no administrator rights.
 
-**You need:** a Windows 10/11 PC. The normal public setup does not require a
-GitHub account, repository invitation, GitHub CLI or Python.
+**1.** Press the **Windows key**, type `powershell`, press **Enter**.
 
-1. Open the public [Releases page](https://github.com/alijabbar04/lifted-stage2-processing/releases)
-   and select the intended release.
-2. Download **Stage2_Processing_Setup.exe** and **SHA256SUMS.txt** from that same
-   release. Compare the setup file's SHA-256 with its exact manifest entry:
+**2.** Copy the command below, paste it into the window that opened
+(right-click pastes), and press **Enter**.
 
-   ```powershell
-   Get-FileHash -Algorithm SHA256 .\Stage2_Processing_Setup.exe
-   Get-Content .\SHA256SUMS.txt
-   ```
+<!-- install-command -->
+```powershell
+&{$ProgressPreference='SilentlyContinue';[Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor 3072;$d=Join-Path $env:TEMP ('Stage2-'+[guid]::NewGuid().ToString('N'));$null=New-Item -ItemType Directory -Force $d -EA 0;$f=Join-Path $d 'install.ps1';try{Invoke-WebRequest -Uri 'https://github.com/alijabbar04/lifted-stage2-processing/releases/latest/download/install.ps1' -OutFile $f -UseBasicParsing -TimeoutSec 120}catch{Write-Host ('Could not download the Stage 2 installer: '+$_.Exception.Message) -Fore Red;return};if(!(Test-Path -LiteralPath $f)){Write-Host 'Could not download the Stage 2 installer - check your internet connection and try again.' -Fore Red;return};powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f}
+```
 
-3. If the hashes match, run the setup wizard. It installs the app, Desktop and
-   Start Menu shortcuts, and the guide. Do not run a mismatched download.
+**3.** Windows may ask for permission to install LibreOffice — choose **Yes**.
 
-| Installed | Where |
+**4.** Wait for **Installation complete**, then close the window.
+
+That is the whole install. **No setting on your PC is changed** — in
+particular you never have to run `Set-ExecutionPolicy`.
+
+The installer narrates itself, so you can see where it is:
+
+```
+[1/6] Checking your system...
+[2/6] Finding the latest version of Stage 2...
+[3/6] Downloading Stage 2 (about 83 MB)...
+[4/6] Installing the app...
+[5/6] Creating shortcuts...
+[6/6] LibreOffice (converts Word/Excel/PowerPoint files)...
+      Installation complete
+```
+
+If it stops early it prints **PROBLEM:** followed by exactly what to do next.
+
+### What the installer does
+
+| What | Detail |
 |---|---|
-| App + Desktop/Start Menu shortcuts | `%LOCALAPPDATA%\Programs\Stage 2 - Processing\` |
-| User guide (in-app **Guide** button) | `%LOCALAPPDATA%\Lifted\Guides\` |
+| Downloads the newest published version | Never a draft or a pre-release |
+| Checks every file against the published SHA-256 | A mismatched file is deleted and nothing is installed |
+| Installs the app | `%LOCALAPPDATA%\Programs\Stage 2 - Processing\` |
+| Installs the user guide | `%LOCALAPPDATA%\Lifted\Guides\` — the in-app **Guide** button |
+| Creates Desktop and Start Menu shortcuts | Overwritten, never duplicated |
+| **Installs LibreOffice if it is missing** | So Word/Excel/PowerPoint files convert properly |
+| Writes a log | `%LOCALAPPDATA%\Lifted\Logs\Stage2-install.log` |
 
-The public setup also installs guide copies in the app's `Guides` directory and
-`Documents\Lifted\Guides`. It contains no preconfigured API key or bot tokens
-and does not silently install LibreOffice.
+LibreOffice matters: without it, `.docx` / `.xlsx` / `.pptx` files are read as
+plain text only and classify noticeably worse. The installer now adds it for
+you instead of asking you to go and find it. If that one step fails, Stage 2
+still installs and tells you plainly what is degraded and the single command
+to fix it later.
 
-For a portable option, download **Stage2_Processing.exe** and verify its own
-manifest entry. It includes the guide and AI workflow rules, but does not create
-shortcuts. The older optional `install.ps1` bootstrap uses the GitHub CLI and
-currently asks for GitHub sign-in; that is a script requirement, not a condition
-of downloading the public setup. Developer checkout instructions are below.
+### Updating, or installing again
+
+Paste the same command again. It always installs the newest published version
+over the old one. Your saved API key, your settings and your work are left
+alone, and you never end up with two copies or two shortcuts.
+
+### Other ways to install
+
+- **Double-click instead of pasting.** Download
+  [`install.cmd`](https://github.com/alijabbar04/lifted-stage2-processing/releases/latest/download/install.cmd)
+  from the latest release and double-click it. It does exactly the same thing —
+  it just starts PowerShell for you, for that one installer process only.
+- **Install by hand.** Download `Stage2_Processing_Setup.exe` and
+  `SHA256SUMS.txt` from the
+  [Releases page](https://github.com/alijabbar04/lifted-stage2-processing/releases),
+  check the hash yourself with `Get-FileHash -Algorithm SHA256 .\Stage2_Processing_Setup.exe`,
+  and run the wizard if it matches. This route does **not** install LibreOffice
+  for you.
+- **Portable.** `Stage2_Processing.exe` runs on its own with no shortcuts.
+  Verify its manifest entry before running it.
+
+Trouble? See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#installation).
 
 ### First run
 
@@ -385,7 +444,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.5 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.6 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

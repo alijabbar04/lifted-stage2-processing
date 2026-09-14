@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -36,8 +37,16 @@ def test_release_versions_and_guide_locations_are_consistent():
     smoke = (ROOT / "tools" / "smoke_test_frozen_app.ps1").read_text(encoding="utf-8")
     assert f'$ExpectedVersion = "{version}"' in smoke
     assert f'$ExpectedBuild = "{constants["APP_BUILD"]}"' in smoke
+    # install.ps1 deliberately does NOT pin a version any more: it resolves the
+    # latest published release at run time so the README and this repo never go
+    # stale when a new version ships. So assert the ABSENCE of a pin - the
+    # opposite of what this test used to require - plus the mechanism that
+    # replaced it. GitHub's releases/latest endpoint is the part that
+    # guarantees drafts and pre-releases are never selected.
     bootstrap = (ROOT / "install.ps1").read_text(encoding="utf-8")
-    assert f'"v{version}"' in bootstrap
+    assert "releases/latest" in bootstrap
+    assert not re.search(r"^\s*\$Tag\s*=\s*['\"]v?\d", bootstrap, re.M), \
+        "install.ps1 must not hard-code a release tag"
     installer = (ROOT / "build" / "installer" / "Stage2_Public_Installer.iss").read_text(encoding="utf-8")
     assert 'DestDir: "{app}\\Guides"' in installer
 
@@ -46,9 +55,12 @@ def test_release_checksum_uses_public_download_filename():
     manifest = (ROOT / "build" / "generate_release_checksums.ps1").read_text(encoding="utf-8")
     bootstrap = (ROOT / "install.ps1").read_text(encoding="utf-8")
     assert '"Stage2_Processing.exe" = Join-Path $RepoRoot "dist\\Stage 2 - Processing.exe"' in manifest
-    assert '$AppAsset  = "Stage2_Processing.exe"' in bootstrap
+    # Asset names must match the names GitHub actually serves on the release.
+    # Quoting style is not the contract, so match on the assignment itself.
+    assert re.search(r"\$AppAsset\s*=\s*['\"]Stage2_Processing\.exe['\"]", bootstrap)
+    assert re.search(r"\$GuideAsset\s*=\s*['\"]Stage2_Guide_AI_Processing\.pdf['\"]", bootstrap)
+    assert re.search(r"\$SumsAsset\s*=\s*['\"]SHA256SUMS\.txt['\"]", bootstrap)
     # The common verifier validates both public assets by their download names.
     assert '[regex]::Escape($AssetName)' in bootstrap
-    assert '-AssetPath $DownloadedApp -AssetName $AppAsset' in bootstrap
-    assert '-AssetPath $DownloadedGuide -AssetName $GuideAsset' in bootstrap
-    assert '$GuideAsset = "Stage2_Guide_AI_Processing.pdf"' in bootstrap
+    assert '-FilePath $downloadedApp -AssetName $AppAsset' in bootstrap
+    assert '-FilePath $downloadedPdf -AssetName $GuideAsset' in bootstrap

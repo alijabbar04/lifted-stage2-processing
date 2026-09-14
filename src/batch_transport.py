@@ -14,6 +14,43 @@ class BatchTransportError(RuntimeError):
         self.send_started = bool(send_started)
 
 
+def _hex_hresult(value):
+    """Format a COM HRESULT without exposing the exception text/body."""
+    if isinstance(value, int):
+        return f"0x{value & 0xffffffff:08X}"
+    return ""
+
+
+def _com_numeric_diagnostics(exc):
+    """Extract numeric HRESULT/EXCEPINFO diagnostics from pywin32 errors.
+
+    ``pywintypes.com_error`` commonly stores the nested EXCEPINFO tuple in
+    ``args[2]``.  Keep only numeric fields: COM descriptions can accidentally
+    contain URLs, proxy details, headers, or request content.
+    """
+    values = []
+    primary = getattr(exc, "hresult", None)
+    if isinstance(primary, int):
+        values.append(("HRESULT", primary))
+    args = getattr(exc, "args", ())
+    if len(args) > 0 and isinstance(args[0], int):
+        values.append(("HRESULT", args[0]))
+    excepinfo = args[2] if len(args) > 2 else getattr(exc, "excepinfo", None)
+    if isinstance(excepinfo, (tuple, list)):
+        for index in (0, 4, 5):
+            if index < len(excepinfo) and isinstance(excepinfo[index], int):
+                values.append(("EXCEPINFO_HRESULT" if index == 5
+                               else f"EXCEPINFO_{index}", excepinfo[index]))
+    seen = set()
+    parts = []
+    for label, value in values:
+        key = (label, value)
+        if key not in seen:
+            seen.add(key)
+            parts.append(f"{label} {_hex_hresult(value)}")
+    return ", ".join(parts)
+
+
 def _load_com():
     try:
         import pythoncom
@@ -75,16 +112,20 @@ def winhttp_post_batch(url, headers, payload):
         for name, value in headers.items():
             request.SetRequestHeader(str(name), str(value))
         body = client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_UI1, payload)
-        phase = "upload/response"
+        phase = "send"
         send_started = True
         request.Send(body)
-        return int(request.Status), str(request.ResponseText)
+        phase = "status"
+        status = int(request.Status)
+        phase = "response"
+        response = str(request.ResponseText)
+        return status, response
     except Exception as exc:
         # COM exception descriptions can contain request or proxy details.
-        # Surface only the failure phase and numeric HRESULT, never headers,
-        # response bodies, document contents, or the original exception string.
-        hresult = getattr(exc, "hresult", None)
-        code = f" (HRESULT 0x{hresult & 0xffffffff:08X})" if isinstance(hresult, int) else ""
+        # Surface only the failure phase and numeric HRESULT/EXCEPINFO fields,
+        # never headers, response bodies, document contents, or raw text.
+        code = _com_numeric_diagnostics(exc)
+        code = f" ({code})" if code else ""
         outcome = ("The submission outcome must be reconciled before retrying."
                    if send_started else "No request was sent.")
         raise BatchTransportError(

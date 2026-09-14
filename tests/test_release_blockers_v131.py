@@ -184,13 +184,32 @@ class TestFinishingPersistence(unittest.TestCase):
 class TestReleaseChecksumContract(unittest.TestCase):
 
     def test_public_installer_verifies_download_before_copy(self):
+        """Nothing downloaded may be installed before its checksum is checked.
+
+        The invariant is what matters here, not the spelling: the hash has to
+        be computed before the app binary is copied into place, and the path
+        between them must abort rather than fall through.
+        """
         repo = Path(__file__).parents[1]
         script = (repo / "install.ps1").read_text(encoding="utf-8")
         verify_at = script.index("Get-FileHash -Algorithm SHA256")
-        copy_at = script.index("Copy-Item -LiteralPath $DownloadedApp")
+        copy_at = script.index("Copy-Item -LiteralPath $downloadedApp")
         self.assertLess(verify_at, copy_at)
-        self.assertIn('"SHA256SUMS.txt"', script)
-        self.assertIn("exit 1", script[verify_at:copy_at])
+        self.assertIn("SHA256SUMS.txt", script)
+        # The failure path must stop the install outright...
+        between = script[verify_at:copy_at]
+        self.assertIn("Stop-WithProblem", between)
+        # ...and must not leave an unverified binary on disk to be run later.
+        self.assertIn("Remove-Item -LiteralPath $downloadedApp", between)
+
+    def test_public_installer_needs_no_github_cli_or_git(self):
+        """Stage 2's repository is public, so the installer must not demand an
+        account, a sign-in or the GitHub CLI just to fetch a public asset."""
+        repo = Path(__file__).parents[1]
+        script = (repo / "install.ps1").read_text(encoding="utf-8")
+        for forbidden in ("gh auth", "gh release", "git clone", "Set-ExecutionPolicy"):
+            self.assertNotIn(forbidden, script,
+                             f"install.ps1 should not need {forbidden!r}")
 
     def test_manifest_generator_has_public_final_inputs_and_no_self_hash(self):
         repo = Path(__file__).parents[1]

@@ -115,6 +115,34 @@ class TestRealAppUISmoke(unittest.TestCase):
         self.assertFalse(self.callback_errors, self.callback_errors)
         self.external.assert_not_called()
 
+    def test_recovery_labels_and_retry_progress_fit(self):
+        self.app.geometry("1000x640+0+0")
+        self.app.deiconify()
+        cases = [
+            ({}, "Check batch status"),
+            ({"workers": {"synthetic": {"finishing_status": "deferred"}}},
+             "Recover final checks"),
+            ({"phase": "primary_exceptions_only", "requests": {}, "batches": []},
+             "View source issues"),
+        ]
+        for pending, label in cases:
+            self.app._refresh_run_controls(pending=pending)
+            self.pump()
+            button = self.app.batch_btn
+            self.assertEqual(button.cget("text"), label)
+            self.assertGreaterEqual(button.winfo_width(), button.winfo_reqwidth())
+            self.assertLessEqual(button.winfo_x() + button.winfo_width(),
+                                 button.master.winfo_width())
+        self.app.dashboard.progress.observe({"phase": "downloading_results",
+            "state": "retrying", "retry": 2, "retry_delay_seconds": 3,
+            "completed": 3, "total": 12})
+        self.app.dashboard.refresh_progress()
+        self.pump()
+        self.assertIn("retry 2", self.app.dashboard.state_label.cget("text"))
+        self.assertIn("3 sec", self.app.dashboard.wait_label.cget("text"))
+        self.assertFalse(self.callback_errors, self.callback_errors)
+        self.external.assert_not_called()
+
     def test_guide_ribbon_constructs_and_renders_actual_bundled_viewer(self):
         pdf = self.module.bundled_resource("docs", "USER_GUIDE.pdf")
         if not pdf.is_file():

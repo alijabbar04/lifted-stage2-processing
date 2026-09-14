@@ -18,6 +18,8 @@ class PhaseProgress:
     documents: int = 0
     accepted: int = 0
     prepared: int = 0
+    retry: int = 0
+    retry_delay_seconds: float = 0.0
     started: float = 0.0
     step_started: float = 0.0
     finished: float = 0.0
@@ -35,11 +37,13 @@ class PhaseProgress:
             self.path, self.worker, self.report = "", "", ""
             self.operation, self.documents, self.accepted = "", 0, 0
             self.prepared = 0
+            self.retry, self.retry_delay_seconds = 0, 0.0
         # Measure inactivity of the current operation, not total phase duration.
         # Repeated UI polls with identical facts must not reset this clock.
         advanced = int(event.get("completed", self.completed) or 0) > self.completed
         if (state != self.state or event.get("path", self.path) != self.path
-                or event.get("operation", self.operation) != self.operation or advanced):
+                or event.get("operation", self.operation) != self.operation
+                or event.get("retry", self.retry) != self.retry or advanced):
             self.step_started = now
         self.state = state
         self.total = max(0, int(event.get("total", self.total) or 0))
@@ -50,6 +54,12 @@ class PhaseProgress:
         self.documents = max(self.documents, int(event.get("documents", self.documents) or 0))
         self.accepted = max(self.accepted, int(event.get("accepted", self.accepted) or 0))
         self.prepared = max(self.prepared, int(event.get("prepared", self.prepared) or 0))
+        if state == "retrying":
+            self.retry = max(0, int(event.get("retry", self.retry) or 0))
+            self.retry_delay_seconds = max(0.0, float(
+                event.get("retry_delay_seconds", self.retry_delay_seconds) or 0))
+        else:
+            self.retry, self.retry_delay_seconds = 0, 0.0
         for key in ("path", "worker", "report", "operation"):
             if key in event:
                 setattr(self, key, str(event[key] or ""))
@@ -63,7 +73,8 @@ class PhaseProgress:
 
     def wait_seconds(self):
         if self.state not in ("checking", "adjudicating", "running", "writing_report",
-                              "scanning", "orienting", "rendering", "submitting"):
+                              "scanning", "orienting", "rendering", "submitting",
+                              "downloading", "retrying"):
             return 0
         return max(0, int(self.clock() - self.step_started))
 
@@ -80,6 +91,9 @@ class PhaseProgress:
         return max(0, int(elapsed / self.completed * (self.total - self.completed)))
 
     def caption(self):
+        if self.phase == "downloading_results":
+            return (f"{self.completed:,} of {self.total:,} result batches verified"
+                    " · downloading saved answers, not submitting documents")
         if self.phase == "audit":
             count = f"{self.completed:,} of {self.total:,} documents checked"
             if self.errors:
