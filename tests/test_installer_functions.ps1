@@ -67,7 +67,9 @@ $installPs1 = Join-Path $RepoRoot 'install.ps1'
 $setupPs1   = Join-Path $RepoRoot 'setup.ps1'
 
 Import-FunctionsFrom -ScriptPath $installPs1 -Names @(
-    'Assert-Checksum', 'Find-LibreOffice', 'Find-Winget', 'Test-LooksLikeNetworkFailure')
+    'Assert-Checksum', 'Find-LibreOffice', 'Find-Winget', 'Test-LooksLikeNetworkFailure',
+    'Test-Stage2Source', 'Install-Stage2Source', 'Set-WorkflowPaths', 'Find-RealPython',
+    'Invoke-Download')
 Import-FunctionsFrom -ScriptPath $setupPs1 -Names @(
     'Test-PythonCandidate', 'Get-PythonCandidatePaths')
 
@@ -217,6 +219,134 @@ try {
         Push-Location $env:SystemRoot
         try { $after = Find-LibreOffice } finally { Pop-Location }
         $before -eq $after
+    }
+
+    # =========================================================================
+    Write-Host ""
+    Write-Host "Per-user data folders" -ForegroundColor Cyan
+
+    $installSource = Get-Content -LiteralPath $installPs1 -Raw
+
+    # The folder names are a contract with the application: Stage 2 reads and
+    # writes these exact paths (stage2_run_state.py, stage2_diagnostics.py,
+    # stage2_ai_workflows.default_workspace_root). Inventing a folder here
+    # would create an empty directory the app never looks at.
+    foreach ($expected in 'Lifted\Guides', 'Lifted\Logs', 'Lifted\Stage2\runs',
+                          'Lifted\Stage2\ai-workflows', 'Lifted\Stage2Diagnostics') {
+        Test-Case "the installer provisions $expected" {
+            $installSource -match ([regex]::Escape("'" + $expected + "'"))
+        }
+    }
+
+    # The ledger workbook must NOT be pre-created. ai_review.sync_records
+    # creates it - with the Review Log, Run Log and Instructions sheets it
+    # needs - the first time a review is recorded. An empty .xlsx planted by
+    # the installer adds nothing and can sit locked by Excel.
+    Test-Case "the installer does NOT create the review ledger workbook" {
+        $installSource -notmatch 'New-Item[^\r\n]*Master_Filename_Review_Ledger'
+    }
+    # C:\Lifted is a machine-wide legacy location that may need admin rights.
+    # A new PC must use the per-user path instead.
+    Test-Case "the installer never creates anything under C:\Lifted" {
+        $installSource -notmatch 'New-Item[^\r\n]*C:\\Lifted'
+    }
+
+    # -CheckOnly writes nothing, so it has to keep working while the app is
+    # open - that is precisely when someone is diagnosing a problem.
+    Test-Case "-CheckOnly is not blocked by the app being open" {
+        $installSource -match '\$appRunning -and -not \$CheckOnly'
+    }
+
+    # =========================================================================
+    Write-Host ""
+    Write-Host "Post-run AI review setup (-WithAuditReview)" -ForegroundColor Cyan
+
+    # These run against a sandbox: the script-scope paths the functions read
+    # are redefined here, so nothing touches the real config or install.
+    $global:Repo         = 'alijabbar04/lifted-stage2-processing'
+    $global:WorkDir      = Join-Path $sandbox 'work'
+    $global:SourceRoot   = Join-Path $sandbox 'source'
+    $global:WorkspaceDir = Join-Path $sandbox 'ai-workflows'
+    $global:ConfigPath   = Join-Path $sandbox 'config.json'
+    New-Item -ItemType Directory -Path $global:WorkDir -Force | Out-Null
+
+    Test-Case "a folder without the review sources is rejected" {
+        -not (Test-Stage2Source $sandbox)
+    }
+    Test-Case "the repo checkout itself is accepted" {
+        Test-Stage2Source $RepoRoot
+    }
+    # prepare_workflow() needs these two files and, for the audit-review role,
+    # explicitly does NOT need a .git directory.
+    Test-Case "acceptance needs exactly ai_review.py and Stage2_Processing.pyw" {
+        $partial = Join-Path $sandbox 'partial'
+        New-Item -ItemType Directory -Path (Join-Path $partial 'src') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $partial 'src\ai_review.py') -Value '#'
+        $before = Test-Stage2Source $partial          # one file only -> no
+        Set-Content -LiteralPath (Join-Path $partial 'src\Stage2_Processing.pyw') -Value '#'
+        $after = Test-Stage2Source $partial           # both files -> yes, no .git
+        (-not $before) -and $after
+    }
+
+    Test-Case "the Microsoft Store python stub is not offered as a runtime" {
+        $stub = Join-Path $sandbox 'stub\python.exe'
+        New-Item -ItemType File -Path $stub -Force | Out-Null   # zero bytes
+        $found = Find-RealPython
+        # Either a real interpreter, or nothing - never the zero-byte stub.
+        ($null -eq $found) -or ((Get-Item -LiteralPath $found).Length -gt 0)
+    }
+
+    # --- config.json merging -------------------------------------------------
+    # config.json also holds the user's model, care-home and account choices.
+    # Losing those would be a far worse outcome than not filling in a path.
+    $existing = @{
+        api_model = 'test-model'
+        fx_rate   = 1.23
+        ai_workflows = @{ care_home = 'Test Home'; 'audit-review_model' = 'sol' }
+    } | ConvertTo-Json -Depth 8
+    Set-Content -LiteralPath $global:ConfigPath -Value $existing -Encoding UTF8
+
+    Test-Case "writing the paths keeps every other setting" {
+        $null = Set-WorkflowPaths -Source 'C:\some\source'
+        $after = Get-Content -LiteralPath $global:ConfigPath -Raw | ConvertFrom-Json
+        ($after.api_model -eq 'test-model') -and ($after.fx_rate -eq 1.23) -and
+        ($after.ai_workflows.care_home -eq 'Test Home') -and
+        ($after.ai_workflows.'audit-review_model' -eq 'sol')
+    }
+    Test-Case "the paths are actually written" {
+        $after = Get-Content -LiteralPath $global:ConfigPath -Raw | ConvertFrom-Json
+        ($after.ai_workflows.source_root -eq 'C:\some\source') -and
+        ($after.ai_workflows.workspace_root -eq $global:WorkspaceDir)
+    }
+    Test-Case "an existing source_root is never overwritten" {
+        # Someone pointing Stage 2 at their own checkout keeps it.
+        $null = Set-WorkflowPaths -Source 'C:\a\different\source'
+        $after = Get-Content -LiteralPath $global:ConfigPath -Raw | ConvertFrom-Json
+        $after.ai_workflows.source_root -eq 'C:\some\source'
+    }
+    Test-Case "no config file yet is handled" {
+        Remove-Item -LiteralPath $global:ConfigPath -Force
+        $ok = Set-WorkflowPaths -Source 'C:\fresh\source'
+        $after = Get-Content -LiteralPath $global:ConfigPath -Raw | ConvertFrom-Json
+        $ok -and ($after.ai_workflows.source_root -eq 'C:\fresh\source')
+    }
+
+    # --- the real download ---------------------------------------------------
+    # Network-dependent, so it is skipped rather than failed when offline.
+    $latestTag = $null
+    try {
+        $latestTag = (Invoke-RestMethod -Uri "https://api.github.com/repos/$global:Repo/releases/latest" `
+                        -UseBasicParsing -TimeoutSec 30 `
+                        -Headers @{ 'User-Agent' = 'Lifted-Stage2-Tests' }).tag_name
+    } catch { }
+    if ($latestTag) {
+        Test-Case "the release source really downloads and contains the review code" {
+            $placed = Install-Stage2Source -ReleaseTag $latestTag
+            $placed -and (Test-Stage2Source $placed)
+        }
+        Write-Host ("        source tag " + $latestTag) -ForegroundColor DarkGray
+    } else {
+        Write-Host "  SKIP  no network for the source download test" -ForegroundColor Yellow
     }
 
     # =========================================================================

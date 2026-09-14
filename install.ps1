@@ -28,6 +28,33 @@
     with a text-only fallback, which classifies noticeably worse. Advanced use
     only - the default is to install it.
 
+.PARAMETER WithAuditReview
+    Also set this machine up to run the post-run AI document review
+    (Reports -> AI Document Review). Off by default, because a colleague who
+    only processes documents never needs it and it adds a Python install and a
+    source download.
+
+    It provisions the three things prepare_workflow() actually requires and
+    that a fresh PC does not have:
+
+      1. a Stage 2 source folder containing src\ai_review.py and
+         src\Stage2_Processing.pyw - downloaded for the SAME release being
+         installed, so the review code matches the app. No Git is involved:
+         the audit-review role only needs those files, not a .git directory
+         (that is required for Improve Stage 2 / code learning, which this
+         switch deliberately does not enable).
+      2. a real Python, because resolve_python_runtime() will not use the
+         frozen exe's own interpreter.
+      3. the paths written into Stage 2's settings, so there is nothing left
+         to pick in Settings -> AI workflows.
+
+    The workspace folder and the Master review ledger are NOT provisioned:
+    Stage 2 defaults and creates both on demand, and the audit-review role
+    never requires the ledger to exist beforehand.
+
+    You still have to sign in to the Codex or Claude CLI yourself - that is an
+    account action this installer must not attempt.
+
 .PARAMETER CheckOnly
     Report what this PC has and which version would be installed, then stop
     without downloading or changing anything.
@@ -52,6 +79,7 @@
 param(
     [string] $Tag,
     [switch] $SkipLibreOffice,
+    [switch] $WithAuditReview,
     [switch] $CheckOnly,
     [switch] $KeepDownload
 )
@@ -103,7 +131,30 @@ $AppExe      = Join-Path $AppDir ($AppName + '.exe')
 $GuideDir    = Join-Path $env:LOCALAPPDATA 'Lifted\Guides'
 $LogDir      = Join-Path $env:LOCALAPPDATA 'Lifted\Logs'
 $LogPath     = Join-Path $LogDir 'Stage2-install.log'
-$TotalSteps  = 6
+$TotalSteps  = if ($WithAuditReview) { 7 } else { 6 }
+
+# The per-user folders Stage 2 works in. The app creates each of these on
+# demand, so this is not load-bearing - but creating them up front means a
+# brand-new machine has the whole layout from minute one, the folders are
+# there to be browsed before the first run, and anything that cannot be
+# created (a redirected or locked profile) is reported now rather than
+# halfway through someone's first batch.
+#
+# Deliberately NOT created here:
+#   - the Master AI review ledger workbook. ai_review.sync_records creates
+#     both its folder and the workbook, with the exact sheets it needs, the
+#     first time a review is recorded. An empty .xlsx planted here would add
+#     nothing and could go stale or sit locked by Excel.
+#   - anything under C:\Lifted. That is a machine-wide legacy location that
+#     Stage 2 only uses if it already exists; a per-user path is correct on a
+#     new PC and needs no admin rights.
+$DataDirs = [ordered]@{
+    'Lifted\Guides'                = 'user guides (the in-app Guide button)'
+    'Lifted\Logs'                  = 'install and run logs'
+    'Lifted\Stage2\runs'           = 'run snapshots and activity logs'
+    'Lifted\Stage2\ai-workflows'   = 'AI review workspace (maintainer feature)'
+    'Lifted\Stage2Diagnostics'     = 'crash and window diagnostics'
+}
 
 # A unique working folder per run: two installers running at once must not
 # share a directory, and the name is what the cleanup check keys on.
@@ -342,6 +393,175 @@ function Test-AppRunning {
 }
 
 # =============================================================================
+#  Optional: post-run AI document review prerequisites
+# =============================================================================
+# Only reached with -WithAuditReview. See the .PARAMETER notes above for why
+# each of these is genuinely required and why the ledger is not.
+
+# Stage 2 keeps its settings here. The API key is deliberately NOT in this file
+# (the app resolves it from the Windows Credential Manager), so writing to it
+# never risks a secret.
+$ConfigPath   = Join-Path $env:APPDATA 'DocReviewAIStation\config.json'
+$SourceRoot   = Join-Path $env:LOCALAPPDATA 'Lifted\Stage2\source'
+$WorkspaceDir = Join-Path $env:LOCALAPPDATA 'Lifted\Stage2\ai-workflows'
+
+function Test-Stage2Source {
+    param([string] $Root)
+    if (-not $Root) { return $false }
+    foreach ($needed in 'src\ai_review.py', 'src\Stage2_Processing.pyw') {
+        if (-not (Test-Path -LiteralPath (Join-Path $Root $needed) -PathType Leaf)) { return $false }
+    }
+    return $true
+}
+
+# Download the source for the exact release being installed, so the review code
+# and the installed app are the same version. Public repo, so this is a plain
+# anonymous HTTPS request - no Git, no GitHub account.
+function Install-Stage2Source {
+    param([Parameter(Mandatory)][string] $ReleaseTag)
+
+    $zip     = Join-Path $WorkDir 'stage2-source.zip'
+    $extract = Join-Path $WorkDir 'stage2-source'
+    $url     = "https://github.com/$Repo/archive/refs/tags/$ReleaseTag.zip"
+
+    if (-not (Invoke-Download -Url $url -Destination $zip)) {
+        Write-Log -Text ("source download failed: " + $script:DownloadError) -Level 'WARN'
+        return $null
+    }
+    try {
+        Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+    } catch {
+        Write-Log -Text ("source extract failed: " + $_.Exception.Message) -Level 'WARN'
+        return $null
+    }
+
+    # GitHub wraps the tree in a single "<repo>-<version>" folder. Find it
+    # rather than guessing the name, which varies with how the tag is written.
+    $inner = @(Get-ChildItem -LiteralPath $extract -Directory -ErrorAction SilentlyContinue |
+               Where-Object { Test-Stage2Source $_.FullName }) | Select-Object -First 1
+    if (-not $inner) {
+        Write-Log -Text 'downloaded source does not contain src\ai_review.py' -Level 'WARN'
+        return $null
+    }
+
+    # Replace the previous copy wholesale: a half-updated source tree would be
+    # worse than none. The staging copy is already complete and verified to
+    # contain the files that matter, so the swap is the last step.
+    try {
+        if (Test-Path -LiteralPath $SourceRoot) {
+            Remove-Item -LiteralPath $SourceRoot -Recurse -Force
+        }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $SourceRoot) -Force | Out-Null
+        Move-Item -LiteralPath $inner.FullName -Destination $SourceRoot -Force
+    } catch {
+        Write-Log -Text ("could not place the source: " + $_.Exception.Message) -Level 'WARN'
+        return $null
+    }
+    if (-not (Test-Stage2Source $SourceRoot)) { return $null }
+    return $SourceRoot
+}
+
+# resolve_python_runtime() skips the frozen exe's own interpreter, so the
+# review needs a real Python on the machine. It looks in
+# %LOCALAPPDATA%\Programs\Python\Python*\python.exe and on PATH.
+function Find-RealPython {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $base = Join-Path $env:LOCALAPPDATA 'Programs\Python'
+    if (Test-Path -LiteralPath $base) {
+        foreach ($dir in @(Get-ChildItem -LiteralPath $base -Directory -Filter 'Python3*' -ErrorAction SilentlyContinue |
+                           Sort-Object Name -Descending)) {
+            $candidates.Add((Join-Path $dir.FullName 'python.exe'))
+        }
+    }
+    foreach ($cmd in @(Get-Command python.exe -All -ErrorAction SilentlyContinue)) {
+        if ($cmd.Source) { $candidates.Add($cmd.Source) }
+    }
+    foreach ($candidate in $candidates) {
+        # A zero-length python.exe is the Microsoft Store stub, not an
+        # interpreter - the same trap setup.ps1 guards against.
+        if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and
+            ((Get-Item -LiteralPath $candidate).Length -gt 0)) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+# Merge the three paths into config.json without disturbing anything else in
+# it. Read, modify, write - never replace the file wholesale, because it also
+# holds the user's model, care-home and account choices.
+function Set-WorkflowPaths {
+    param([Parameter(Mandatory)][string] $Source)
+    $config = @{}
+    if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
+        try {
+            $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
+            if ($raw.Trim()) {
+                $parsed = $raw | ConvertFrom-Json
+                foreach ($property in $parsed.PSObject.Properties) { $config[$property.Name] = $property.Value }
+            }
+        } catch {
+            # An unreadable config is the user's, not ours to overwrite.
+            Write-Log -Text ("config.json could not be read: " + $_.Exception.Message) -Level 'WARN'
+            return $false
+        }
+    }
+
+    $workflows = @{}
+    if ($config.ContainsKey('ai_workflows') -and $config['ai_workflows']) {
+        foreach ($property in $config['ai_workflows'].PSObject.Properties) {
+            $workflows[$property.Name] = $property.Value
+        }
+    }
+
+    # Only fill in what is not already set: someone who has deliberately
+    # pointed Stage 2 at their own checkout keeps it.
+    $changed = $false
+    foreach ($pair in @(@{ K = 'source_root';    V = $Source },
+                        @{ K = 'workspace_root'; V = $WorkspaceDir })) {
+        $current = [string]$workflows[$pair.K]
+        if (-not $current.Trim()) { $workflows[$pair.K] = $pair.V; $changed = $true }
+    }
+    if (-not $changed) { return $true }
+
+    $config['ai_workflows'] = $workflows
+    try {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $ConfigPath) -Force | Out-Null
+        $json = ($config | ConvertTo-Json -Depth 12)
+        $utf8 = New-Object Text.UTF8Encoding($false)
+        # Write beside the target and move into place, so an interrupted write
+        # cannot leave Stage 2 with a truncated config.
+        $temp = $ConfigPath + '.tmp'
+        [IO.File]::WriteAllText($temp, $json, $utf8)
+        Move-Item -LiteralPath $temp -Destination $ConfigPath -Force
+        Write-Log -Text "registered source_root and workspace_root in config.json"
+        return $true
+    } catch {
+        Write-Log -Text ("could not write config.json: " + $_.Exception.Message) -Level 'WARN'
+        return $false
+    }
+}
+
+# Create Stage 2's per-user data folders. Idempotent: an existing folder is
+# left exactly as it is, with whatever is already in it.
+function New-DataFolders {
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in $DataDirs.GetEnumerator()) {
+        $path = Join-Path $env:LOCALAPPDATA $entry.Key
+        try {
+            if (-not (Test-Path -LiteralPath $path)) {
+                New-Item -ItemType Directory -Path $path -Force | Out-Null
+                Write-Log -Text ("created " + $path + "  (" + $entry.Value + ")")
+            }
+        } catch {
+            $failures.Add($entry.Key)
+            Write-Log -Text ("could not create " + $path + ": " + $_.Exception.Message) -Level 'WARN'
+        }
+    }
+    return $failures
+}
+
+# =============================================================================
 Write-Log -Text '==================================================================='
 Write-Log -Text ("Stage 2 installer starting. Windows " + [Environment]::OSVersion.Version +
                  ", PowerShell " + $PSVersionTable.PSVersion + " (" + $PSVersionTable.PSEdition + ")" +
@@ -373,13 +593,21 @@ if ($isAdmin) {
 }
 
 # A running copy holds its own exe open, so the file could not be replaced.
-if (Test-AppRunning) {
+# -CheckOnly writes nothing, so it must stay usable while the app is open -
+# that is exactly when someone is likely to be diagnosing a problem.
+$appRunning = Test-AppRunning
+if ($appRunning -and -not $CheckOnly) {
     Stop-WithProblem -Code 2 `
         -Problem "'$AppName' is open at the moment, so its files cannot be replaced." `
         -WhatToDo @("Close the Stage 2 window (finish or stop any run first),",
                     "then start this installer again.")
 }
-Write-Ok "Nothing is in the way."
+if ($appRunning) {
+    Write-Note "Stage 2 is open. Nothing is being changed, so this check still works."
+    Write-Info "You would need to close it before a real install."
+} else {
+    Write-Ok "Nothing is in the way."
+}
 
 # -----------------------------------------------------------------------------
 # [2/6] Work out which version to install
@@ -452,6 +680,19 @@ if ($CheckOnly) {
     Write-Host ("  Already there : " + $(if ($isUpdate) { 'yes - would update' } else { 'no - first install' }))
     Write-Host ("  LibreOffice   : " + $(if ($office) { $office } else { 'not installed - would be installed' }))
     Write-Host ("  winget        : " + $(if (Find-Winget) { 'available' } else { 'NOT available' }))
+    Write-Host ""
+    Write-Host "  Stage 2's data folders:"
+    foreach ($entry in $DataDirs.GetEnumerator()) {
+        $path = Join-Path $env:LOCALAPPDATA $entry.Key
+        $state = if (Test-Path -LiteralPath $path) { 'exists ' } else { 'would be created' }
+        Write-Host ("    [{0}] {1}" -f $state, $path)
+    }
+    # The AI review ledger is created by the app the first time a review is
+    # recorded - reported here only so a machine can be diagnosed remotely.
+    $legacyLedger = 'C:\Lifted\Stage2 Audit Review\Master_Filename_Review_Ledger.xlsx'
+    $ledger = if (Test-Path -LiteralPath $legacyLedger) { $legacyLedger }
+              else { Join-Path $env:LOCALAPPDATA 'Lifted\Stage2\ai-workflows\Master_Filename_Review_Ledger.xlsx' }
+    Write-Host ("    [{0}] {1}" -f $(if (Test-Path -LiteralPath $ledger) { 'exists ' } else { 'made on first review' }), $ledger)
     Write-Host "Re-run without -CheckOnly to install." -ForegroundColor Green
     Write-Host "-----------------------------------------------------------------" -ForegroundColor Green
     Remove-WorkDir
@@ -531,6 +772,15 @@ try {
     New-Item -ItemType Directory -Force -Path $AppDir   | Out-Null
     New-Item -ItemType Directory -Force -Path $GuideDir | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $AppDir 'Guides') | Out-Null
+
+    # Stage 2's working folders, so a new machine starts with the full layout.
+    $folderFailures = New-DataFolders
+    if ($folderFailures.Count -gt 0) {
+        # Not fatal: the app creates each of these on demand too. Say so rather
+        # than failing an otherwise good install.
+        Write-Note ("Could not pre-create " + $folderFailures.Count + " data folder(s).")
+        Write-Info "Stage 2 will create them itself when it first needs them."
+    }
 
     # The download is already complete and verified, so replacing the installed
     # files is the last and quickest step - an interrupted or corrupt download
@@ -630,6 +880,64 @@ if ($SkipLibreOffice) {
 }
 
 # -----------------------------------------------------------------------------
+# [7/7] Optional: post-run AI document review
+# -----------------------------------------------------------------------------
+$auditReviewReady = $false
+$auditReviewNotes = New-Object System.Collections.Generic.List[string]
+
+if ($WithAuditReview) {
+    Write-Step 7 "Setting up the post-run AI document review..."
+
+    # 1. The source folder - the thing that actually blocks a fresh machine.
+    if (Test-Stage2Source $SourceRoot) {
+        Write-Info "Updating the Stage 2 source copy..."
+    } else {
+        Write-Info "Downloading the Stage 2 source for this version..."
+    }
+    $source = Install-Stage2Source -ReleaseTag $releaseTag
+    if ($source) {
+        Write-Ok "Review source ready."
+        Write-Info $source
+    } else {
+        $auditReviewNotes.Add("the Stage 2 source copy could not be downloaded")
+        Write-Note "Could not set up the review source."
+    }
+
+    # 2. A real Python, which the frozen exe cannot stand in for.
+    $python = Find-RealPython
+    if (-not $python) {
+        Write-Info "The review needs a real Python. Installing Python 3.13..."
+        $winget = Find-Winget
+        if ($winget) {
+            Invoke-Native -Exe $winget -Arguments @(
+                'install', '--id', 'Python.Python.3.13', '--exact', '--source', 'winget',
+                '--silent', '--accept-package-agreements', '--accept-source-agreements') -Show | Out-Null
+            # Judge it by finding an interpreter, never by winget's exit code.
+            $python = Find-RealPython
+        }
+    }
+    if ($python) {
+        Write-Ok "Python available for the review."
+        Write-Info $python
+    } else {
+        $auditReviewNotes.Add("no usable Python was found or installed")
+        Write-Note "No Python - the review cannot prepare its queue without one."
+    }
+
+    # 3. Write the paths into Stage 2's settings, so nothing is left to pick.
+    if ($source) {
+        if (Set-WorkflowPaths -Source $source) {
+            Write-Ok "Settings filled in - nothing to choose in Settings > AI workflows."
+        } else {
+            $auditReviewNotes.Add("the paths could not be written to config.json")
+            Write-Note "Could not write the settings; pick the folders in Settings instead."
+        }
+    }
+
+    $auditReviewReady = [bool]($source -and $python)
+}
+
+# -----------------------------------------------------------------------------
 # Verify what actually landed
 # -----------------------------------------------------------------------------
 Write-Host ""
@@ -668,6 +976,24 @@ Write-Host "The first time you run it:" -ForegroundColor Green
 Write-Host "  Click the cog, paste the Anthropic API key you were given, and save."
 Write-Host "  Windows stores it securely for you and you only do it once."
 Write-Host "  Ask the maintainer for the key - it is never included in this install."
+
+if ($WithAuditReview) {
+    Write-Host ""
+    if ($auditReviewReady) {
+        Write-Host "Post-run AI document review is set up." -ForegroundColor Green
+        Write-Host "  One thing is left, and only you can do it: sign in to the Codex or"
+        Write-Host "  Claude CLI you intend to use. Stage 2 verifies that account at launch;"
+        Write-Host "  this installer must never sign in on your behalf."
+    } else {
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor Yellow
+        Write-Host "  AI document review is NOT set up" -ForegroundColor Yellow
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor Yellow
+        Write-Host "Stage 2 itself is installed and processes documents normally." -ForegroundColor Yellow
+        foreach ($note in $auditReviewNotes) { Write-Host ("  - " + $note) -ForegroundColor Yellow }
+        Write-Host "Re-run the installer with -WithAuditReview to try again." -ForegroundColor Yellow
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor Yellow
+    }
+}
 
 if (-not $libreOfficeReady) {
     Write-Host ""

@@ -249,7 +249,69 @@ If it stops early it prints **PROBLEM:** followed by exactly what to do next.
 | Installs the user guide | `%LOCALAPPDATA%\Lifted\Guides\` — the in-app **Guide** button |
 | Creates Desktop and Start Menu shortcuts | Overwritten, never duplicated |
 | **Installs LibreOffice if it is missing** | So Word/Excel/PowerPoint files convert properly |
+| Creates Stage 2's working folders | Under `%LOCALAPPDATA%\Lifted\` — see below |
 | Writes a log | `%LOCALAPPDATA%\Lifted\Logs\Stage2-install.log` |
+
+Nothing else needs setting up by hand. On a brand-new machine the installer
+creates the whole per-user layout:
+
+```
+%LOCALAPPDATA%\Lifted\Guides              user guides (the in-app Guide button)
+%LOCALAPPDATA%\Lifted\Logs                install and run logs
+%LOCALAPPDATA%\Lifted\Stage2\runs         run snapshots and activity logs
+%LOCALAPPDATA%\Lifted\Stage2\ai-workflows AI review workspace
+%LOCALAPPDATA%\Lifted\Stage2Diagnostics   crash and window diagnostics
+```
+
+The **Master AI review ledger** is deliberately *not* created by the installer:
+Stage 2 writes it, with the sheets it needs, the first time a review is
+recorded — at
+`%LOCALAPPDATA%\Lifted\Stage2\ai-workflows\Master_Filename_Review_Ledger.xlsx`
+on a new PC. (`C:\Lifted\Stage2 Audit Review\…` is an older machine-wide
+location that Stage 2 only uses when it already exists; it is never created.)
+
+### Setting up the post-run AI document review on a new machine
+
+Document processing needs none of this. But if you want **Reports → AI
+Document Review** to work on a machine, add one switch:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -WithAuditReview
+```
+
+It provisions the three things `prepare_workflow()` actually requires and a
+fresh PC does not have, then writes them into Stage 2's settings so there is
+**nothing left to pick in Settings → AI workflows**:
+
+| Provisioned | Why |
+|---|---|
+| A Stage 2 source folder under `%LOCALAPPDATA%\Lifted\Stage2\source` | The audit review needs `src\ai_review.py` and `src\Stage2_Processing.pyw` to prepare its queue and records. Downloaded for the **same release** being installed, so review code and app match. **No Git** — the audit-review role needs those two files, not a `.git` directory. |
+| A real Python (3.13 via winget if absent) | `resolve_python_runtime()` will not use the frozen exe's own interpreter. |
+| `source_root` and `workspace_root` in `config.json` | So the Settings dialog is already filled in. Existing values are never overwritten, and no other setting is disturbed. |
+
+**Still yours to do:** sign in to the Codex or Claude CLI you intend to use.
+Stage 2 verifies that account at launch, and the installer must never sign in
+on your behalf.
+
+> **What is deliberately *not* provisioned, and why.** The workspace folder and
+> the **Master AI review ledger** are left alone: Stage 2 defaults both, creates
+> the workspace with `mkdir(parents=True, exist_ok=True)`, and writes the
+> ledger — with its *Review Log*, *Run Log* and *Instructions* sheets — the
+> first time a review is recorded. The audit-review path never requires the
+> ledger to exist beforehand (that check applies only to **Improve Stage 2** /
+> code learning, which also needs a real `.git` checkout and which this switch
+> does not enable). Planting an empty `.xlsx` would add nothing and could sit
+> locked by Excel.
+
+To see what a machine has without installing anything:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -CheckOnly
+```
+
+It lists the folders, whether the ledger exists yet, and whether LibreOffice
+and winget are present. It changes nothing and works even while Stage 2 is
+open.
 
 LibreOffice matters: without it, `.docx` / `.xlsx` / `.pptx` files are read as
 plain text only and classify noticeably worse. The installer now adds it for
