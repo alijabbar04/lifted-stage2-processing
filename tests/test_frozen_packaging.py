@@ -37,6 +37,18 @@ def test_release_versions_and_guide_locations_are_consistent():
     smoke = (ROOT / "tools" / "smoke_test_frozen_app.ps1").read_text(encoding="utf-8")
     assert f'$ExpectedVersion = "{version}"' in smoke
     assert f'$ExpectedBuild = "{constants["APP_BUILD"]}"' in smoke
+    # The previous releases updated the EXE but left the public welcome text
+    # and guide on an older version. Treat those as release artifacts too.
+    public_readme = (ROOT / "build" / "installer" / "README_public.txt").read_text(encoding="utf-8")
+    first_run = (ROOT / "build" / "installer" / "first_run_public.txt").read_text(encoding="utf-8")
+    assert f"v{version}" in public_readme.splitlines()[0]
+    assert constants["APP_BUILD"] in public_readme.splitlines()[0]
+    assert f"Stage 2 v{version}" in first_run
+    assert constants["APP_BUILD"] in first_run
+    guide = (ROOT / "docs" / "USER_GUIDE.md").read_text(encoding="utf-8")
+    assert f"## User guide | v{version} " in guide
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert re.search(r"^## v" + re.escape(version) + r"\b", readme, re.M)
     # install.ps1 deliberately does NOT pin a version any more: it resolves the
     # latest published release at run time so the README and this repo never go
     # stale when a new version ships. So assert the ABSENCE of a pin - the

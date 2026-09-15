@@ -1,7 +1,7 @@
 # Installing Stage 2 — Processing
 
-This guide applies to the v1.5.5 Obsidian / Jade release (build
-2026.09.10-session1).
+This guide applies to the v1.5.9 Obsidian / Jade release (build
+2026.09.15-evidence1).
 
 This guide assumes no technical knowledge. Follow it top to bottom.
 
@@ -48,11 +48,20 @@ an API key or silently install LibreOffice.
 same release's checksum file; it includes the guide/rules but creates no
 shortcuts. **Stage2_Guide_AI_Processing.pdf** is the standalone guide download.
 
-The older optional **install.ps1** bootstrap uses the GitHub CLI and currently
-asks for GitHub sign-in. That is a requirement of the script, not the public
-setup. A failed public download does not imply a missing repository invitation:
-check the selected release, filename and connection. Developer checkout is
-covered separately in Option B.
+The **install.ps1** bootstrap downloads the latest published release over HTTPS;
+it needs no GitHub account, Git or GitHub CLI. Use the one-line command in the
+[README](../README.md), or download **install.cmd** from the same release and
+double-click it. This route also attempts LibreOffice setup; the manual setup
+wizard above does not. A failed public download does not imply a missing
+repository invitation: check the release, filename and connection.
+
+If you also want AI Document Review on this laptop, run the downloaded script
+with **-WithAuditReview**. It provisions a real Python and source files from the
+same release, and fills missing workflow paths without replacing an existing
+configured source. You still sign in to your chosen Codex or Claude CLI yourself.
+It does not create a placeholder review ledger or enable **Improve Stage 2**,
+which needs a real Git checkout (Option B). Existing source selections are
+preserved; update that checkout separately if it belongs to an older release.
 
 > Windows may warn that the file is "not commonly downloaded" because it is not
 > code-signed. Choose **Keep**, then if SmartScreen appears, **More info → Run
@@ -162,8 +171,9 @@ its expected cost before it starts and is skipped—without undoing completed
 processing—when the remaining cumulative budget is insufficient.
 
 If the run reports **ranking needs attention**, a date, signature or quality
-check lacked usable evidence. Use **Check batch status** to read the retained
-finishing details. Only a confirmed eligible failed finishing operation may be
+check lacked usable evidence. This includes malformed signature/date replies,
+not genuine false values or explicit empty dates. Use **Recover final checks**
+to read retained finishing details. Only a confirmed eligible unresolved operation may be
 retried after its separate estimate and confirmation; reconcile an uncertain
 provider outcome first, and never repeat primary classification blindly. Keep
 the same files and settings: a changed, moved, added or removed input

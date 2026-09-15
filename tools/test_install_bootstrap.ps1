@@ -1,6 +1,6 @@
 # Isolated bootstrap guide-fix check
 #
-# This test extracts only Get-VerifiedReleaseAssetHash from this checkout's
+# This test extracts only Assert-Checksum from this checkout's
 # install.ps1 (or an explicitly supplied staged script). It never dot-sources
 # or invokes install.ps1, and performs no GitHub, installer, shortcut,
 # credential, or live-repository operation.
@@ -24,12 +24,12 @@ if ($InstallScriptPath) {
     if ($parseErrors.Count) { throw "Staged install script did not parse." }
     $functions = @($ast.Find({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq "Get-VerifiedReleaseAssetHash" }, $true))
+        $node.Name -eq "Assert-Checksum" }, $true))
     if ($functions.Count -ne 1) { throw "Staged install script has no unique helper." }
     $helperText = $functions[0].Extent.Text
 } else {
     $patchLines = @(Get-Content -LiteralPath $sourcePath)
-    $start = [Array]::IndexOf($patchLines, "+function Get-VerifiedReleaseAssetHash {")
+    $start = [Array]::IndexOf($patchLines, "+function Assert-Checksum {")
     if ($start -lt 0) { throw "Inactive patch does not contain the helper." }
     $end = -1
     for ($i = $start; $i -lt $patchLines.Count; $i++) {
@@ -40,6 +40,10 @@ if ($InstallScriptPath) {
         ForEach-Object { $_.Substring(1) }) -join [Environment]::NewLine)
 }
 . ([scriptblock]::Create($helperText))
+
+# Assert-Checksum normally logs through the installer. This isolated harness
+# never runs the installer, so provide a no-op logging stub.
+function Write-Log { param([string]$Text, [string]$Level) }
 
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
 $fixture = Join-Path $tempRoot ("Stage2GuideValidation-" + [guid]::NewGuid().ToString("N"))
@@ -53,7 +57,7 @@ try {
 
     # Good guide and unique manifest entry.
     [IO.File]::WriteAllText($manifest, $validLine + [Environment]::NewLine)
-    $actual = Get-VerifiedReleaseAssetHash -ManifestPath $manifest -AssetPath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
+    $actual = Assert-Checksum -ManifestPath $manifest -FilePath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
     if ($actual -ine $hash) { throw "Good case returned the wrong hash." }
 
     function Expect-Failure {
@@ -73,45 +77,42 @@ try {
     # Missing downloaded guide file.
     Remove-Item -LiteralPath $guide -Force
     Expect-Failure "missing guide" {
-        Get-VerifiedReleaseAssetHash -ManifestPath $manifest -AssetPath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
-    } "asset is missing"
+        Assert-Checksum -ManifestPath $manifest -FilePath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
+    } "was not downloaded"
     [IO.File]::WriteAllText($guide, "synthetic guide bytes")
 
     # Missing guide entry in an otherwise readable manifest.
     [IO.File]::WriteAllText($manifest, ("0" * 64) + " *Stage2_Processing.exe" + [Environment]::NewLine)
     Expect-Failure "missing manifest entry" {
-        Get-VerifiedReleaseAssetHash -ManifestPath $manifest -AssetPath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
-    } "exactly one entry.*found 0"
+        Assert-Checksum -ManifestPath $manifest -FilePath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
+    } "exactly once"
 
     # Duplicate guide entries are rejected rather than first-match accepted.
     [IO.File]::WriteAllText($manifest, ($validLine + [Environment]::NewLine + $validLine + [Environment]::NewLine))
     Expect-Failure "duplicate manifest entry" {
-        Get-VerifiedReleaseAssetHash -ManifestPath $manifest -AssetPath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
-    } "exactly one entry.*found 2"
+        Assert-Checksum -ManifestPath $manifest -FilePath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
+    } "exactly once"
 
     # A changed guide fails the recorded hash.
     [IO.File]::WriteAllText($guide, "changed synthetic guide bytes")
     [IO.File]::WriteAllText($manifest, $validLine + [Environment]::NewLine)
     Expect-Failure "mismatched guide" {
-        Get-VerifiedReleaseAssetHash -ManifestPath $manifest -AssetPath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
-    } "Checksum mismatch"
+        Assert-Checksum -ManifestPath $manifest -FilePath $guide -AssetName "Stage2_Guide_AI_Processing.pdf"
+    } "does not match"
 
-    # Static assertions for the guarded guide path and copy source.
-    $guideValidation = $sourceText.IndexOf('-AssetPath $DownloadedGuide')
-    $installSection = $sourceText.IndexOf('# --- 4. Install into the user profile')
-    $guideCopy = $sourceText.IndexOf('Copy-Item -LiteralPath $DownloadedGuide')
+    # Static assertions for the current guarded guide path and copy source.
+    $guideValidation = $sourceText.IndexOf('-FilePath $downloadedPdf')
+    $installSection = $sourceText.IndexOf('# [4/6] Install')
+    $guideCopy = $sourceText.IndexOf('Copy-Item -LiteralPath $downloadedPdf')
     if ($guideValidation -lt 0 -or $installSection -lt 0 -or
         $guideValidation -gt $installSection -or $guideCopy -lt $installSection) {
         throw "Guide validation/copy is not guarded before install completion."
     }
-    if ($sourceText -match '(?m)^\+?\s*if\s*\(\$guideOk\)') {
-        throw "Old optional guide-copy branch remains in the patch."
-    }
-    if ($sourceText -notmatch 'Copy-Item -LiteralPath \$DownloadedGuide') {
+    if ($sourceText -notmatch 'Copy-Item -LiteralPath \$downloadedPdf') {
         throw "Guide copy source is missing."
     }
-    if ($sourceText -notmatch "Guide download failed.*nothing was installed") {
-        throw "Missing-guide download path lacks the no-install message."
+    if ($sourceText -notmatch 'Remove-Item -LiteralPath \$downloadedPdf') {
+        throw "Guide failure path does not clean up the downloaded guide."
     }
 
     Write-Output "PASS: good, missing, missing-entry, duplicate, mismatch, and guarded-path cases."

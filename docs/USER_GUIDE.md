@@ -1,6 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.5.6 Obsidian / Jade
+## User guide | v1.5.9 Obsidian / Jade
 
 Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Stage 3 uploads the prepared folders. Completing Stage 2 does not itself upload anything.
 
@@ -32,7 +32,7 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 | Troubleshooting and completion checklist | 14 |
 | Reliable recovery and source exceptions | 15 |
 
-Edition: 14 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
+Edition: 15 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
 
 <!-- pagebreak -->
 
@@ -53,7 +53,7 @@ when relevant.
 | AI Document Review | Prepare an account-selected document review. |
 | Improve Stage 2 | Prepare a software-learning review of accumulated correction evidence. |
 
-The v1.5.6 presentation uses Graphite surfaces, restrained Deep Jade accents,
+The workspace uses Graphite surfaces, restrained Deep Jade accents,
 real buttons and progressive active panels. **Accuracy Audit** finds possible
 mistakes; **AI Document Review** checks pages; **Improve Stage 2** studies the
 ledger for justified software changes. Corrections never grant code authority.
@@ -155,13 +155,19 @@ did not provide usable evidence. It is different from a zero score or from a
 document with no applicable date. Stage 2 must not guess a score, mark a
 contract unsigned, or promote a copy because a request failed.
 
+Malformed signature/date answers also defer the whole family: text booleans
+and missing or wrong-type fields are not evidence. Real **false** values and
+explicit empty dates remain valid. Saved invalid answers are not automatically
+rebought; older answers already converted to false/empty cannot be identified
+retrospectively. This check validates structure, not the AI's reading accuracy.
+
 Incomplete worker folders stay in the source location with their saved results.
 Completed workers may already be in **Processed**; that does not mean the
 captured processing scope finished. The full **Accuracy Audit** and automatic
 **AI Document Review** wait until the captured scope is complete and durable.
 
 For a Batch run, the button becomes **Recover final checks** when checks are
-deferred. It inspects saved evidence before downloading results. If a confirmed failed finishing check is eligible
+deferred. It inspects saved evidence before downloading results. If a failed or malformed finishing check is eligible
 for another attempt, the app asks separately before sending new paid finishing
 requests and shows an estimate. Declining preserves unfinished work for later.
 An uncertain provider outcome is not retried this way: reconcile whether it was
@@ -171,7 +177,7 @@ attention state.
 Keep the same files and saved run settings. If a document is changed, added,
 removed or moved, the old retry confirmation is no longer valid. Resolve the
 mismatch rather than deleting state or forcing a fresh run. Confirmed retries
-apply only to eligible failed finishing operations; they do not authorize a
+apply only to eligible unresolved finishing operations; they do not authorize a
 repeat primary submission.
 
 ### Targeted audit-row recovery
@@ -303,7 +309,7 @@ The ledger is shared across accounts, providers and runs. On an existing setup i
 ## 7. AI Document Review
 
 Before Start, configure **AI Document Review** as **Model → Account → Effort**;
-the provider is inferred. The default is **Sol - Codex, High**, with
+the provider is inferred. For new settings, the default is **Opus 5 - Claude Code, High**, with
 **Apply supported filename corrections** on and automatic review after a
 complete Accuracy Audit. This step then checks the audit against real
 documents; it is not another blind rename pass.
@@ -326,7 +332,7 @@ The launcher does not claim to inject text into an already open VS Code extensio
 
 At Start, the selected **Model → Account → Effort** (provider inferred
 read-only: Sol/Terra/Luna/Astra are Codex; Fable/Opus are Claude), scope and
-authority are snapshotted and fixed on resume. The default is **Sol / High**;
+authority are snapshotted and fixed on resume. Existing saved selections are preserved;
 automatic review submits once only after a matching complete audit receipt and
 released locks. Pending/failed audits do not launch and the newest report is
 never guessed. A terminal/log viewer shows live output, not private reasoning

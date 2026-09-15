@@ -1,6 +1,20 @@
 # Stage 2 — Processing
 
-## v1.5.6 - Reliable batch recovery - build 2026.09.14-recovery1
+## v1.5.9 - Strict finishing evidence - build 2026.09.15-evidence1
+
+Signature and date responses must have the declared field types before they
+can affect filenames or ranks. A text `"false"` is not a boolean, and a missing
+date field is not an explicit empty date. Malformed fresh or saved answers
+defer the whole affected family with names unchanged. **Recover final checks**
+offers eligible, explicitly confirmed retries; normal replay does not rebuy
+stored invalid evidence. Genuine false values and empty dates remain valid.
+
+This update retains the v1.5.8 models/prices and all naming, ranking and routing
+rules. The vocabulary guide now correctly separates display tiers from the
+`OVERWRITE_TYPES` routing list. No historical ledger or document was changed,
+and synthetic regression tests are not a live accuracy benchmark.
+
+### Retained batch recovery features
 
 - Journal exact duplicate removal before changing files, and checkpoint surviving
   documents before final checks. Interrupted finalisation can resume without
@@ -16,8 +30,8 @@
   retaining numeric nested causes. Unknown paid outcomes still require provider
   reconciliation; no blind resubmission or transport fallback was added.
 
-Models, page evidence and naming/ranking policy are unchanged. Reliability tests
-are not an accuracy benchmark. Keep original documents and read the updated Guide.
+Page evidence and naming/ranking policy are unchanged by this update. Keep
+original documents and read the updated Guide.
 
 ### Retained features from v1.5.5
 
@@ -506,7 +520,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.6 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.9 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

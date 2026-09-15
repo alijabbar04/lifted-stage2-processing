@@ -32,12 +32,12 @@ They are **constants in the source**, not separate data files:
 
 | What | Constant | Location |
 |---|---|---|
-| Crucial tier (13 types) | `SEED_CRUCIAL` | [`src/Stage2_Processing.pyw`](../src/Stage2_Processing.pyw) line ~347 |
-| Important tier (61 types) | `SEED_IMPORTANT` | line ~522 |
-| Other tier (13 types) | `SEED_OTHER` | line ~913 |
-| Disambiguation rules (~17,000 chars) | `DISAMBIGUATION_RULES` | line ~2255 |
-| Retired / renamed names | `RETIRED_NAMES` | line ~1029 |
-| Types Stage 3 overwrite-uploads | `OVERWRITE_TYPES` | line ~1046 |
+| Crucial tier | `SEED_CRUCIAL` | [`src/Stage2_Processing.pyw`](../src/Stage2_Processing.pyw) |
+| Important tier | `SEED_IMPORTANT` | same source file |
+| Other tier | `SEED_OTHER` | same source file |
+| Disambiguation rules | `DISAMBIGUATION_RULES` | same source file |
+| Retired / renamed names | `RETIRED_NAMES` | same source file |
+| Types Stage 3 overwrite-uploads | `OVERWRITE_TYPES` | same source file |
 
 A flat, reviewable mirror of all of it is generated into
 [`../vocabulary/`](../vocabulary/) — see that folder's README. The mirror is
@@ -79,10 +79,12 @@ assert "your new wording" in kb.vocabulary_block()
 
 ## How to add a new document type
 
-1. Pick the tier. This is not cosmetic — it changes where Stage 3 uploads the file:
+1. Pick the vocabulary tier. Tiers guide classification and display grouping; they
+   do **not** decide where Stage 3 uploads the file:
    - **`SEED_CRUCIAL`** — right-to-work / sponsorship critical documents.
    - **`SEED_IMPORTANT`** — normal compliance documents (most things).
    - **`SEED_OTHER`** — real documents that exist but need no compliance slot.
+   The individual-overwrite route is controlled separately by `OVERWRITE_TYPES`.
 2. Add a `(name, description)` tuple. The **name becomes the filename**, so it
    must be valid on Windows (no `/ \ : * ? " < > |`) and under 80 characters
    (`MAX_NAME_LEN`). Match the Lifted portal's document-type spelling exactly —
@@ -138,8 +140,9 @@ churn costs money as well as accuracy.
 This is a real fix from the 2026-07-15 Southern Sefton audit.
 
 **Symptom.** Letters that only told a worker their new hourly rate were being
-filed as `Employment Contract Amendment` — a Crucial-tier type. Wrong tier,
-wrong upload slot, and it polluted a right-to-work-adjacent category.
+filed as `Employment Contract Amendment` — a Crucial-tier vocabulary type that
+is nevertheless routed to Bulk because it is not in `OVERWRITE_TYPES`. The
+classification was too broad; the upload route was not changed by the tier.
 
 **The wrong fix.** Special-casing the filename, or a keyword rule like
 "if it says 'salary' it's not an amendment". Both are brittle: a genuine
@@ -189,8 +192,9 @@ python src\eval_classifier.py --tag my-fix
 ```
 
 It re-runs the real production path (`classify_document_core` +
-`validate_result` — the same functions the live Engine calls) so a pass means
-the app is fixed, not just the harness. The ground-truth documents are real
+`validate_result` — the same functions the live Engine calls). A pass is evidence
+for the bounded cases and controls included in that evaluation; it does not prove
+the app is fixed for every document. The ground-truth documents are real
 worker files and are **not** in this repo; point the harness at your local copy
 with `set STAGE2_GT_ROOT=<folder>`. It costs real API money and asks for
 confirmation before sending anything.

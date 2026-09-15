@@ -440,6 +440,77 @@ class TestUnavailableSignatureEvidenceIsNotUnsigned(unittest.TestCase):
             finally:
                 f.close()
 
+    def test_malformed_stored_signature_answers_defer_without_rebuy_or_rename(self):
+        """Persisted non-boolean signed answers are unavailable evidence."""
+        for garbage in ("false", 0, {"signed": False}, None):
+            with self.subTest(garbage=garbage), tempfile.TemporaryDirectory() as temp:
+                f = SecondPassFixture(temp)
+                try:
+                    unsigned, signed, records = f.contract_pair()
+                    state = f.batch_state({
+                        signed_op(signed): {"status": "complete", "result": garbage}})
+                    f.engine._batch_state = state
+                    f.engine._committed_batch_cost_gbp = 0.0
+                    f.engine._committed_batch_tokens = 0
+                    f.engine._persisted_live_cost_gbp = 0.0
+                    f.engine._persisted_live_tokens = 0
+                    f.engine._second_pass(f.worker, records)
+                    self.assert_family_untouched(f, records, unsigned, signed)
+                    self.assertEqual(len(f.api.signed_calls), 1)
+                finally:
+                    f.close()
+
+    def test_authorized_retry_replaces_malformed_complete_answer_with_lineage(self):
+        """Only an explicit, binding-matched retry may replace bad stored evidence."""
+        with tempfile.TemporaryDirectory() as temp:
+            f = SecondPassFixture(temp)
+            try:
+                unsigned, signed, records = f.contract_pair()
+                operation = signed_op(signed)
+                state = f.batch_state({operation: {
+                    "status": "complete", "attempt_id": "malformed-attempt",
+                    "result": "false"}})
+                f.engine._batch_state = state
+                for attr, value in (("_committed_batch_cost_gbp", 0.0),
+                                    ("_committed_batch_tokens", 0),
+                                    ("_persisted_live_cost_gbp", 0.0),
+                                    ("_persisted_live_tokens", 0)):
+                    setattr(f.engine, attr, value)
+                first = f.engine._second_pass(f.worker, records)
+                self.assertEqual([item["name"] for item in first["deferred"]],
+                                 ["Employment Contract"])
+                state = app.BatchState(f.root)
+                worker_key = str(f.worker.resolve()).casefold()
+                worker = state.data["workers"][worker_key]
+                worker["finishing_status"] = "deferred"
+                self.assertEqual(worker["ranking_families"]["Employment Contract"]["status"],
+                                 "deferred")
+                state.save()
+                f.engine._batch_state = state
+                calls_before_retry = len(f.api.signed_calls)
+                assessment = f.engine.assess_unresolved_finishing(state)
+                item = next(item for item in assessment["retryable"]
+                             if item["operation"] == operation)
+                f.engine._authorized_finishing_retries = {
+                    (worker_key, operation): {
+                        "status": item["status"],
+                        "attempt_id": item["attempt_id"],
+                        "binding": item["binding"]}}
+                f.engine._finishing_retry_active = True
+                second = f.engine._second_pass(f.worker, records)
+                self.assertEqual(second["deferred"], [])
+                self.assertEqual([item["name"] for item in second["completed"]],
+                                 ["Employment Contract"])
+                self.assertEqual(len(f.api.signed_calls) - calls_before_retry, 1)
+                final = app.BatchState(f.root).data["workers"][worker_key]
+                operation_row = final["finishing_operations"][operation]
+                self.assertEqual(operation_row["status"], "complete")
+                self.assertEqual(operation_row["retry_of"], "malformed-attempt")
+                self.assertEqual([attempt["attempt_id"] for attempt in operation_row["attempts"]],
+                                 ["malformed-attempt"])
+            finally:
+                f.close()
+
 
 if __name__ == "__main__":
     unittest.main()

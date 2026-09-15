@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.5.9 - 2026-09-15 - Strict finishing evidence
+
+- Validate signature, CoS issue-date and Share Code check responses before
+  converting values. Missing fields, text booleans and wrong-type dates now
+  defer the affected family instead of becoming signed/unsigned/undated claims.
+- Reject representably malformed stored finishing answers on replay without
+  renaming or parking family members or automatically purchasing another check.
+  Existing confirmed, input-bound recovery supports these unresolved operations.
+- Preserve real false values, explicit empty dates, supported date parsing,
+  ranking order, classification models/prices, routing and batch replay gates.
+  Already-coerced historical values cannot be retrospectively identified.
+- Correct the vocabulary guide: display tiers do not determine routing;
+  `OVERWRITE_TYPES` does. Refresh installer text and the packaged user guide.
+- Offline regression tests establish these boundaries, not historical naming
+  error rates or a measured document-interpretation accuracy improvement.
+
 ## v1.5.8 - 2026-09-15 - Current Claude models throughout
 
 - Classification "Opus" option is now Claude Opus 5 (`claude-opus-5`) rather

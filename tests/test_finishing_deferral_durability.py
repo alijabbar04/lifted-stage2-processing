@@ -1038,6 +1038,7 @@ class TestDateEvidenceBoundary(unittest.TestCase):
                 self.assertIn("CoS issue date unavailable", rows[0]["detail"])
             finally:
                 f.close()
+
         with tempfile.TemporaryDirectory() as tmp:
             f = SecondPassFixture(tmp, api=FinishingAPI())
             try:
@@ -1056,6 +1057,68 @@ class TestDateEvidenceBoundary(unittest.TestCase):
                 self.assertEqual(f.failed_rows(), [])
                 worker = next(iter(json.loads(state.path.read_text(encoding="utf-8"))["workers"].values()))
                 self.assertEqual(worker["ranking_families"]["Certificate of Sponsorship"]["status"], "complete")
+            finally:
+                f.close()
+
+    def test_malformed_stored_share_date_defers_without_rebuy_or_rename(self):
+        malformed = (
+            {"work_permitted": True},                         # missing check_date
+            {"check_date": 7, "work_permitted": True},       # wrong date type
+            {"check_date": "2025-11-28"},                    # missing work_permitted
+            {"check_date": "2025-11-28", "work_permitted": "false"},
+        )
+        for answer in malformed:
+            with self.subTest(answer=answer), tempfile.TemporaryDirectory() as tmp:
+                f = SecondPassFixture(tmp, api=FinishingAPI())
+                try:
+                    a = f.file("Share Code Check Result.pdf", share_code("2023-07-31", 60, "SC-A"))
+                    b = f.file("Share Code Check Result (2).pdf", share_code("2025-11-28", 60, "SC-B"))
+                    records = [f.record(a, "Share Code Check Result"),
+                               f.record(b, "Share Code Check Result")]
+                    op = f"share-code-date:{app.file_hash(b)}"
+                    state = f.batch_state({op: {"status": "complete", "result": answer}})
+                    f.engine._batch_state = state
+                    f.engine._committed_batch_cost_gbp = 0.0
+                    f.engine._committed_batch_tokens = 0
+                    f.engine._persisted_live_cost_gbp = 0.0
+                    f.engine._persisted_live_tokens = 0
+                    before = {p.name: p.read_bytes() for p in f.worker.glob("*.pdf")}
+                    first = f.engine._second_pass(f.worker, records)
+                    self.assertEqual({p.name: p.read_bytes() for p in f.worker.glob("*.pdf")}, before)
+                    self.assertEqual([item["name"] for item in first["deferred"]],
+                                     ["Share Code Check Result"])
+                    self.assertEqual(len(f.api.date_calls), 1)
+                    self.assertEqual(f.api.date_calls[0][0], "share-code")
+                    # A restart/recheck replays the malformed answer; it must
+                    # remain deferred and must not buy the same operation again.
+                    second = f.engine._second_pass(f.worker, records)
+                    self.assertEqual({p.name: p.read_bytes() for p in f.worker.glob("*.pdf")}, before)
+                    self.assertEqual([item["name"] for item in second["deferred"]],
+                                     ["Share Code Check Result"])
+                    self.assertEqual(len(f.api.date_calls), 1)
+                finally:
+                    f.close()
+
+    def test_malformed_stored_cos_date_defers_without_rebuy_or_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = SecondPassFixture(tmp, api=FinishingAPI())
+            try:
+                source = f.file("Certificate of Sponsorship.pdf", cos("2025-11-28", "COS-A"))
+                records = [f.record(source, "Certificate of Sponsorship")]
+                op = f"cos-date:{app.file_hash(source)}"
+                state = f.batch_state({op: {"status": "complete",
+                                            "result": {"issue_date": 7}}})
+                f.engine._batch_state = state
+                f.engine._committed_batch_cost_gbp = 0.0
+                f.engine._committed_batch_tokens = 0
+                f.engine._persisted_live_cost_gbp = 0.0
+                f.engine._persisted_live_tokens = 0
+                before = source.read_bytes()
+                outcome = f.engine._second_pass(f.worker, records)
+                self.assertEqual(source.read_bytes(), before)
+                self.assertEqual([item["name"] for item in outcome["deferred"]],
+                                 ["Certificate of Sponsorship"])
+                self.assertEqual(f.api.date_calls, [])
             finally:
                 f.close()
 

@@ -1395,8 +1395,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.5.8"
-APP_BUILD = "2026.09.15-current-models"
+APP_VERSION = "1.5.9"
+APP_BUILD = "2026.09.15-evidence1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -3680,7 +3680,10 @@ class ClaudeAPI:
         if text:
             blocks.append({"type": "text", "text": f"Extracted text:\n{text[:4000]}"})
         blocks.append({"type": "text", "text": "Return the issue date as JSON only."})
-        return self._json_from(self._post(system, blocks, max_tokens=120)).get("issue_date", "")
+        d = self._json_from(self._post(system, blocks, max_tokens=120))
+        if "issue_date" not in d or not isinstance(d["issue_date"], str):
+            raise ValueError("malformed Certificate of Sponsorship issue-date response")
+        return d["issue_date"]
 
     # ---- 2b) Employment Contract: signed? ----
     def contract_signed(self, imgs: list, text: str) -> bool:
@@ -3695,7 +3698,10 @@ class ClaudeAPI:
         if text:
             blocks.append({"type": "text", "text": f"Extracted text:\n{text[:5000]}"})
         blocks.append({"type": "text", "text": "Is it signed? JSON only."})
-        return bool(self._json_from(self._post(system, blocks, max_tokens=80)).get("signed", False))
+        d = self._json_from(self._post(system, blocks, max_tokens=80))
+        if "signed" not in d or type(d["signed"]) is not bool:
+            raise ValueError("malformed employment-contract signature response")
+        return d["signed"]
 
     # ---- 2d) DBS Document: clarity / completeness / relevance score ----
     # ---- general document-quality ranker (any type, for numbered ranking) ----
@@ -3937,8 +3943,12 @@ class ClaudeAPI:
             blocks.append({"type": "text", "text": f"Extracted text:\n{text[:4000]}"})
         blocks.append({"type": "text", "text": "Return check date and work status. JSON only."})
         d = self._json_from(self._post(system, blocks, max_tokens=100))
-        return {"check_date": (d.get("check_date") or "").strip(),
-                "work_permitted": bool(d.get("work_permitted", False))}
+        if ("check_date" not in d or not isinstance(d["check_date"], str)
+                or "work_permitted" not in d
+                or type(d["work_permitted"]) is not bool):
+            raise ValueError("malformed share-code check response")
+        return {"check_date": d["check_date"].strip(),
+                "work_permitted": d["work_permitted"]}
 
     # ================================================================
     # MESSAGE BATCHES API  (Overnight Batch mode - 50% cheaper)
@@ -13407,12 +13417,14 @@ class Engine:
             answer = answer_for("share-code-date", r, p, self.api.share_code_check)
             if isinstance(answer, UnavailableEvidence):
                 return answer
-            if not isinstance(answer, dict):
+            if (not isinstance(answer, dict)
+                    or not isinstance(answer.get("check_date"), str)
+                    or type(answer.get("work_permitted")) is not bool):
                 return unavailable("share-code-date",
                                    finishing_key("share-code-date", p), p,
-                                   f"invalid answer recorded ({type(answer).__name__})",
+                                   "invalid check-date/work-status answer recorded",
                                    stored=True)
-            return parse_date(str(answer.get("check_date", "") or ""))
+            return parse_date(answer["check_date"])
 
         def quality_for(r, p, doc_type):
             kind = f"quality:{doc_type}"
@@ -13581,6 +13593,15 @@ class Engine:
                     signed = answer_for(
                         "contract-signed", r, p, self.api.contract_signed,
                         pages=self._signature_pages(r, p))
+                    # A saved legacy answer can bypass the API's response
+                    # validator. In particular, bool("false") is True: never
+                    # convert malformed evidence into a ranking advantage.
+                    if (not isinstance(signed, UnavailableEvidence)
+                            and type(signed) is not bool):
+                        signed = unavailable(
+                            "contract-signed", finishing_key("contract-signed", p), p,
+                            "invalid signature answer recorded (expected boolean)",
+                            stored=True)
                     if isinstance(signed, UnavailableEvidence):
                         signed_state = "unavailable"
                         unresolved.append((r, p, signed))
