@@ -733,7 +733,8 @@ class CompactDashboard:
             self.review_var.set(str(stats["audit_flagged"]))
 
     def finish(self, stats, status):
-        if stats.get("terminal_outcome") == "completed_with_exclusions":
+        if (stats.get("terminal_outcome") == "completed_with_exclusions"
+                and str(status or "").partition(":")[0] in ("batch_applied", "batch_audit_complete")):
             self._terminal_status = "completed_with_exclusions"
             self.state_label.configure(text="Completed with exclusions")
             self.phase_label.configure(text="Partial-scope outcome — not a full accuracy pass")

@@ -702,6 +702,7 @@ class Recovery:
 
     def resume(self, render):
         self.initialize()
+        verify_excluded_archives(self.state)
         self.finish_quarantines()
         self.finish_reinstatements()
         for cid, r in self.data["records"].items():
@@ -812,7 +813,7 @@ def exclusion_summary(state):
 
 
 def verify_excluded_archives(state):
-    """Read-only terminal guard: every claimed quarantine stays recoverable.
+    """Read-only guard: quarantines and earlier original versions stay recoverable.
 
     Checking only when opening the recovery UI is insufficient: a subsequent
     Apply action can run without opening that window again. Never issue a
@@ -821,6 +822,13 @@ def verify_excluded_archives(state):
     root = safe_path(state.dir.resolve() / ".stage2-source-recovery", state.dir.resolve())
     rows = (state.data.get("source_recovery") or {}).get("records", {})
     for record in rows.values():
+        for original in record.get("archives", []):
+            try:
+                saved_original = safe_path(original["path"], root)
+                if not original.get("hash") or digest(saved_original) != original["hash"]:
+                    raise RecoveryError("Retained original archive is missing or changed; recovery and completion are blocked.")
+            except (OSError, KeyError, TypeError, ValueError):
+                raise RecoveryError("Retained original archive cannot be verified; saved state is retained.") from None
         if record.get("state") != "excluded_quarantined":
             continue
         try:
@@ -884,6 +892,29 @@ def reuse_accepted(recovery, cid, request_id):
     recovery.event(cid, "accepted_evidence_reused", request_id=request_id)
 
 
+def require_accounted_batch_costs(state):
+    """Finite budgets cannot ignore earlier accepted, unaccounted purchases.
+
+    Accounting markers are written only after complete validated result unions.
+    Legacy runs without them must refresh through Apply accepted before buying
+    a later source scope. This guard does not poll or contact any provider.
+    """
+    if float((state.data.get("settings") or {}).get("max_budget_gbp", 0) or 0) <= 0:
+        return
+    costs = state.data.get("costs") or {}
+    followup = state.data.get("followup") or {}
+    marker = followup.get("submission") or {}
+    if (followup.get("phase") in {"submission_started", "ambiguous"}
+            or marker.get("status") in {"submission_started", "ambiguous"}):
+        raise RecoveryError("Earlier follow-up billing is uncertain. Reconcile that submission before buying another source scope.")
+    for phase, batches in (("primary", state.data.get("batches", [])),
+                           ("followup", followup.get("batches", []))):
+        accepted = {b["id"] for b in batches if isinstance(b.get("id"), str) and b["id"]}
+        accounted = costs.get(phase + "_accounted_batch_ids", [])
+        if not isinstance(accounted, list) or not accepted.issubset(set(accounted)):
+            raise RecoveryError("Earlier accepted batch costs are not yet accounted for. Use Apply accepted / Check batch status to settle their results and costs before buying another source scope under the saved budget.")
+
+
 def submit_ready(recovery, ids, token, api, vocabulary, *, allow_partial=False,
                  stop=lambda: None, max_bytes=40 * 1024 * 1024, max_requests=1000):
     """Persist exact scopes before POST. Started/ambiguous scopes never replay.
@@ -893,6 +924,11 @@ def submit_ready(recovery, ids, token, api, vocabulary, *, allow_partial=False,
     """
     recovery.assert_decision(ids, token)
     recovery.validate_current_scope()
+    accepted_hashes = accepted_request_hashes(recovery.state)
+    if any(recovery.data["records"][cid]["hash"] not in accepted_hashes for cid in ids):
+        # Once for this explicitly confirmed scope, not between its own chunks.
+        # Entirely reused aliases make no new purchase and need no new reserve.
+        require_accounted_batch_costs(recovery.state)
     if not recovery.data["preflight_complete"] or (recovery.unresolved() and not allow_partial):
         raise RecoveryError("Waiting for whole-run source recovery; no request sent.")
     for scope in recovery.data["scopes"]:

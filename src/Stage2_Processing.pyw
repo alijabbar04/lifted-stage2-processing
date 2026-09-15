@@ -12307,7 +12307,7 @@ class Engine:
                 "reason": exclusions["statement"], "eligible_worker_paths": [str(p) for p in allowed]}
             self._review_controller = None
             self._review_run_id = ""
-            self.log("COMPLETED WITH EXCLUSIONS: " + exclusions["statement"]
+            self.log("PARTIAL SCOPE: " + exclusions["statement"]
                 + ". Affected workers are excluded from the accuracy audit; automatic review is not started.")
             report = self.dir / ("_source_exclusions_" + controller.data["run_id"] + ".json")
             controller.export(report)
@@ -12535,6 +12535,8 @@ class Engine:
                 primary_in, primary_out, batch=True)
             state.data.setdefault("costs", {})["primary_actual_gbp"] = round(
                 primary_cost, 6)
+            state.data["costs"]["primary_accounted_batch_ids"] = sorted(
+                batch["id"] for batch in primary_batches)
 
             # Resume an existing guarded chunk plan before expecting its full
             # result union: the request map can still contain unsubmitted tail
@@ -12599,6 +12601,8 @@ class Engine:
                 if followup_results else 0.0)
             state.data.setdefault("costs", {})["followup_actual_gbp"] = round(
                 followup_cost, 6)
+            state.data["costs"]["followup_accounted_batch_ids"] = sorted(
+                batch["id"] for batch in followup_batches) if followup_results else []
             state.save()
             self._committed_batch_cost_gbp = primary_cost + followup_cost
             self._committed_batch_tokens = (primary_in + primary_out
@@ -13075,10 +13079,7 @@ class Engine:
             state.data["processing_completed_ts"] = \
                 datetime.datetime.now().isoformat(timespec="seconds")
             state.data["phase"] = "processing_complete"
-            if not state.save():
-                raise RuntimeError(
-                    "processing completion could not be persisted; audit was "
-                    "not started")
+            verify_batch_save(state, "processing completion could not be persisted; audit was not started")
             unique_audit_dirs = []
             seen_audit_dirs = set()
             for path in self._audit_worker_dirs:
@@ -16195,7 +16196,8 @@ class App(tk.Tk):
 
     def _notify_done(self, stats, status):
         kind, _, payload = str(status or "").partition(":")
-        if stats.get("terminal_outcome") == "completed_with_exclusions":
+        if (stats.get("terminal_outcome") == "completed_with_exclusions"
+                and kind in ("batch_applied", "batch_audit_complete")):
             exclusions = stats.get("source_exclusions") or {}
             self._notify("completed_with_exclusions", documents=exclusions.get("count", 0),
                          workers=len(exclusions.get("workers") or []))

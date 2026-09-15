@@ -238,6 +238,8 @@ def test_apply_accounts_ended_prior_followup_before_supplement_budget_gate(scope
     engine._finish_worker.assert_not_called()
     restored = app.BatchState(state.dir)
     assert restored.data["costs"]["followup_actual_gbp"] == pytest.approx(actual_old_cost, abs=1e-6)
+    assert restored.data["costs"]["primary_accounted_batch_ids"] == ["synthetic-primary"]
+    assert restored.data["costs"]["followup_accounted_batch_ids"] == ["batch-0"]
     assert restored.data["followup"]["batches"] == old_followup["batches"]
     assert restored.data["followup"]["est_gbp"] >= actual_old_cost
     assert app.batch_result_cache.load(state.dir, "batch-0", [old_cid],

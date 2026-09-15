@@ -215,6 +215,9 @@ class RecoveryWindow(tk.Toplevel):
                     elif action == "submit":
                         if not self.engine.api.api_key:
                             raise recovery.RecoveryError("Set the provider API key in Settings before submitting.")
+                        accepted_hashes = recovery.accepted_request_hashes(state)
+                        if any(controller.data["records"][cid]["hash"] not in accepted_hashes for cid in ids):
+                            recovery.require_accounted_batch_costs(state)
                         extra = self.estimate(len(ids))
                         incurred = controller.summary()["cost_incurred_gbp"]
                         budget = float(state.data.get("settings", {}).get("max_budget_gbp", 0) or 0)

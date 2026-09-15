@@ -48,11 +48,15 @@ def test_terminal_archive_guard_rejects_out_of_scope_paths_without_reading_them(
     ids = list(c.data["records"])
     c.quarantine(ids, c.token(ids))
     c.data["records"][ids[0]]["quarantine_path"] = str(tmp_path / "outside.bin")
-    read_hash = Mock(side_effect=AssertionError("must not read an out-of-scope archive"))
+    original_digest = recovery.digest
+    def guarded_digest(path):
+        assert Path(path).resolve().is_relative_to(root.resolve()), "must not read an out-of-scope archive"
+        return original_digest(path)
+    read_hash = Mock(side_effect=guarded_digest)
     monkeypatch.setattr(recovery, "digest", read_hash)
     with pytest.raises(recovery.RecoveryError, match="outside"):
         recovery.verify_excluded_archives(c.state)
-    read_hash.assert_not_called()
+    assert all(Path(call.args[0]).resolve().is_relative_to(root.resolve()) for call in read_hash.call_args_list)
 
 
 def test_final_receipt_rechecks_archive_after_completion_policy(tmp_path):
@@ -74,3 +78,21 @@ def test_final_receipt_rechecks_archive_after_completion_policy(tmp_path):
         c.state.finalize_applied()
     assert app.BatchState(root).exists()
     assert not list(root.glob("*.terminal-*.bak"))
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed"])
+def test_unlocked_original_archives_must_remain_verified_on_resume_and_completion(tmp_path, damage):
+    from test_source_recovery import setup, render, reload
+    c, paths = setup(tmp_path / "Synthetic care home", ["later"])
+    c.preflight(render)
+    c.unlock(["0"], "later", c.token(["0"]), render)
+    retained = Path(c.data["records"]["0"]["archives"][0]["path"])
+    if damage == "missing":
+        retained.unlink()
+    else:
+        retained.write_bytes(b"Synthetic corruption")
+    with pytest.raises(recovery.RecoveryError, match="archive"):
+        reload(c).resume(render)
+    with pytest.raises(recovery.RecoveryError, match="archive"):
+        c.state.finalize_applied()
+    assert c.state.exists() and paths[0].is_file()

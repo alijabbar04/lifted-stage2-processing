@@ -341,5 +341,17 @@ class TestCompactDashboard(unittest.TestCase):
         self.assertIn("still need provider processing", self.dashboard.wait_label.cget("text"))
 
 
+    def test_partial_outcome_never_hides_incomplete_audit_or_failed_receipt(self):
+        stats = {"terminal_outcome": "completed_with_exclusions",
+                 "source_exclusions": {"count": 1, "statement": "1 excluded, not processed"}}
+        for status in ("batch_processing_complete_audit_pending", "batch_error:archive unavailable", "stopped"):
+            with self.subTest(status=status):
+                self.dashboard.reset()
+                self.dashboard.finish(stats, status)
+                self.assertNotEqual(self.dashboard.state_label.cget("text"), "Completed with exclusions")
+        self.dashboard.finish(stats, "batch_applied:1.0|2.0")
+        self.assertEqual(self.dashboard.state_label.cget("text"), "Completed with exclusions")
+
+
 if __name__ == "__main__":
     unittest.main()
