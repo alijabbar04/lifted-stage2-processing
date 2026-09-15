@@ -319,7 +319,7 @@ BATCH_SIZE = 30
 # on the "advanced models" setting AND confirms an extra warning.
 SAFE_MODELS = {
     "Haiku  (cheapest)":  {"id": "claude-haiku-4-5",  "in": 1.00, "out": 5.00},
-    "Sonnet (balanced)":  {"id": "claude-sonnet-4-6", "in": 3.00, "out": 15.00},
+    "Sonnet (balanced)":  {"id": "claude-sonnet-5",   "in": 2.00, "out": 10.00},
 }
 ADVANCED_MODELS = {
     "Opus   (most able, EXPENSIVE)": {"id": "claude-opus-4-8", "in": 5.00, "out": 25.00},
@@ -6083,7 +6083,11 @@ ROTATION_RETRY_NOTE = (
 # When the primary (cheap) model can't settle a document - no match, or
 # confidence below this threshold - ONE follow-up call is made to a stronger
 # model. Only the handful of hard documents per run pay the higher price.
-SECOND_OPINION_MODEL_ID = "claude-sonnet-4-6"
+# NOTE: this id must also appear in MODELS (SAFE_MODELS above). The escalation
+# gate compares MODELS_BY_ID[...]["in"] against the primary model's price and
+# falls back to 0.0 when the id is absent - so an id missing from MODELS does
+# not merely misprice the follow-up, it silently disables escalation entirely.
+SECOND_OPINION_MODEL_ID = "claude-sonnet-5"
 SECOND_OPINION_MAX_CONF = 40
 
 

@@ -69,7 +69,10 @@ PRICES = [
     ("haiku-4-5", 1.00, 5.00),
     ("haiku", 1.00, 5.00),
     ("sonnet-4-6", 3.00, 15.00),
-    ("sonnet-5", 3.00, 15.00),
+    ("sonnet-5", 2.00, 10.00),
+    # Bare "sonnet" is the catch-all for a variant not listed above. It keeps
+    # the older, dearer rate on purpose: over-reporting an unknown model is
+    # safe, under-reporting it hides real spend.
     ("sonnet", 3.00, 15.00),
     ("opus-4-8", 15.00, 75.00),
     ("opus", 15.00, 75.00),

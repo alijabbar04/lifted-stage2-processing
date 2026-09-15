@@ -188,7 +188,7 @@ class TestDiscountedFollowupState(unittest.TestCase):
             worker = root / "Worker"
             worker.mkdir()
             primary = FakeBatchAPI("claude-haiku-4-5")
-            stronger = FakeBatchAPI("claude-sonnet-4-6")
+            stronger = FakeBatchAPI(app.SECOND_OPINION_MODEL_ID)
             state = app.BatchState(root)
             state.init("Home", primary.model_id, 1.0, {})
             unresolved = []
@@ -216,7 +216,7 @@ class TestDiscountedFollowupState(unittest.TestCase):
             self.assertEqual(len(submitted), 3)
             self.assertEqual(len({item["custom_id"] for item in submitted}), 3)
             self.assertTrue(all(item["params"]["model"]
-                                == "claude-sonnet-4-6" for item in submitted))
+                                == app.SECOND_OPINION_MODEL_ID for item in submitted))
             primary.classify.assert_not_called()
             stronger.classify.assert_not_called()
 
@@ -226,7 +226,7 @@ class TestDiscountedFollowupState(unittest.TestCase):
             worker = root / "Worker"
             worker.mkdir()
             primary = FakeBatchAPI("claude-haiku-4-5")
-            stronger = FakeBatchAPI("claude-sonnet-4-6")
+            stronger = FakeBatchAPI(app.SECOND_OPINION_MODEL_ID)
             state = app.BatchState(root)
             state.init("Home", primary.model_id, 1.0, {})
             unresolved = []
@@ -284,7 +284,7 @@ class TestDiscountedFollowupState(unittest.TestCase):
             worker = root / "Worker"
             worker.mkdir()
             primary = FakeBatchAPI("claude-haiku-4-5")
-            stronger = FakeBatchAPI("claude-sonnet-4-6")
+            stronger = FakeBatchAPI(app.SECOND_OPINION_MODEL_ID)
             state = app.BatchState(root)
             state.init("Home", primary.model_id, 1.0, {})
             unresolved = []
@@ -339,7 +339,7 @@ class TestDiscountedFollowupState(unittest.TestCase):
             worker = root / "Worker"
             worker.mkdir()
             primary = FakeBatchAPI("claude-haiku-4-5")
-            stronger = FakeBatchAPI("claude-sonnet-4-6")
+            stronger = FakeBatchAPI(app.SECOND_OPINION_MODEL_ID)
             state = app.BatchState(root)
             state.init("Home", primary.model_id, 1.0, {})
             unresolved = []
@@ -427,7 +427,7 @@ class TestDiscountedFollowupState(unittest.TestCase):
             path.write_bytes(b"doc")
             digest = app.file_hash(path)
             primary = FakeBatchAPI("claude-haiku-4-5")
-            stronger = FakeBatchAPI("claude-sonnet-4-6")
+            stronger = FakeBatchAPI(app.SECOND_OPINION_MODEL_ID)
             state = app.BatchState(root)
             state.init("Home", primary.model_id, 1.0, {})
             state.add_request("primary-0", path, worker, digest, 1)
@@ -469,7 +469,7 @@ class TestDiscountedFollowupState(unittest.TestCase):
             path.write_bytes(b"offline-pdf")
             digest = app.file_hash(path)
             primary = FakeBatchAPI("claude-haiku-4-5")
-            stronger = FakeBatchAPI("claude-sonnet-4-6")
+            stronger = FakeBatchAPI(app.SECOND_OPINION_MODEL_ID)
             primary.status_by_id["primary-batch"] = {
                 "id": "primary-batch", "processing_status": "ended",
                 "results_url": "primary-results",
@@ -609,7 +609,7 @@ class TestDiscountedFollowupState(unittest.TestCase):
                 path = worker / "query.pdf"
                 path.write_bytes(b"offline-pdf")
                 primary = FakeBatchAPI("claude-haiku-4-5")
-                stronger = FakeBatchAPI("claude-sonnet-4-6")
+                stronger = FakeBatchAPI(app.SECOND_OPINION_MODEL_ID)
                 primary.status_by_id["primary-batch"] = {
                     "id": "primary-batch", "processing_status": "ended",
                     "results_url": "primary-results",
@@ -708,7 +708,7 @@ class TestCumulativeCostEstimate(unittest.TestCase):
 
     def test_every_enabled_phase_is_separate_and_in_total(self):
         est = app.estimate_pipeline_costs_gbp(
-            100, "claude-haiku-4-5", "claude-sonnet-4-6", 1.5,
+            100, "claude-haiku-4-5", app.SECOND_OPINION_MODEL_ID, 1.5,
             StubKB().vocabulary_block(), batch=True, include_audit=True)
         for key in ("primary_gbp", "finishing_gbp",
                     "followup_reserve_gbp", "audit_gbp"):
@@ -724,7 +724,7 @@ class TestCumulativeCostEstimate(unittest.TestCase):
             worker.mkdir()
             (worker / "Passport.pdf").write_bytes(b"offline")
             primary = FakeBatchAPI("claude-haiku-4-5")
-            stronger = FakeBatchAPI("claude-sonnet-4-6")
+            stronger = FakeBatchAPI(app.SECOND_OPINION_MODEL_ID)
             engine = app.Engine(
                 root, StubKB(), primary, "Home", log=lambda _m: None,
                 set_status=lambda _m: None, set_progress=lambda *_a: None,
