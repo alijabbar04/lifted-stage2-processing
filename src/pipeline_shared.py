@@ -20,7 +20,7 @@ from collections import Counter
 from difflib import SequenceMatcher
 
 CONTRACT_VERSION = "1"
-BUILD_VERSION = "2026.09.04-rc1"
+BUILD_VERSION = "2026.09.15"
 FIELDS = ["schema_version", "worker_key", "care_home", "agency_name",
           "folder_name", "original_folder_name", "source_path", "file_count",
           "duplicate_flag", "status", "matched_name", "matched_id", "score",
@@ -207,8 +207,9 @@ def merge_rows(existing, updates, owned_fields=None, care_home="", root=None):
         if len(candidates) > 1:
             raise ValueError(f"Duplicate roster rows for {update.get('folder_name')}; review before saving.")
         row = result[candidates[0]] if candidates else {}
+        is_new = not candidates
         for k, v in update.items():
-            if owned_fields is None or k in owned_fields or not row:
+            if owned_fields is None or k in owned_fields or is_new:
                 row[k] = v
         row.setdefault("folder_name", update.get("folder_name", ""))
         row.setdefault("original_folder_name", row["folder_name"])
@@ -218,7 +219,7 @@ def merge_rows(existing, updates, owned_fields=None, care_home="", root=None):
             row["worker_key"] = str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
         row["schema_version"] = CONTRACT_VERSION
         row["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        if not candidates:
+        if is_new:
             result.append(row)
     return result
 
@@ -439,14 +440,19 @@ def save_settings(stage, **updates):
             os.unlink(temp)
 
 
-def build_identity(stage):
+def build_identity(stage, app_version=None):
+    version = str(app_version or BUILD_VERSION)
+    pipeline_version = (f" | pipeline {BUILD_VERSION}"
+                        if app_version and version != BUILD_VERSION else "")
     import sys
     if getattr(sys, "frozen", False):
         hasher = hashlib.sha256()
         with Path(sys.executable).open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 hasher.update(block)
-        return f"{stage} {BUILD_VERSION} | roster v{CONTRACT_VERSION} | executable {hasher.hexdigest()[:16]}"
+        return (f"{stage} {version}{pipeline_version} | roster "
+                f"v{CONTRACT_VERSION} | executable {hasher.hexdigest()[:16]}")
     source = Path(__file__)
     digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12] if source.exists() else "bundled"
-    return f"{stage} {BUILD_VERSION} | roster v{CONTRACT_VERSION} | shared {digest}"
+    return (f"{stage} {version}{pipeline_version} | roster "
+            f"v{CONTRACT_VERSION} | shared {digest}")
