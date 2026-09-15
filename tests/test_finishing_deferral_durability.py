@@ -431,7 +431,7 @@ class TestDeferralSurvivesTheBatchWorkflow(unittest.TestCase):
                 ops = state["finishing_operations"]
                 failed = [op for op in ops.values() if op["status"] == "failed"]
                 self.assertEqual(len(failed), 1)
-                self.assertIn("synthetic quality outage", failed[0]["error"])
+                self.assertIn("finishing evidence unavailable", failed[0]["error"])
                 self.assertEqual(info["operations"], 1)
                 self.assertEqual(info["blocked"], 0)
                 self.assertTrue(info["token"])
@@ -473,7 +473,7 @@ class TestDeferralSurvivesTheBatchWorkflow(unittest.TestCase):
                                  "the completed DBS family is not re-ranked")
                 # unresolved rows are re-recorded for this pass, nothing else
                 self.assertEqual(len(f.failed_rows()), rows_before + 2)
-                self.assertTrue(any("no answer recorded (RuntimeError: synthetic quality outage)" in line
+                self.assertTrue(any("no answer recorded (RuntimeError: finishing evidence unavailable)" in line
                                     for line in f.logs))
                 self.assertEqual(info["token"], f.engine(second).assess_unresolved_finishing()["token"])
             finally:
@@ -547,7 +547,7 @@ class TestDeferralSurvivesTheBatchWorkflow(unittest.TestCase):
                 self.assertEqual(op["retry_of"], first_attempt)
                 self.assertEqual([a["attempt_id"] for a in op["attempts"]], [first_attempt])
                 self.assertEqual(op["attempts"][0]["status"], "failed")
-                self.assertIn("synthetic quality outage", op["attempts"][0]["error"])
+                self.assertIn("finishing evidence unavailable", op["attempts"][0]["error"])
                 retries = f.saved()["finishing_retries"]
                 self.assertEqual(len(retries), 1)
                 self.assertEqual(retries[0]["token"], first_info["token"])
@@ -870,7 +870,7 @@ class TestUnavailableQualityIsNotScoreZero(unittest.TestCase):
                 self.assertEqual(len(f.api.quality_calls), 2, "the peer is still assessed once")
                 self.assertEqual([d["name"] for d in outcome["deferred"]], ["DBS Document"])
                 self.assertEqual(outcome["deferred"][0]["unavailable"][0]["kind"], "quality:DBS Document")
-                self.assertTrue(any("quality assessment unavailable (RuntimeError: synthetic quality outage)" in line
+                self.assertTrue(any("quality assessment unavailable (RuntimeError: finishing evidence unavailable)" in line
                                     for line in f.logs))
                 self.assertTrue(any("ranking deferred, names unchanged" in line for line in f.logs))
             finally:

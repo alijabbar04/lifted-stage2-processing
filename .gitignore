@@ -1,4 +1,6 @@
 # Python
+.test-*/
+.stage2-source-recovery/
 __pycache__/
 *.pyc
 *.pyo

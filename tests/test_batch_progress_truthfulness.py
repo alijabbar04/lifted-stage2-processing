@@ -1,7 +1,7 @@
 """Isolated real-method control-flow tests: no app launch, model or real documents.
 
-AST extraction avoids importing application startup during inactive patch QA.
-After integration also run the existing full engine/recovery and isolated Tk tests.
+AST extraction isolates engine control flow; the inactive application loader
+supplies real durable state and local recovery for synthetic PDF fixtures.
 """
 import ast
 import copy
@@ -16,6 +16,13 @@ import traceback
 from types import SimpleNamespace
 
 import pytest
+import fitz
+
+from _load_app import load_app
+
+app = load_app()
+source_recovery = app.source_recovery
+APP_VERSION, APP_BUILD = app.APP_VERSION, app.APP_BUILD
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "Stage2_Processing.pyw"
 
@@ -74,44 +81,31 @@ def fixture(tmp_path, *, convert=None, orientation=None, submit=None, save_accep
         for index in range(documents_per_worker):
             name = "synthetic.pdf" if documents_per_worker == 1 else f"synthetic-{index}.pdf"
             path = worker / name
-            path.write_bytes(b"synthetic only")
+            with fitz.open() as document:
+                document.new_page().insert_text((40, 40), f"Synthetic {worker.name} {index}")
+                document.save(path)
             documents[worker].append(path)
 
-    class BatchState:
+    class BatchState(app.BatchState):
         def __init__(self, root):
-            self.path = SimpleNamespace(exists=lambda: state_box["persisted"])
-            self.data = copy.deepcopy(state_box["stored"]) if state_box["persisted"] else {}
-            self.batches = []
-
-        def exists(self):
-            return actual_batch_state_exists(self.data)
-
-        def init(self, *args):
-            self.data = {}
+            super().__init__(root)
 
         def save(self):
             saves.append(self.data.get("primary_submission", {}).get("status"))
             if not save_accepted and saves[-1] == "accepted":
                 return False
-            if not save_terminal_marker and saves[-1] == "nothing_renderable":
+            if not save_terminal_marker and self.data.get("source_recovery", {}).get("preflight_complete"):
                 return False
+            saved = super().save()
             state_box["stored"] = copy.deepcopy(self.data)
-            state_box["persisted"] = True
-            return True
+            state_box["persisted"] = self.path.exists()
+            return saved
 
         def delete(self):
             state_box["deletes"] += 1
             if delete_works:
+                super().delete()
                 state_box["persisted"] = False
-
-        def add_request(self, *args):
-            pass
-
-        def add_batch(self, bid, *args, **kwargs):
-            self.batches.append(bid)
-
-        def batch_ids(self):
-            return self.batches
 
     def conversion(worker, log, stop):
         # No folder is marked finished while its conversion pass is running.
@@ -132,9 +126,13 @@ def fixture(tmp_path, *, convert=None, orientation=None, submit=None, save_accep
         return {}
 
     def post(chunk):
-        assert events[-1]["state"] == "submitting"
-        assert events[-1]["accepted"] == sum(map(len, sent))
+        # New contract: preflight progress is local only. The immutable scope
+        # and reopened started marker authorize the separately confirmed POST.
         assert saves[-1] == "submission_started"
+        durable = app.BatchState(tmp_path).data
+        assert durable["source_recovery"]["preflight_complete"] is True
+        assert durable["primary_submission"]["status"] == "submission_started"
+        assert durable["source_recovery"]["scopes"][-1]["status"] == "submission_started"
         if submit:
             submit(chunk)
         sent.append(list(chunk))
@@ -145,7 +143,9 @@ def fixture(tmp_path, *, convert=None, orientation=None, submit=None, save_accep
         PdfConverter=SimpleNamespace(convert_worker=conversion),
         flatten_worker=lambda worker, log: 0,
         list_worker_docs=lambda worker: documents[worker],
-        file_hash=lambda path: hashlib.sha256(str(path).encode()).hexdigest(),
+        file_hash=app.file_hash,
+        is_program_file=app.is_program_file, _is_junk=app._is_junk,
+        natural_key=app.natural_key,
         DocRender=SimpleNamespace(page_count=lambda path: 1),
         estimate_pipeline_costs_gbp=lambda *a, **k: defaultdict(float, gbp=1))
     Engine = extract_class("Engine", {"_activity", "_phase", "_phase_progress", "run_batch_submit"}, namespace)
@@ -177,6 +177,7 @@ def fixture(tmp_path, *, convert=None, orientation=None, submit=None, save_accep
     engine.BATCH_SUBMIT_MAX_BYTES = 100000
     engine.BATCH_SUBMIT_MAX_REQUESTS = 2
     engine._state_probe = state_box
+    engine._recovery_state = lambda: BatchState(tmp_path)
     def record_source_exception(state, cid, meta, reason, detail=""):
         state.data.setdefault("primary_render_exclusions", {})[cid] = {
             "schema": "stage2-primary-source-exception/v1",
@@ -199,21 +200,49 @@ def fixture(tmp_path, *, convert=None, orientation=None, submit=None, save_accep
     return engine, events, statuses, sent
 
 
-def test_five_preparation_passes_then_explicit_scanning_and_durable_acceptance(tmp_path):
+def recovery_for(engine):
+    return source_recovery.Recovery(engine._recovery_state(), APP_VERSION, APP_BUILD)
+
+
+def submit_confirmed_ready(engine, *, allow_partial=False):
+    recovery = recovery_for(engine)
+    ids = [cid for cid, row in recovery.data["records"].items()
+           if row["state"] in source_recovery.READY]
+    return source_recovery.submit_ready(recovery, ids, recovery.token(ids),
+        engine.api, engine.kb.vocabulary_block(), allow_partial=allow_partial,
+        max_requests=engine.BATCH_SUBMIT_MAX_REQUESTS,
+        max_bytes=engine.BATCH_SUBMIT_MAX_BYTES)
+
+
+def worker_scan(events):
+    return [e for e in events if e.get("phase") == "scanning"
+            and e.get("kind") == "run_progress" and "documents" in e]
+
+
+def test_five_preparation_passes_then_whole_scope_local_evidence_before_confirmation(tmp_path):
     engine, events, statuses, sent = fixture(tmp_path)
     engine.run_batch_submit()
-    assert statuses[-1].startswith("batch_submitted:5|3|")
-    assert [len(chunk) for chunk in sent] == [2, 2, 1]
+    assert statuses[-1].startswith("batch_source_attention:")
+    assert sent == []
+    recovery = recovery_for(engine)
+    assert recovery.data["preflight_complete"] is True
+    assert recovery.summary()["ready"] == 5
+    assert recovery.state.data["primary_submission_complete"] is False
     prep = [e for e in events if e.get("phase") == "preparing" and e.get("kind") == "run_progress"]
     assert [e["completed"] for e in prep] == [0, 1, 2, 3, 4, 5, 5]
     assert prep[-1]["state"] == "complete"
-    scan = [e for e in events if e.get("phase") == "scanning" and e.get("kind") == "run_progress"]
+    scan = worker_scan(events)
     assert scan[-1]["completed"] == scan[-1]["total"] == 5
     assert scan[-1]["documents"] == 5
     accepted = [e["accepted"] for e in events if e.get("state") == "submitted"]
-    assert accepted == [2, 4, 5, 5]
-    # No document/page events are notifications. Only three phase milestones.
-    assert [e["phase"] for e in events if e["kind"] == "phase_started"] == ["preparing", "scanning", "batch"]
+    assert accepted == []
+    phases = [e["phase"] for e in events if e["kind"] == "phase_started"]
+    assert phases == ["preparing", "scanning", "source_preflight"]
+    assert len(submit_confirmed_ready(engine)) == 5
+    assert [len(chunk) for chunk in sent] == [2, 2, 1]
+    durable = recovery_for(engine)
+    assert [s["status"] for s in durable.data["scopes"]] == ["accepted"] * 3
+    assert durable.summary()["submitted"] == 5
 
 
 def test_stop_during_conversion_never_claims_five_passes_or_starts_scan(tmp_path):
@@ -241,11 +270,14 @@ def test_file_limit_credits_a_completed_worker_but_remains_limited_for_later_wor
     engine, events, statuses, sent = fixture(tmp_path)
     engine.max_files = 1
     engine.run_batch_submit()
-    scan = [e for e in events if e.get("phase") == "scanning" and e.get("kind") == "run_progress"]
+    scan = worker_scan(events)
     assert scan[-1]["state"] == "limited"
     assert scan[-1]["completed"] == 1 and scan[-1]["total"] == 5
     assert scan[-1]["documents"] == 1
-    assert statuses[-1].startswith("batch_submitted:1|1|")
+    assert statuses[-1].startswith("limit:")
+    assert "scope" in statuses[-1].lower()
+    assert not engine._state_probe["persisted"] and sent == []
+    assert len(list(tmp_path.glob("Synthetic-*/*.pdf"))) == 5
 
 
 def test_file_limit_inside_worker_does_not_credit_partial_worker(tmp_path):
@@ -253,11 +285,14 @@ def test_file_limit_inside_worker_does_not_credit_partial_worker(tmp_path):
                                               documents_per_worker=2)
     engine.max_files = 1
     engine.run_batch_submit()
-    scan = [e for e in events if e.get("phase") == "scanning" and e.get("kind") == "run_progress"]
+    scan = worker_scan(events)
     assert scan[-1]["state"] == "limited"
     assert scan[-1]["completed"] == 0 and scan[-1]["total"] == 2
     assert scan[-1]["documents"] == 1
-    assert statuses[-1].startswith("batch_submitted:1|1|")
+    assert statuses[-1].startswith("limit:")
+    assert "scope" in statuses[-1].lower()
+    assert not engine._state_probe["persisted"] and sent == []
+    assert len(list(tmp_path.glob("Synthetic-*/*.pdf"))) == 4
 
 
 def test_file_limit_at_last_eligible_document_completes_final_worker(tmp_path):
@@ -265,11 +300,12 @@ def test_file_limit_at_last_eligible_document_completes_final_worker(tmp_path):
                                               documents_per_worker=2)
     engine.max_files = 4
     engine.run_batch_submit()
-    scan = [e for e in events if e.get("phase") == "scanning" and e.get("kind") == "run_progress"]
+    scan = worker_scan(events)
     assert scan[-1]["state"] == "complete"
     assert scan[-1]["completed"] == scan[-1]["total"] == 2
     assert scan[-1]["documents"] == 4
-    assert statuses[-1].startswith("batch_submitted:4|2|")
+    assert statuses[-1].startswith("batch_source_attention:")
+    assert recovery_for(engine).summary()["ready"] == 4 and sent == []
 
 
 def test_stop_during_orientation_does_not_complete_scan_or_submit(tmp_path):
@@ -289,21 +325,53 @@ def test_ambiguous_or_unpersisted_submission_never_claims_accepted(tmp_path, sav
             raise OSError("synthetic connection failure")
     engine, events, statuses, sent = fixture(tmp_path, submit=submit, save_accepted=save_accepted)
     engine.run_batch_submit()
+    assert sent == []
+    with pytest.raises(source_recovery.RecoveryError):
+        submit_confirmed_ready(engine)
+    durable = recovery_for(engine)
+    assert durable.data["scopes"][-1]["status"] in {"submission_started", "ambiguous"}
     assert not any(e.get("accepted", 0) > 0 for e in events)
     assert not any(e.get("state") == "submitted" for e in events)
     assert not statuses[-1].startswith("batch_submitted:")
 
 
+def test_last_worker_locked_pdf_blocks_paid_earlier_ready_chunks(tmp_path):
+    engine, events, statuses, sent = fixture(tmp_path)
+    target = tmp_path / "Synthetic-4" / "synthetic.pdf"
+    with fitz.open() as document:
+        for index in range(40):
+            document.new_page().insert_text((40, 40), f"Synthetic locked page {index}")
+        document.save(target, encryption=fitz.PDF_ENCRYPT_AES_256,
+                      owner_pw="synthetic-owner", user_pw="synthetic-unlock")
+    engine.run_batch_submit()
+    assert statuses[-1].startswith("batch_source_attention:")
+    recovery = recovery_for(engine)
+    assert recovery.data["preflight_complete"] is True
+    assert recovery.summary()["ready"] == 4
+    assert recovery.summary()["locked"] == 1
+    assert sent == []
+    with pytest.raises(source_recovery.RecoveryError, match="Waiting"):
+        submit_confirmed_ready(engine)
+    assert sent == []
+
+
 def test_outbound_dispatch_ignores_all_per_document_progress(tmp_path):
     engine, events, statuses, sent = fixture(tmp_path)
     engine.run_batch_submit()
+    assert sent == []
+    local_event_count = len(events)
+    submit_confirmed_ready(engine)
+    assert len(sent) == 3
+    assert len(events) == local_event_count  # No fabricated per-file upload events.
     App = extract_class("App", {"_activity_main"}, {})
     outbound = []
     observer = SimpleNamespace(dashboard=SimpleNamespace(activity_event=lambda event: None),
                                _notify=lambda kind, **data: outbound.append((kind, data)))
     for event in events:
         App._activity_main(observer, event)
-    assert [kind for kind, data in outbound] == ["phase_started"] * 3
+    milestones = [event for event in events if event["kind"] == "phase_started"]
+    assert [kind for kind, data in outbound] == ["phase_started"] * len(milestones)
+    assert [event["phase"] for event in milestones] == ["preparing", "scanning", "source_preflight"]
     assert all(set(data) == {"phase"} for kind, data in outbound)
 
 
@@ -351,8 +419,9 @@ def test_skip_completed_destination_still_finishes_preparation_and_scan_passes(t
     engine.move_mode = True
     engine.run_batch_submit()
     assert engine.stats["skipped_done"] == 1
-    assert statuses[-1].startswith("batch_submitted:4|2|")
-    scan = [e for e in events if e.get("phase") == "scanning" and e.get("kind") == "run_progress"]
+    assert statuses[-1].startswith("batch_source_attention:")
+    assert recovery_for(engine).summary()["ready"] == 4 and sent == []
+    scan = worker_scan(events)
     assert scan[-1]["completed"] == 5 and scan[-1]["documents"] == 4
 
 
@@ -362,9 +431,11 @@ def test_unrenderable_document_does_not_count_as_prepared_or_accepted(tmp_path):
         ([], "", [0], 1, False) if path.parent.name == "Synthetic-4"
         else ([], "synthetic text", [0], 1, False))
     engine.run_batch_submit()
-    assert statuses[-1].startswith("batch_submitted:4|2|")
-    assert events[-1]["completed"] == 4 and events[-1]["total"] == 5
-    assert events[-1]["accepted"] == 4
+    assert statuses[-1].startswith("batch_source_attention:")
+    assert sent == []
+    summary = recovery_for(engine).summary()
+    assert summary["ready"] == 4 and summary["unresolved"] == 1
+    assert summary["submitted"] == 0
 
 
 def test_all_unrenderable_documents_need_attention_without_pending_or_submission(tmp_path):
@@ -375,89 +446,100 @@ def test_all_unrenderable_documents_need_attention_without_pending_or_submission
     assert sent == []
     assert engine._state_probe["deletes"] == 0
     assert engine._state_probe["persisted"]
-    assert engine._state_probe["stored"]["phase"] == "primary_nothing_renderable"
-    assert engine._state_probe["stored"]["primary_submission"]["status"] == "nothing_renderable"
-    assert engine._state_probe["stored"]["primary_submission_complete"] is True
+    assert engine._state_probe["stored"]["phase"] == "waiting_source_recovery"
+    assert not engine._state_probe["stored"].get("primary_submission")
+    assert engine._state_probe["stored"]["primary_submission_complete"] is False
     assert len(engine._state_probe["stored"]["primary_render_exclusions"]) == 5
-    assert events[-1].get("state") == "attention"
-    assert events[-1].get("accepted") == 0
+    assert recovery_for(engine).summary()["unresolved"] == 5
+    assert not any(event.get("accepted", 0) for event in events)
     assert not any(event.get("state") == "submitted" for event in events)
 
 
-def test_all_missing_documents_need_attention_and_can_retry(tmp_path):
+def test_all_missing_documents_need_attention_and_can_retry(tmp_path, monkeypatch):
     engine, events, statuses, sent = fixture(tmp_path)
-    original_progress = engine._phase_progress
-    removed = False
+    original_inspect = source_recovery.inspect_source
+    inspected = 0
+    originals = {p: p.read_bytes() for p in tmp_path.glob("Synthetic-*/*.pdf")}
 
-    def remove_sources_before_render(phase, done, total, **details):
-        nonlocal removed
-        if phase == "batch" and details.get("state") == "rendering" and not removed:
-            removed = True
+    def remove_sources_before_preflight(path, expected_hash=None, **kwargs):
+        nonlocal inspected
+        inspected += 1
+        if inspected == 6:  # Inventory scan finished; durable local preflight starts.
             for worker in tmp_path.glob("Synthetic-*"):
                 (worker / "synthetic.pdf").unlink()
-        return original_progress(phase, done, total, **details)
+        return original_inspect(path, expected_hash, **kwargs)
 
-    engine._phase_progress = remove_sources_before_render
+    monkeypatch.setattr(source_recovery, "inspect_source", remove_sources_before_preflight)
     engine.run_batch_submit()
     assert statuses[-1].startswith("batch_source_attention:")
     assert sent == [] and engine._state_probe["deletes"] == 0
-    for worker in tmp_path.glob("Synthetic-*"):
-        (worker / "synthetic.pdf").write_bytes(b"restored synthetic only")
-    engine._phase_progress = original_progress
+    assert all(row["cause"] == "source_missing" for row in recovery_for(engine).data["records"].values())
+    for path, payload in originals.items():
+        path.write_bytes(payload)
+    monkeypatch.setattr(source_recovery, "inspect_source", original_inspect)
     engine.run_batch_submit()
     assert statuses[-1] == "batch_already_pending"
     assert sent == []
+    recovery = recovery_for(engine)
+    recovery.preflight(engine._batch_classification_view)
+    assert recovery.summary()["ready"] == 5
+    assert sent == []  # Restoration still requires a new explicit paid decision.
 
 
-def test_retained_nothing_renderable_marker_is_nonpending_and_retryable(tmp_path):
+def test_retained_unrenderable_queue_remains_pending_and_locally_retryable(tmp_path):
     engine, events, statuses, sent = fixture(tmp_path, delete_works=False)
     engine._batch_classification_view = lambda path: ([], "", [0], 1, False)
     engine.run_batch_submit()
     retained = engine._state_probe["stored"]
     assert statuses[-1].startswith("batch_source_attention:")
     assert engine._state_probe["persisted"] and engine._state_probe["deletes"] == 0
-    assert retained["primary_submission"]["status"] == "nothing_renderable"
+    assert retained["phase"] == "waiting_source_recovery"
     assert actual_batch_state_exists(retained)
-    assert not actual_primary_recovery_needed(retained)
     engine._batch_classification_view = lambda path: ([], "synthetic text", [0], 1, False)
     engine.run_batch_submit()
     assert statuses[-1] == "batch_already_pending"
     assert sent == []
+    recovery = recovery_for(engine)
+    recovery.preflight(engine._batch_classification_view)
+    assert recovery.summary()["ready"] == 5 and sent == []
 
 
-def test_terminal_marker_save_failure_never_emits_success_or_provider_wait(tmp_path):
+def test_preflight_completion_save_failure_never_emits_success_or_provider_wait(tmp_path):
     engine, events, statuses, sent = fixture(tmp_path, save_terminal_marker=False)
     engine._batch_classification_view = lambda path: ([], "", [0], 1, False)
     engine.run_batch_submit()
     retained = engine._state_probe["stored"]
-    assert statuses == ["batch_state_write_failed"]
+    assert len(statuses) == 1 and "did not persist" in statuses[0].lower()
     assert sent == []
     assert retained["primary_submission_complete"] is False
     assert actual_batch_state_exists(retained)
-    assert actual_primary_recovery_needed(retained)
+    assert retained["source_recovery"]["preflight_complete"] is False
     assert not any(event.get("state") in ("submitted", "attention") for event in events)
-    App = extract_class("App", {"_notify_done"}, {})
-    outbound = []
-    App._notify_done(SimpleNamespace(_notify=lambda kind, **data: outbound.append((kind, data))),
-                     {}, statuses[0])
-    assert outbound == [("blocked", {"reason": "general"})]
+    assert not any(status.startswith(("batch_submitted:", "batch_source_attention:")) for status in statuses)
 
 
-def test_mixed_renderable_and_unrenderable_documents_still_submit_actual_chunk(tmp_path):
+def test_mixed_scope_waits_by_default_then_explicit_partial_only_submits_ready(tmp_path):
     engine, events, statuses, sent = fixture(tmp_path)
     engine._batch_classification_view = lambda path: (
         ([], "", [0], 1, False) if path.parent.name in ("Synthetic-1", "Synthetic-3")
         else ([], "synthetic text", [0], 1, False))
     engine.run_batch_submit()
-    assert statuses[-1].startswith("batch_submitted:3|2|")
+    assert statuses[-1].startswith("batch_source_attention:")
+    assert sent == []
+    assert recovery_for(engine).summary()["unresolved"] == 2
+    with pytest.raises(source_recovery.RecoveryError, match="Waiting"):
+        submit_confirmed_ready(engine)
+    assert sent == []
+    assert len(submit_confirmed_ready(engine, allow_partial=True)) == 3
     assert [len(chunk) for chunk in sent] == [2, 1]
-    assert events[-1]["state"] == "submitted"
-    assert events[-1]["accepted"] == 3
+    summary = recovery_for(engine).summary()
+    assert summary["submitted"] == 3 and summary["unresolved"] == 2
+    assert summary["completed_workers"] == 0
 
 
 def test_zero_eligible_documents_finishes_scan_without_batch_submission(tmp_path):
     engine, events, statuses, sent = fixture(tmp_path)
-    engine._batch_skip_file = lambda *args: "synthetic skip"
+    engine.manifest.seen = lambda *args: {"name": "Synthetic", "group": "Other"}
     engine.run_batch_submit()
     assert events[-1]["phase"] == "scanning" and events[-1]["completed"] == 5
     assert events[-1]["documents"] == 5

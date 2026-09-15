@@ -135,5 +135,6 @@ def test_recovery_records_new_unrenderable_and_does_not_submit(tmp_path):
     engine._resume_primary_inventory(state, state.data["primary_inventory"], set())
     saved = app.BatchState(tmp_path).data
     assert cid in saved["primary_render_exclusions"]
-    assert saved["primary_submission_complete"] is True
+    assert saved["source_recovery"]["preflight_complete"] is True
+    assert not saved.get("primary_submission_complete")
     engine.api.submit_batch.assert_not_called()

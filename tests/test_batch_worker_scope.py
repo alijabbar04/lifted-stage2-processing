@@ -258,6 +258,12 @@ class TestBatchWorkerScope(unittest.TestCase):
                     return_value=(["image"], "text", [0], 1, False)):
                 engine.run_batch_submit()
 
+            api.submit_batch.assert_not_called()
+            controller = app.source_recovery.Recovery(app.BatchState(root), "test", "synthetic")
+            ids = list(controller.data["records"])
+            with self.assertRaises(app.source_recovery.RecoveryError):
+                app.source_recovery.submit_ready(controller, ids, controller.token(ids), api, "Passport")
+
             saved = app.BatchState(root).data
             self.assertEqual(saved["auto_review_run_id"], "review-run-five")
             self.assertEqual(
@@ -265,7 +271,7 @@ class TestBatchWorkerScope(unittest.TestCase):
                 [worker.name for worker in all_workers[:5]])
             self.assertEqual(saved["primary_submission"]["status"], "ambiguous")
             self.assertEqual(api.submit_batch.call_count, 1)
-            self.assertTrue(statuses[-1].startswith("batch_submit_failed:"))
+            self.assertTrue(statuses[-1].startswith("batch_source_attention:"))
 
             # Reopening the app binds only the marker saved with this batch.
             probe = SimpleNamespace(

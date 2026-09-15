@@ -94,16 +94,21 @@ class TestPrimarySubmissionSafety(unittest.TestCase):
             with patch.object(engine, "_batch_classification_view",
                               return_value=(["image"], "text", [0], 1, False)):
                 engine.run_batch_submit()
+            api.submit_batch.assert_not_called()
+            controller = app.source_recovery.Recovery(app.BatchState(root), "test", "synthetic")
+            ids = list(controller.data["records"])
+            with self.assertRaises(app.source_recovery.RecoveryError):
+                app.source_recovery.submit_ready(controller, ids, controller.token(ids), api, "Passport")
             self.assertEqual(api.submit_batch.call_count, 1)
             state = app.BatchState(root)
             marker = state.data["primary_submission"]
             self.assertEqual(marker["status"], "ambiguous")
-            self.assertEqual(marker["planned_chunk_id"], "primary-0001")
             self.assertEqual(len(marker["request_identities"]), 1)
-            self.assertTrue(marker["submission_started"])
+            self.assertTrue(marker["started_ts"])
             self.assertTrue(marker["attempt_id"])
             self.assertTrue(state.exists())
-            self.assertTrue(statuses[-1].startswith("batch_submit_failed:"))
+            self.assertTrue(statuses[-1].startswith("batch_source_attention:"))
+            self.assertEqual(state.data["source_recovery"]["scopes"][0]["status"], "ambiguous")
 
 
 class TestFinishingPersistence(unittest.TestCase):

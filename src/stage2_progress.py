@@ -91,6 +91,8 @@ class PhaseProgress:
         return max(0, int(elapsed / self.completed * (self.total - self.completed)))
 
     def caption(self):
+        if self.phase == "source_preflight":
+            return f"{self.completed:,} of {self.total:,} sources inspected locally · not submitted or processed"
         if self.phase == "downloading_results":
             return (f"{self.completed:,} of {self.total:,} result batches verified"
                     " · downloading saved answers, not submitting documents")

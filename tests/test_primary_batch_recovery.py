@@ -14,6 +14,22 @@ from _load_app import load_app
 from test_release_blockers_v131 import SubmitAPI, make_engine, FIXTURE
 
 app = load_app()
+recovery = app.source_recovery
+
+
+def fresh_ready_scope(f, unique=False):
+    """Synthetic explicit new scope; never re-authorizes an uncertain POST."""
+    if unique:
+        for index, meta in enumerate(f.meta.values()):
+            with Path(meta["path"]).open("ab") as stream:
+                stream.write(f"\n% synthetic unique {index}\n".encode())
+            meta["fhash"] = app.file_hash(Path(meta["path"]))
+    f.state.data.update(requests={}, batches=[], primary_inventory=dict(f.meta),
+                        primary_submission={}, primary_submission_complete=False)
+    f.state.save()
+    controller = recovery.Recovery(app.BatchState(f.root), "test", "synthetic")
+    controller.preflight(f.engine._batch_classification_view)
+    return controller
 
 
 class RecoveryFixture:
@@ -74,40 +90,38 @@ class TestPrimaryRecovery(unittest.TestCase):
     def test_assess_legacy_tail_is_read_only_and_preserves_duplicate_ids(self):
         with tempfile.TemporaryDirectory() as root:
             f = RecoveryFixture(root)
+            f.api.list_batches.return_value = {"data": [f.candidate()], "has_more": False}
             before = f.state.path.read_bytes()
             with patch.object(app, "cleanup_orientation_temp_files", side_effect=AssertionError("cleanup called")):
                 report = f.engine.recover_primary_submission()
             self.assertEqual(report["status"], "needs_authorization", report)
-            self.assertEqual((report["accepted"], report["remaining"], report["legacy_tail"]), (2, 2, 1))
+            self.assertEqual((report["accepted"], report["remaining"], report["legacy_tail"]), (3, 1, 1))
             self.assertEqual(before, f.state.path.read_bytes())
             self.assertFalse(list(f.root.glob("*.bak")))
             f.api.submit_batch.assert_not_called()
             self.assertFalse(f.statuses)
 
-    def test_authorized_no_match_snapshots_rechecks_and_submits_only_tail(self):
+    def test_authorized_no_match_never_retries_uncertain_request(self):
         with tempfile.TemporaryDirectory() as root:
             f = RecoveryFixture(root)
             before = f.state.path.read_bytes()
             report = f.engine.recover_primary_submission(True)
-            self.assertEqual(report["status"], "submitted", report)
-            self.assertEqual(f.api.list_batches.call_count, 2)
-            sent = f.api.submit_batch.call_args.args[0]
-            self.assertEqual({row["custom_id"] for row in sent}, set(f.ids[2:]))
-            state = app.BatchState(f.root).data
-            self.assertTrue(state["primary_submission_complete"])
-            self.assertEqual(len(state["primary_inventory"]), 4)
-            self.assertEqual(state["batches"][0]["id"], "known")
-            self.assertEqual(Path(report["snapshot"]).read_bytes(), before)
-            self.assertTrue(f.statuses[-1].startswith("batch_submitted:"))
+            self.assertEqual(report["status"], "blocked", report)
+            self.assertEqual(f.api.list_batches.call_count, 1)
+            f.api.submit_batch.assert_not_called()
+            self.assertEqual(f.state.path.read_bytes(), before)
+            self.assertEqual(app.BatchState(f.root).data["primary_submission"]["status"], "ambiguous")
 
-    def test_exact_provider_match_reuses_results_and_only_sends_unrendered_tail(self):
+    def test_exact_provider_match_retains_results_and_preflights_tail_without_post(self):
         with tempfile.TemporaryDirectory() as root:
             f = RecoveryFixture(root)
             f.api.list_batches.return_value = {"data": [f.candidate()], "has_more": False}
             report = f.engine.recover_primary_submission(True)
-            self.assertEqual(report["status"], "submitted", report)
-            self.assertEqual({row["custom_id"] for row in f.api.submit_batch.call_args.args[0]}, {f.ids[3]})
-            self.assertEqual(app.BatchState(f.root).batch_ids(), ["known", "candidate", "recovered"])
+            self.assertEqual(report["status"], "source_attention", report)
+            f.api.submit_batch.assert_not_called()
+            self.assertEqual(app.BatchState(f.root).batch_ids(), ["known", "candidate"])
+            self.assertTrue(app.BatchState(f.root).data["source_recovery"]["preflight_complete"])
+            self.assertTrue(Path(report["snapshot"]).is_file())
 
     def test_pending_candidate_blocks_without_mutation(self):
         with tempfile.TemporaryDirectory() as root:
@@ -136,15 +150,20 @@ class TestPrimaryRecovery(unittest.TestCase):
             f.api.list_batches.side_effect = [{"data": [], "has_more": False},
                 {"data": [f.candidate()], "has_more": False}]
             report = f.engine.recover_primary_submission(True)
-            self.assertEqual(report["status"], "submitted", report)
-            self.assertEqual({row["custom_id"] for row in f.api.submit_batch.call_args.args[0]}, {f.ids[3]})
+            self.assertEqual(report["status"], "blocked", report)
+            f.api.submit_batch.assert_not_called()
+            report = f.engine.recover_primary_submission(True)
+            self.assertEqual(report["status"], "source_attention", report)
+            f.api.submit_batch.assert_not_called()
+            self.assertEqual(app.BatchState(f.root).batch_ids(), ["known", "candidate"])
 
     def test_recovery_post_failure_stays_ambiguous_with_full_inventory(self):
         with tempfile.TemporaryDirectory() as root:
             f = RecoveryFixture(root)
+            controller = fresh_ready_scope(f, unique=True)
             f.api.submit_batch.side_effect = app.APIError(0, "network outcome unknown")
-            report = f.engine.recover_primary_submission(True)
-            self.assertEqual(report["status"], "blocked", report)
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.submit_ready(controller, f.ids[2:], controller.token(f.ids[2:]), f.api, "Passport")
             state = app.BatchState(f.root).data
             self.assertEqual(state["primary_submission"]["status"], "ambiguous")
             self.assertFalse(state["primary_submission_complete"])
@@ -179,6 +198,13 @@ class TestPrimaryRecovery(unittest.TestCase):
             f.engine.run_batch_submit()
             state = app.BatchState(f.root).data
             self.assertEqual(len(state["primary_inventory"]), 4)
+            self.assertEqual(len(state["requests"]), 0)
+            f.api.submit_batch.assert_not_called()
+            controller = recovery.Recovery(app.BatchState(f.root), "test", "synthetic")
+            ids = list(controller.data["records"])
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.submit_ready(controller, ids, controller.token(ids), f.api, "Passport", max_requests=1)
+            state = app.BatchState(f.root).data
             self.assertEqual(len(state["requests"]), 1)
             self.assertFalse(state["primary_submission_complete"])
             self.assertEqual(f.api.submit_batch.call_count, 1)
@@ -186,16 +212,16 @@ class TestPrimaryRecovery(unittest.TestCase):
     def test_clean_restart_skips_accepted_recovery_chunk_and_keeps_tail(self):
         with tempfile.TemporaryDirectory() as root:
             f = RecoveryFixture(root)
-            f.engine.BATCH_SUBMIT_MAX_REQUESTS = 1
+            controller = fresh_ready_scope(f, unique=True)
             f.api.submit_batch.side_effect = [
                 {"id": "first-recovery", "processing_status": "in_progress"},
                 app.APIError(0, "connection interrupted")]
-            report = f.engine.recover_primary_submission(True)
-            self.assertEqual(report["status"], "blocked", report)
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.submit_ready(controller, f.ids[2:], controller.token(f.ids[2:]), f.api, "Passport", max_requests=1)
             interrupted = app.BatchState(f.root).data
             self.assertEqual(interrupted["batches"][-1]["request_ids"], [f.ids[2]])
             self.assertEqual(interrupted["primary_submission"]["request_identities"], [f.ids[3]])
-            self.assertFalse(interrupted["primary_submission_complete"])
+            self.assertEqual(interrupted["primary_submission"]["status"], "ambiguous")
 
             restarted = make_engine(f.root, f.api)
             restarted.PRIMARY_RECOVERY_GRACE_SECONDS = 0
@@ -204,19 +230,16 @@ class TestPrimaryRecovery(unittest.TestCase):
                 return_value=([], "synthetic document", [0], 1, False))
             f.api.submit_batch.reset_mock(side_effect=True)
             f.api.submit_batch.return_value = {"id": "last-recovery", "processing_status": "in_progress"}
-            assessment = restarted.recover_primary_submission()
-            self.assertEqual((assessment["accepted"], assessment["remaining"]), (3, 1), assessment)
+            resumed = recovery.Recovery(app.BatchState(f.root), "test", "synthetic")
+            with self.assertRaises(recovery.RecoveryError):
+                recovery.submit_ready(resumed, [f.ids[3]], resumed.token([f.ids[3]]), f.api, "Passport")
             f.api.submit_batch.assert_not_called()
-            report = restarted.recover_primary_submission(True)
-            self.assertEqual(report["status"], "submitted", report)
-            self.assertEqual({row["custom_id"] for row in f.api.submit_batch.call_args.args[0]}, {f.ids[3]})
-            self.assertEqual(app.BatchState(f.root).batch_ids(),
-                             ["known", "first-recovery", "last-recovery"])
-            self.assertTrue(app.BatchState(f.root).data["primary_submission_complete"])
+            self.assertEqual(app.BatchState(f.root).batch_ids(), ["first-recovery"])
 
     def test_recovery_target_splits_chunks_below_the_hard_cap(self):
         with tempfile.TemporaryDirectory() as root:
             f = RecoveryFixture(root)
+            controller = fresh_ready_scope(f, unique=True)
             system, blocks, mt = f.api.classify_payload("Passport", [], "synthetic document")
             one_request = f.api.build_batch_request(f.ids[2], system, blocks, mt)
             one_wire_size = len(json.dumps({"requests": [one_request]}).encode("utf-8"))
@@ -226,19 +249,18 @@ class TestPrimaryRecovery(unittest.TestCase):
                 {"id": "small-2", "processing_status": "in_progress"}]
             statuses = []
             f.engine.set_status = statuses.append
-            report = f.engine.recover_primary_submission(True)
-            self.assertEqual(report["status"], "submitted", report)
+            recovery.submit_ready(controller, f.ids[2:], controller.token(f.ids[2:]), f.api, "Passport",
+                                  max_bytes=one_wire_size + 32)
             self.assertEqual(f.api.submit_batch.call_count, 2)
             sent_ids = []
             for call in f.api.submit_batch.call_args_list:
                 payload = call.args[0]
                 wire_size = len(json.dumps({"requests": payload}).encode("utf-8"))
-                self.assertLessEqual(wire_size, f.engine.PRIMARY_RECOVERY_TARGET_BYTES)
+                self.assertLessEqual(wire_size, one_wire_size + 32)
                 self.assertLessEqual(wire_size, f.engine.PRIMARY_RECOVERY_CHUNK_BYTES)
                 sent_ids.extend(row["custom_id"] for row in payload)
             self.assertEqual(sent_ids, f.ids[2:])
-            self.assertTrue(any(message.startswith("Uploading recovery chunk")
-                                and "MiB" in message for message in statuses))
+            self.assertEqual(len(controller.data["scopes"]), 2)
 
     def test_recovery_excludes_newly_unrenderable_tail_without_rebuilding_requests(self):
         with tempfile.TemporaryDirectory() as root:
@@ -246,19 +268,26 @@ class TestPrimaryRecovery(unittest.TestCase):
             bad = Path(f.meta[f.ids[2]]["path"])
             f.state.data["requests"].pop(f.ids[2])
             f.state.data["primary_submission"]["request_identities"] = [f.ids[3]]
+            f.state.data["requests"][f.ids[3]] = f.meta[f.ids[3]]
             f.state.save()
+            f.api.list_batches.return_value = {"data": [f.candidate()], "has_more": False}
+            f.api.get_batch.side_effect = lambda bid: (f.get_batch(bid) if bid == "known" else {
+                "id": bid, "processing_status": "ended", "results_url": "tail-candidate", "request_counts": {"succeeded": 1}})
+            f.api.batch_results.side_effect = lambda url: (f.results(url) if url == "known" else [
+                {"custom_id": f.ids[3], "result": {"type": "succeeded"}}])
             f.engine._batch_classification_view = Mock(
                 side_effect=lambda path: ([], "", [0], 1, False)
                 if Path(path) == bad
                 else ([], "synthetic document", [0], 1, False))
             report = f.engine.recover_primary_submission(True)
-            self.assertEqual(report["status"], "submitted", report)
+            self.assertEqual(report["status"], "source_attention", report)
             saved = app.BatchState(f.root).data
             self.assertIn(f.ids[2], saved["primary_render_exclusions"])
             self.assertNotIn(f.ids[2], saved["requests"])
             sent = [row["custom_id"] for call in f.api.submit_batch.call_args_list
                     for row in call.args[0]]
-            self.assertEqual(sent, [f.ids[3]])
+            self.assertEqual(sent, [])
+            self.assertIn(f.ids[3], saved["requests"])
 
     def test_recovery_all_excluded_is_source_attention_without_provider_submit(self):
         with tempfile.TemporaryDirectory() as root:
@@ -283,11 +312,10 @@ class TestPrimaryRecovery(unittest.TestCase):
     def test_single_request_above_target_is_allowed_without_downsampling(self):
         with tempfile.TemporaryDirectory() as root:
             f = RecoveryFixture(root)
-            f.api.list_batches.return_value = {"data": [f.candidate()], "has_more": False}
+            controller = fresh_ready_scope(f, unique=True)
             f.engine.PRIMARY_RECOVERY_TARGET_BYTES = 1
-            original_resolution = f.state.data["resolution"]
-            report = f.engine.recover_primary_submission(True)
-            self.assertEqual(report["status"], "submitted", report)
+            original_resolution = f.engine.resolution
+            recovery.submit_ready(controller, [f.ids[3]], controller.token([f.ids[3]]), f.api, "Passport")
             f.api.submit_batch.assert_called_once()
             payload = f.api.submit_batch.call_args.args[0]
             wire_size = len(json.dumps({"requests": payload}).encode("utf-8"))
@@ -316,6 +344,7 @@ class TestPrimaryRecovery(unittest.TestCase):
     def test_read_only_assessment_never_creates_a_writer_lock(self):
         with tempfile.TemporaryDirectory() as root:
             f = RecoveryFixture(root)
+            f.api.list_batches.return_value = {"data": [f.candidate()], "has_more": False}
             report = f.engine.recover_primary_submission(False)
             self.assertEqual(report["status"], "needs_authorization", report)
             self.assertFalse((f.root / app.CareHomeWriterLock.NAME).exists())

@@ -47,12 +47,13 @@ class _CapturedPost(BaseException):
     """Escapes an existing API helper before its live ``_post`` can run."""
 
     def __init__(self, system: str, blocks: list, max_tokens: int,
-                 cache_system: bool):
+                 cache_system: bool, output_schema=None):
         super().__init__("captured")
         self.system = system
         self.blocks = blocks
         self.max_tokens = max_tokens
         self.cache_system = cache_system
+        self.output_schema = output_schema
 
 
 def _now() -> str:
@@ -152,8 +153,8 @@ def _capture_params(api, method: str, args: tuple) -> dict:
     clone = copy.copy(api)
 
     def capture(_self, system, content_blocks, max_tokens=400,
-                cache_system=False):
-        raise _CapturedPost(system, content_blocks, max_tokens, cache_system)
+                cache_system=False, output_schema=None, single_attempt=False):
+        raise _CapturedPost(system, content_blocks, max_tokens, cache_system, output_schema)
 
     clone._post = MethodType(capture, clone)
     try:
@@ -161,13 +162,16 @@ def _capture_params(api, method: str, args: tuple) -> dict:
     except _CapturedPost as captured:
         system_field = clone._system_field(
             captured.system, captured.cache_system)
-        return {
+        params = {
             "model": clone.model_id,
             "max_tokens": captured.max_tokens,
             "temperature": 0,
             "system": system_field,
             "messages": [{"role": "user", "content": captured.blocks}],
         }
+        if captured.output_schema is not None:
+            params["output_config"] = {"format": {"type": "json_schema", "schema": captured.output_schema}}
+        return params
     raise BatchFinishingError(
         f"{method} returned without reaching ClaudeAPI._post")
 
@@ -546,7 +550,8 @@ def _replay_answer(api, operation: dict, raw: str):
     _strict_result_shape(api, operation, raw)
     clone = copy.copy(api)
 
-    def replay(_self, _system, _blocks, max_tokens=400, cache_system=False):
+    def replay(_self, _system, _blocks, max_tokens=400, cache_system=False,
+               output_schema=None, single_attempt=False):
         return raw
 
     clone._post = MethodType(replay, clone)

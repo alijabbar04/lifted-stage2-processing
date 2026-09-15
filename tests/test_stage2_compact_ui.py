@@ -35,7 +35,7 @@ class TestCompactDashboard(unittest.TestCase):
         app.care_home_dir = None
         app.move_dest = None
         for name in ("_open_jobs", "_open_reports", "_open_api_analytics", "_open_tools", "_open_settings",
-                     "_pick_folder", "_start", "_batch_check_status", "_stop", "_open_ai_workflow", "_flatten_only", "_toggle_console"):
+                     "_pick_folder", "_start", "_batch_check_status", "_open_source_recovery", "_stop", "_open_ai_workflow", "_flatten_only", "_toggle_console"):
             setattr(app, name, Mock())
         from PIL import Image
         png = io.BytesIO()

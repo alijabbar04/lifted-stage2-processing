@@ -286,6 +286,8 @@ class CompactDashboard:
         self.activity.pack(fill="both", expand=True)
         self.activity.bind("<Double-1>", lambda e:self.open_details())
 
+        app.source_recovery_btn = button(app, "Locked documents / source recovery", app._open_source_recovery, state="disabled")
+        app.source_recovery_btn.pack(anchor="w", padx=24, pady=(0, 8))
         footer_separator = separator(app)
         footer_separator.pack(fill="x")
         footer = tk.Frame(app, bg=BG)
@@ -548,6 +550,7 @@ class CompactDashboard:
             self.structured_progress = True
             self.progress.observe(event)
             titles = {"preparing":"Preparing worker folders", "batch":"Preparing batch requests",
+                      "source_preflight":"Whole-scope local source preflight · no submission",
                       "scanning":"Scanning documents · local orientation preflight",
                       "followup_plan":"Planning stronger-model follow-up",
                       "followup_upload":"Preparing stronger-model follow-up",
@@ -730,6 +733,13 @@ class CompactDashboard:
             self.review_var.set(str(stats["audit_flagged"]))
 
     def finish(self, stats, status):
+        if stats.get("terminal_outcome") == "completed_with_exclusions":
+            self._terminal_status = "completed_with_exclusions"
+            self.state_label.configure(text="Completed with exclusions")
+            self.phase_label.configure(text="Partial-scope outcome — not a full accuracy pass")
+            self.wait_label.configure(text=stats.get("source_exclusions", {}).get("statement", "Deliberately excluded sources were not processed or reviewed."))
+            self._sync_dashboard_visibility()
+            return
         if self.progress.phase == "audit":
             if self.progress.state not in ("complete", "skipped", "failed", "stopped"):
                 self.progress.observe({"phase":"audit", "state":"stopped" if status else "failed"})

@@ -30,6 +30,7 @@ MAX_ATTEMPTS = 3
 REQUEST_TIMEOUT = 15
 MAX_RETRY_DELAY = 30
 PHASES = {
+    "source_preflight": "Whole-scope local source preflight (not submitted or processed)",
     "preparing": "Preparing documents", "processing": "Processing documents",
     "scanning": "Local document scanning and orientation checks",
     "followup_plan": "Stronger-model follow-up planning",
@@ -50,8 +51,9 @@ REASONS = {
     "connection": "The service could not be reached after bounded retries.",
     "general": "Open Stage 2 for the details and next action.",
 }
-IMPORTANT = {"blocked", "error", "run_complete", "stopped", "audit_complete", "review_complete", "source_attention"}
+IMPORTANT = {"blocked", "error", "run_complete", "stopped", "audit_complete", "review_complete", "source_attention", "completed_with_exclusions"}
 EVENTS = {
+    "completed_with_exclusions",
     "test", "run_started", "phase_started", "phase_complete", "progress",
     "worker_complete", "batch_submitted", "batch_waiting", "followup_submitted",
     "long_wait", "audit_started", "audit_complete", "audit_skipped",
@@ -221,6 +223,7 @@ def format_event(event: str, **data) -> str:
     count = f"{completed:,} of {total:,}" if total else f"{completed:,}"
     reason = REASONS.get(data.get("reason"), REASONS["general"])
     templates = {
+        "completed_with_exclusions": f"Completed with exclusions: {documents:,} source document(s) across {workers:,} worker(s) deliberately excluded and not processed or reviewed. Retained archives and terminal receipt remain available. This is not full-scope completion; automatic review was not started.",
         "test": "Notifications are connected. Future updates will cover phase changes, progress, waiting, attention needed and completion. Document contents and worker names are not sent.",
         "run_started": f"Run started: {workers:,} worker folder(s). Preparing documents for processing.",
         "phase_started": f"{phase} started.",

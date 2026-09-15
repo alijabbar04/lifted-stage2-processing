@@ -151,6 +151,7 @@ import stage2_diagnostics
 from stage2_locking import (DOCUMENT_WRITER_LOCK, PathWriterLock,
                             WriterLockBusy)
 import batch_result_cache
+import stage2_source_recovery as source_recovery
 from local_orientation import (
     MODEL_NAME as ORIENTATION_MODEL_NAME,
     MODEL_REVISION as ORIENTATION_MODEL_REVISION,
@@ -1395,8 +1396,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.5.9"
-APP_BUILD = "2026.09.15-evidence1"
+APP_VERSION = "1.6.0"
+APP_BUILD = "2026.09.15-source-recovery1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -3138,7 +3139,7 @@ class UnreadableDocumentError(Exception):
 PRIMARY_SOURCE_EXCEPTION_SCHEMA = "stage2-primary-source-exception/v1"
 PRIMARY_SOURCE_EXCEPTION_REASONS = frozenset({
     "unreadable_source", "source_missing", "source_changed",
-})
+}) | source_recovery.CAUSES
 
 
 def _sanitize_api_error(status: int, raw_body: str):
@@ -3231,7 +3232,7 @@ class ClaudeAPI:
         return system
 
     def _post(self, system: str, content_blocks: list, max_tokens=400,
-              cache_system: bool = False):
+              cache_system: bool = False, output_schema=None, single_attempt=False):
         self._check_url()
         body = {
             "model": self.model_id,
@@ -3244,6 +3245,9 @@ class ClaudeAPI:
             "system": self._system_field(system, cache_system),
             "messages": [{"role": "user", "content": content_blocks}],
         }
+        if output_schema is not None:
+            body["output_config"] = {"format": {
+                "type": "json_schema", "schema": output_schema}}
         data = json.dumps(body).encode("utf-8")
         attempt = 0
         while True:
@@ -3265,13 +3269,15 @@ class ClaudeAPI:
                 # Console-only diagnostic (captured by the dev console / stdout).
                 # The API response never contains the key, so the message is safe
                 # to surface here and is the key clue for invalid_request errors.
-                print(f"[API {status}] {detail}")
+                print(f"[API {status}] {label if single_attempt else detail}")
                 # Out-of-credit / billing-blocked is an ACCOUNT problem, not a
                 # per-document one: stop the whole run immediately.
                 if is_credit_error(status, detail):
                     raise CreditExhausted(detail)
                 # Retry only transient errors, never 4xx auth/validation.
-                if status in (429, 500, 502, 503, 529) and attempt < self.MAX_RETRIES:
+                if single_attempt and status >= 500:
+                    raise FinishingAmbiguous("Finishing request outcome is uncertain; automatic retry is blocked") from None
+                if not single_attempt and status in (429, 500, 502, 503, 529) and attempt < self.MAX_RETRIES:
                     delay = self.RETRY_BASE_DELAY * (2 ** attempt)
                     attempt += 1
                     import time as _t
@@ -3279,6 +3285,8 @@ class ClaudeAPI:
                     continue
                 raise APIError(status, label, detail)
             except urllib.error.URLError as e:
+                if single_attempt:
+                    raise FinishingAmbiguous("Finishing request outcome is uncertain; automatic retry is blocked") from None
                 # network/DNS/timeout - retry a couple of times, then give up
                 if attempt < self.MAX_RETRIES:
                     delay = self.RETRY_BASE_DELAY * (2 ** attempt)
@@ -3288,6 +3296,8 @@ class ClaudeAPI:
                     continue
                 raise APIError(0, f"network error ({getattr(e, 'reason', e)})")
             except TimeoutError as e:
+                if single_attempt:
+                    raise FinishingAmbiguous("Finishing request outcome is uncertain; automatic retry is blocked") from None
                 # A timeout DURING resp.read() is raised as a bare
                 # TimeoutError, not URLError, so it used to bypass the retry
                 # above and fail the document outright (a readable DBS result
@@ -3942,12 +3952,32 @@ class ClaudeAPI:
         if text:
             blocks.append({"type": "text", "text": f"Extracted text:\n{text[:4000]}"})
         blocks.append({"type": "text", "text": "Return check date and work status. JSON only."})
-        d = self._json_from(self._post(system, blocks, max_tokens=100))
+        schema = {"type": "object", "properties": {
+            "check_date": {"type": "string"},
+            "work_permitted": {"type": "boolean"}},
+            "required": ["check_date", "work_permitted"], "additionalProperties": False}
+        raw = self._post(system, blocks, max_tokens=256,
+                         output_schema=schema, single_attempt=True)
+        try:
+            d = json.loads(raw)
+        except (ValueError, TypeError):
+            raise ValueError("malformed share-code check response") from None
+        if not isinstance(d, dict):
+            raise ValueError("malformed share-code check response")
         if ("check_date" not in d or not isinstance(d["check_date"], str)
                 or "work_permitted" not in d
-                or type(d["work_permitted"]) is not bool):
+                or type(d["work_permitted"]) is not bool
+                or set(d) != {"check_date", "work_permitted"}):
             raise ValueError("malformed share-code check response")
-        return {"check_date": d["check_date"].strip(),
+        date_value = d["check_date"].strip()
+        if date_value:
+            try:
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_value):
+                    raise ValueError("date format")
+                datetime.date.fromisoformat(date_value)
+            except ValueError:
+                raise ValueError("malformed share-code check date") from None
+        return {"check_date": date_value,
                 "work_permitted": d["work_permitted"]}
 
     # ================================================================
@@ -5430,6 +5460,17 @@ class OrientationState:
     def save(self):
         _write_hidden_json(self.path, self.data)
 
+def verify_batch_save(state, context):
+    """Durability is verified from disk, never inferred from a save return value."""
+    state.save()
+    try:
+        saved = json.loads(state.path.read_text(encoding="utf-8"))
+    except Exception:
+        raise DurableStateError(context) from None
+    if saved != state.data:
+        raise DurableStateError(context)
+
+
 class BatchState:
     def __init__(self, care_home_dir: Path):
         self.dir = Path(care_home_dir)
@@ -5445,6 +5486,11 @@ class BatchState:
                     self.data = loaded
         except Exception:
             traceback.print_exc()
+
+        if self.path.exists() and not self.data:
+            raise DurableStateError("Saved batch state is unreadable; restore its checkpoint before continuing")
+        if int(self.data.get("version", 1)) > 5:
+            raise DurableStateError("Saved batch state needs a newer application; no changes were made")
 
     def exists(self) -> bool:
         if not self.data or self.data.get("applied", False):
@@ -5569,11 +5615,32 @@ class BatchState:
 
     def finalize_applied(self) -> Path:
         """Take a terminal receipt, then mark and remove mutable state."""
+        recovery = self.data.get("source_recovery")
+        if recovery:
+            if not self.data.get("processing_complete"):
+                raise DurableStateError("Processing is incomplete; terminal receipt is blocked")
+            for source in self.data.get("submitted_worker_scope", []):
+                worker = Engine._batch_worker_state(self, Path(source["source_path"]))
+                if not worker or not worker.get("completed"):
+                    raise DurableStateError("Worker completion is unverified; terminal receipt is blocked")
+            if any(r["state"] not in {"accepted_applied", "excluded_quarantined"}
+                   for r in recovery["records"].values()):
+                raise DurableStateError("Source recovery is incomplete; full completion is blocked")
+            exclusions = source_recovery.exclusion_summary(self)
+            self.data["source_exclusions"] = exclusions
+            self.data["terminal_outcome"] = ("completed_with_exclusions"
+                if exclusions["count"] else "completed")
         target = self.terminal_snapshot()
+        archived = json.loads(target.read_text(encoding="utf-8"))
+        expected = {k: v for k, v in self.data.items() if k not in ("applied", "applied_ts")}
+        if ({k: v for k, v in archived.items() if k not in ("applied", "applied_ts")} != expected
+                or archived.get("applied") is not True):
+            raise DurableStateError("Terminal receipt failed verification; active state retained")
         self.data["applied"] = True
         self.data["applied_ts"] = datetime.datetime.now().isoformat(
             timespec="seconds")
-        if not self.save():
+        self.save()
+        if json.loads(self.path.read_text(encoding="utf-8")) != self.data:
             raise DurableStateError(
                 "terminal receipt was saved, but applied state could not be "
                 "persisted; mutable state was retained")
@@ -7271,7 +7338,7 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
                        resolution, log=lambda m: None,
                        emit_cost=None, check_stop=lambda: None,
                        orientation_rows=None, on_progress=None,
-                       finishing_quality_hints=None):
+                       finishing_quality_hints=None, source_exclusions=None):
     """Audit every document under `worker_dirs`; write the workbook into
     `out_dir`. Returns (rows, xlsx_path). See the section comment above for
     the method. Flags are conservative: a proposed replacement requires the
@@ -7464,8 +7531,21 @@ def run_accuracy_audit(api, adjudicator_api, kb, worker_dirs, out_dir, *,
     progress("writing_report", len(rows), docs[-1] if docs else None)
     rep_dir = processing_reports_dir(Path(out_dir).name)
     xlsx = unique_path(rep_dir, AUDIT_REPORT_STEM, ".csv")
+    if source_exclusions and source_exclusions.get("count"):
+        for row in rows:
+            row["Notes"] = ("PARTIAL RUN: " + source_exclusions["statement"]
+                + "; excluded workers are outside this audit. " + row.get("Notes", ""))
     _write_audit_workbook(rows, xlsx,
                           orientation_rows=orientation_rows or [])
+    if source_exclusions and source_exclusions.get("count"):
+        summary_path = xlsx.with_name(xlsx.stem + " - Summary.csv")
+        with summary_path.open(encoding="utf-8-sig", newline="") as stream:
+            summary_rows = list(csv.DictReader(stream))
+        summary_rows[:0] = [{"metric": "RUN OUTCOME", "value": "COMPLETED WITH EXCLUSIONS"},
+            {"metric": "Not processed or reviewed", "value": source_exclusions["statement"]},
+            {"metric": "Excluded workers", "value": "; ".join(source_exclusions["workers"])},
+            {"metric": "Full-scope accuracy claim", "value": "NOT PERMITTED"}]
+        pipeline.atomic_csv(summary_path, summary_rows, ["metric", "value"])
     # register it so the ribbon's Reports browser can find it later
     record_processing_report(xlsx, Path(out_dir).name)
     progress("complete", len(rows), docs[-1] if docs else None, report=xlsx)
@@ -7842,9 +7922,7 @@ class Engine:
             + self._session_live_tokens())
         costs["updated_ts"] = datetime.datetime.now().isoformat(
             timespec="seconds")
-        if not state.save():
-            raise DurableStateError(
-                "could not persist cumulative live finishing cost")
+        verify_batch_save(state, "could not persist cumulative live finishing cost")
 
     @staticmethod
     def _operation_input_hash(operation_id: str):
@@ -7920,30 +7998,36 @@ class Engine:
             marker["retry_of"] = prior.get("attempt_id")
         operations[operation_id] = marker
         worker["finishing_status"] = "in_progress"
-        if not state.save():
-            raise DurableStateError(
-                "finishing marker could not be persisted; no request sent")
+        verify_batch_save(state, "finishing marker could not be persisted; no request sent")
         try:
             result = callback()
         except Exception as exc:
             self._persist_batch_live_cost()
             operations[operation_id].update({
-                "status": "failed", "result": None,
-                "error": f"{type(exc).__name__}: {exc}",
+                "status": "submission_started" if isinstance(exc, FinishingAmbiguous) else "failed", "result": None,
+                "error": type(exc).__name__ + ": finishing evidence unavailable",
                 "completed_ts": datetime.datetime.now().isoformat(
                     timespec="seconds")})
-            state.save()
+            verify_batch_save(state, "finishing failure checkpoint could not be persisted")
             self.on_cost(self._current_cost_gbp(),
                          getattr(self, "_committed_batch_tokens", 0)
                          + getattr(self, "_persisted_live_tokens", 0)
                          + self._session_live_tokens())
-            raise
+            if isinstance(exc, FinishingAmbiguous):
+                raise FinishingAmbiguous("finishing evidence unavailable; request may already be accepted") from None
+            if isinstance(exc, CreditExhausted):
+                raise CreditExhausted("API credit unavailable") from None
+            if isinstance(exc, ValueError):
+                raise ValueError("finishing evidence unavailable") from None
+            raise RuntimeError("finishing evidence unavailable") from None
         self._persist_batch_live_cost()
         operations[operation_id].update({
             "status": "complete", "result": result,
             "completed_ts": datetime.datetime.now().isoformat(
                 timespec="seconds")})
-        if not state.save():
+        try:
+            verify_batch_save(state, "finishing result checkpoint could not be persisted")
+        except DurableStateError:
             raise FinishingAmbiguous(
                 "finishing response was received but completion could not be "
                 "persisted; automatic retry is blocked")
@@ -8038,7 +8122,8 @@ class Engine:
             return False
         key = (worker_key, operation_id)
         expected = authorized.get(key)
-        if expected is None or prior.get("status") not in ("complete", "failed"):
+        if (expected is None or prior.get("status") != "failed"
+                or len(prior.get("attempts") or []) >= 2):
             return False
         if ((expected.get("status"), expected.get("attempt_id")) !=
                 (prior.get("status"), prior.get("attempt_id"))):
@@ -8179,9 +8264,9 @@ class Engine:
                         entry["input_error"] = binding_error
                         changed.append(entry)
                         continue
-                    if prior.get("status") in ("complete", "failed"):
+                    if prior.get("status") == "failed" and len(prior.get("attempts") or []) < 2:
                         retryable.append(entry)
-                    elif prior.get("status") == "submission_started":
+                    elif prior.get("status") in ("submission_started", "complete", "failed"):
                         blocked.append(entry)
                     else:
                         fresh.append(entry)   # no stored attempt: any pass asks
@@ -8626,7 +8711,8 @@ class Engine:
                 emit_cost=self._emit_cost, check_stop=self._check_stop,
                 orientation_rows=orientation_rows, on_progress=self._activity,
                 finishing_quality_hints=audit_finishing_quality_hints(
-                    batch_state.data if batch_state is not None else {}))
+                    batch_state.data if batch_state is not None else {}),
+                source_exclusions=batch_state.data.get("source_exclusions") if batch_state else None)
             flagged = sum(1 for r in rows
                           if r["Review Status"] not in ("Correct",
                                                         "Custom Name"))
@@ -10044,8 +10130,35 @@ class Engine:
         worker out of finishing, movement, receipts and audit.  Merely having at
         least one good record is not proof that the worker is complete.
         """
+        recovery_records = (state.data.get("source_recovery") or {}).get("records", {})
+        worker_recovery = [r for r in recovery_records.values()
+                           if str(Path(r["worker_dir"]).resolve()).casefold()
+                           == str(worker_dir.resolve()).casefold()]
+        if any(r["state"] not in {"submitted", "accepted_applied", "excluded_quarantined"}
+               for r in worker_recovery):
+            raise FinishingInputChanged("worker is waiting for source recovery")
         docs = list_worker_docs(worker_dir)
+        # DOC_EXT discovery is suitable for rendering, not scope validation.
+        # A later unsupported attachment must not disappear from the completion
+        # claim, including workers whose original sources were quarantined.
+        try:
+            current_sources = [p for p in worker_dir.rglob("*")
+                if (p.is_file() or p.is_symlink())
+                and not is_program_file(p) and not _is_junk(p)]
+            doc_scope = {str(p.resolve()).casefold() for p in docs}
+            for path in current_sources:
+                source_recovery.safe_path(path, worker_dir.resolve())
+                if str(path.resolve()).casefold() not in doc_scope:
+                    raise FinishingInputChanged(
+                        "unmatched unsupported current file: " + path.name)
+        except FinishingInputChanged:
+            raise
+        except (OSError, source_recovery.RecoveryError) as exc:
+            raise FinishingInputChanged(
+                "current worker source scope could not be verified") from exc
         worker = self._batch_worker_state(state, worker_dir) or {}
+        if any(r["state"] == "excluded_quarantined" for r in worker_recovery):
+            worker["completion_outcome"] = "completed_with_exclusions"
         saved_rows = worker.get("applied_records") or []
         # An explicitly approved, pre-existing empty worker is the only
         # permitted zero-record exception. Keep this narrow: the directory
@@ -10065,6 +10178,10 @@ class Engine:
             valid_approval_ts = bool(approval_ts)
         except (TypeError, ValueError):
             valid_approval_ts = False
+        if (not docs and not records and not saved_rows and worker_recovery
+                and all(r["state"] == "excluded_quarantined" for r in worker_recovery)):
+            worker["completion_outcome"] = "completed_with_exclusions"
+            return
         if not docs and not records and not saved_rows:
             if self._batch_worker_has_saved_source(state, worker_dir):
                 raise FinishingInputChanged(
@@ -10598,127 +10715,48 @@ class Engine:
             raise RuntimeError("Current folder/worker limits exclude previously submitted documents")
         return dict(discovered), len(discovered) - len(requests)
 
-    def _resume_primary_inventory(self, state, inventory, accepted):
-        """Submit only proven-unsubmitted IDs; every POST has a durable marker."""
-        vocab = state.data.get("primary_vocabulary") or self.kb.vocabulary_block()
-        excluded = self._primary_excluded_ids(state, inventory)
-        remaining = [cid for cid in inventory
-                     if cid not in accepted and cid not in excluded]
-        chunk, chunk_ids = [], []
-        envelope_bytes = len(json.dumps({"requests": []}).encode("utf-8"))
-        chunk_bytes = envelope_bytes
-        chunk_no = len(state.data.get("primary_chunks") or [])
-        expected_disk = json.loads(json.dumps(state.data))
-
-        def submit():
-            nonlocal chunk_no, expected_disk, chunk_bytes
-            if not chunk:
-                return
-            self._check_stop()
-            for cid in chunk_ids:
-                meta = inventory[cid]
-                path = Path(meta["path"])
-                if not path.is_file() or file_hash(path) != meta["fhash"]:
-                    raise RuntimeError("Source changed while preparing recovery; no request sent for this chunk")
-            wire_bytes = len(json.dumps({"requests": chunk}).encode("utf-8"))
-            if wire_bytes > self.PRIMARY_RECOVERY_CHUNK_BYTES:
-                raise RuntimeError("One rendered request exceeds the recovery upload limit; reduce that document separately")
-            if BatchState(self.dir).data != expected_disk:
-                raise RuntimeError("Another process changed the batch state while preparing recovery; no request sent for this chunk")
-            chunk_no += 1
-            # Bind this chunk's request metadata in the same durable write as
-            # its submission_started marker. Until this point these IDs are
-            # merely in-memory preparation and cannot be mistaken for paid or
-            # ambiguous requests after a crash.
-            state.data.setdefault("requests", {}).update({
-                cid: dict(inventory[cid]) for cid in chunk_ids})
-            self.set_status(f"Uploading recovery chunk {chunk_no}: {len(chunk)} document(s), "
-                            f"{wire_bytes / 1048576:.1f} MiB…")
-            marker = {"status": "submission_started", "submission_started": True,
-                      "planned_chunk_id": f"primary-recovery-{chunk_no:04d}",
-                      "request_identities": list(chunk_ids),
-                      "attempt_id": hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:24],
-                      "started_ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-                      "wire_bytes": wire_bytes}
-            state.data["primary_submission"] = marker
-            state.data["phase"] = "primary_submission_started"
-            if not state.save():
-                raise RuntimeError("Recovery submission marker could not be saved; no request sent")
-            try:
-                created = self.api.submit_batch(list(chunk))
-                bid = str(created.get("id") or "")
-                if not bid:
-                    raise RuntimeError("Provider returned no batch ID")
-            except Exception:
-                marker["status"] = "ambiguous"
-                state.data["phase"] = "primary_submission_ambiguous"
-                state.save()
-                raise
-            state.add_batch(bid, len(chunk), created.get("processing_status", ""),
-                            request_ids=chunk_ids)
-            marker.update(status="accepted", batch_id=bid)
-            state.data.setdefault("primary_chunks", []).append(dict(marker))
-            state.data["phase"] = "primary_preparing"
-            if not state.save():
-                raise RuntimeError("Accepted recovery batch ID could not be saved; stop and reconcile before retrying")
-            expected_disk = json.loads(json.dumps(state.data))
-            accepted.update(chunk_ids)
-            self.log(f"  > recovered submission {bid} with {len(chunk)} request(s)")
-            chunk.clear()
-            chunk_ids.clear()
-            chunk_bytes = envelope_bytes
-
-        for index, cid in enumerate(remaining, 1):
-            self._check_stop()
-            meta = inventory[cid]
-            path = Path(meta["path"])
-            self.set_status(f"Preparing remaining primary document {index}/{len(remaining)}")
-            self._phase_progress("recovery", index - 1, len(remaining))
-            self.set_progress(index - 1, len(remaining))
-            if not path.is_file() or path.is_symlink():
-                self._record_primary_source_exception(
-                    state, cid, meta, "source_missing",
-                    "source disappeared during recovery")
-                excluded.add(cid)
-                expected_disk = json.loads(json.dumps(state.data))
-                continue
-            try:
-                imgs, text, page_idxs, total_pages, segment_view = \
-                    self._batch_classification_view(path)
-            except UnreadableDocumentError as exc:
-                self._record_primary_source_exception(
-                    state, cid, meta, "unreadable_source", str(exc))
-                excluded.add(cid)
-                expected_disk = json.loads(json.dumps(state.data))
-                continue
-            if not imgs and not text:
-                self._record_primary_source_exception(
-                    state, cid, meta, "unreadable_source",
-                    "no renderable page images or extracted text")
-                excluded.add(cid)
-                expected_disk = json.loads(json.dumps(state.data))
-                continue
-            system, blocks, mt = self.api.classify_payload(vocab, imgs, text,
-                page_idxs=page_idxs, total_pages=total_pages, segment=segment_view)
-            req = self.api.build_batch_request(cid, system, blocks, mt)
-            req_size = len(json.dumps(req).encode("utf-8"))
-            if req_size + envelope_bytes > self.PRIMARY_RECOVERY_CHUNK_BYTES:
-                raise RuntimeError("One rendered request exceeds the 40 MiB recovery upload limit")
-            # Aim for short network writes. A single request may exceed the
-            # target (without lowering document quality), but never the hard cap.
-            if chunk and (chunk_bytes + req_size + 2 > self.PRIMARY_RECOVERY_TARGET_BYTES
-                          or len(chunk) >= self.BATCH_SUBMIT_MAX_REQUESTS):
-                submit()
-            chunk_bytes += req_size + (2 if chunk else 0)
-            chunk.append(req)
-            chunk_ids.append(cid)
-        submit()
-        if BatchState(self.dir).data != expected_disk:
-            raise RuntimeError("Batch state changed before marking primary submission complete")
+    def reconcile_source_submission(self, state):
+        """Adopt only an exact positive provider match; never resubmit an uncertain POST."""
+        recovery = source_recovery.Recovery(state, APP_VERSION, APP_BUILD)
+        marker = state.data.get("primary_submission") or {}
+        if marker.get("status") not in ("submission_started", "ambiguous"):
+            return "No uncertain primary submission requires reconciliation."
+        evidence = self._primary_provider_evidence(state)
+        expected = set(marker.get("request_identities") or [])
+        matches = evidence.get("matched_batches") or []
+        if evidence.get("no_match") or len(matches) != 1 or set(matches[0].get("request_ids") or []) != expected:
+            raise source_recovery.RecoveryError("No exact positive provider match is available. The uncertain scope is retained and will not be retried.")
+        scope = next((s for s in recovery.data["scopes"] if s["id"] == marker.get("attempt_id")), None)
+        if not scope or set(scope["ids"]) != expected:
+            raise source_recovery.RecoveryError("Uncertain request scope is not bound to its saved attempt.")
+        state.recovery_snapshot()
+        batch = matches[0]
+        if batch["id"] not in state.batch_ids():
+            state.data.setdefault("batches", []).append(batch)
+        scope.update(status="accepted", batch_id=batch["id"], reconciled_ts=source_recovery.now())
+        for cid in list(scope["ids"]) + list(scope.get("aliases", {})):
+            record = recovery.data["records"][cid]
+            record["state"] = "submitted"
+            recovery.sync_exception(cid)
+            worker = self._batch_worker_state(state, Path(record["worker_dir"]))
+            if worker and not worker.get("completed"):
+                worker["classification_status"] = "pending"
+            recovery.event(cid, "submission_reconciled", request_id=record.get("request_id", cid), scope_id=scope["id"])
+        marker.update(status="accepted", batch_id=batch["id"])
         state.data["primary_submission_complete"] = True
         state.data["phase"] = "primary_pending"
-        if not state.save():
-            raise RuntimeError("Primary completion could not be saved; resume recovery before applying")
+        recovery.checkpoint()
+        return "Exact accepted request found and retained. No document was resubmitted."
+
+    def _resume_primary_inventory(self, state, inventory, accepted):
+        """Submit only proven-unsubmitted IDs; every POST has a durable marker."""
+        # Legacy interrupted runs enter the same whole-scope local gate.
+        # Authorization to reconcile a POST is not authorization to bypass
+        # the new source decision screen.
+        recovery = source_recovery.Recovery(state, APP_VERSION, APP_BUILD)
+        recovery.resume(self._batch_classification_view)
+        recovery.preflight(self._batch_classification_view, self._check_stop)
+        return recovery.summary()
 
     @_care_home_writer_operation
     def recover_primary_submission(self, allow_resubmit=False):
@@ -10742,6 +10780,8 @@ class Engine:
             budget = min(budgets) if budgets else 0
             inventory, tail_count = self._primary_recovery_inventory(state)
             evidence = self._primary_provider_evidence(state)
+            if evidence.get("no_match"):
+                raise RuntimeError("The uncertain request was not positively matched. Its marker is retained; absence from a listing does not authorize another purchase.")
             accepted = set(evidence["accepted_ids"])
             if not accepted.issubset(inventory):
                 raise RuntimeError("Accepted provider results contain IDs outside the source inventory")
@@ -10802,6 +10842,12 @@ class Engine:
             if not state.save():
                 raise RuntimeError("Reconciled state could not be saved; no remaining requests submitted")
             self._resume_primary_inventory(state, inventory, accepted)
+            if state.data.get("source_recovery"):
+                summary = self.source_attention_summary(state)
+                self.on_done(self.stats, "batch_source_attention:" + json.dumps(summary))
+                return {"status": "source_attention", "message":
+                    "Reconciliation retained. Confirm the exact ready scope in Source recovery.",
+                    "remaining": len(source_recovery.Recovery(state, APP_VERSION, APP_BUILD).unresolved()), "snapshot": str(backup)}
             excluded_after = self._primary_excluded_ids(state, inventory)
             if (not state.batch_ids() and excluded_after
                     and not (set(inventory) - excluded_after)):
@@ -10912,8 +10958,7 @@ class Engine:
         for record in exclusions.values() if isinstance(exclusions, dict) else ():
             if not isinstance(record, dict):
                 continue
-            if record.get("reason") in ("unreadable_source", "source_missing",
-                                         "source_changed"):
+            if record.get("reason") in PRIMARY_SOURCE_EXCEPTION_REASONS:
                 worker = str(record.get("worker") or "")
                 unreadable_workers.add(worker.casefold())
                 unreadable.append({
@@ -11107,22 +11152,24 @@ class Engine:
                     self._phase_progress("scanning", scanned_workers, total,
                                          state="scanning", documents=scanned_documents)
                     continue
-                documents = list(list_worker_docs(w))
+                # Failed conversions and unsupported sources belong in the queue.
+                documents = sorted((p for p in w.rglob("*")
+                    if (p.is_file() or p.is_symlink())
+                    and not is_program_file(p) and not _is_junk(p)),
+                    key=lambda p: natural_key(str(p)))
                 for document_index, f in enumerate(documents):
                     scanned_documents += 1
                     self._phase_progress("scanning", scanned_workers, total,
                                          state="scanning", documents=scanned_documents,
                                          operation=f"scan:{scanned_documents}")
-                    reason = self._batch_skip_file(w, f)
-                    if reason:
-                        self.log(f"    - {self._redact(f.name)}: skipped ({reason})")
-                        continue
+                    # Inspection owns source failures. Content/extension errors
+                    # must survive in the frozen inventory and recovery queue.
                     try:
                         fhash = file_hash(f)
-                    except Exception as e:
+                    except Exception:
                         self.stats["errors"] += 1
-                        self.log(f"    ! could not hash {self._redact(f.name)}: {e}")
-                        continue
+                        self.log("    ! source cannot be fingerprinted; retained for local recovery")
+                        fhash = ""
                     cached_before_orientation = (
                         self.manifest.seen(
                             fhash, self.api.model_id, self.resolution)
@@ -11131,7 +11178,9 @@ class Engine:
                                          state="orienting" if self.orientation_mode != "off" else "scanning",
                                          documents=scanned_documents,
                                          operation=f"orientation:{scanned_documents}")
-                    orientation = self._orientation_preflight(f)
+                    inspection = source_recovery.inspect_source(f, fhash, max_size_mb=self.max_file_mb)
+                    orientation = (self._orientation_preflight(f)
+                                   if not inspection["cause"] else {})
                     self._phase_progress("scanning", scanned_workers, total,
                                          state="scanning", documents=scanned_documents,
                                          operation=f"scan-returned:{scanned_documents}")
@@ -11152,7 +11201,7 @@ class Engine:
                         self.log(f"    = {self._redact(f.name)}: already processed "
                                  f"(cached - will be applied without the API)")
                         continue
-                    eligible.append((w, f, fhash, DocRender.page_count(f)))
+                    eligible.append((w, f, fhash, inspection.get("pages") or 0))
                     if self.max_files > 0 and len(eligible) >= self.max_files:
                         limit_reached = True
                         limit_leaves_scope = (
@@ -11178,6 +11227,9 @@ class Engine:
             self._phase_progress("scanning", scanned_workers, total,
                                  state="limited" if limit_leaves_scope else "complete",
                                  documents=scanned_documents)
+            if limit_leaves_scope:
+                self.on_done(self.stats, "limit:File limit would truncate the worker scope; increase the file limit or select fewer whole workers")
+                return
 
             if not eligible:
                 self.log("Nothing to submit - every document is cached, skipped "
@@ -11274,189 +11326,15 @@ class Engine:
                                          "not writable")
                 return
 
-            # ---- build + submit in chunks (render as we go, cap memory) ----
-            chunk, chunk_bytes = [], 0
-            hash_counts = {}
-            n_built = 0
-            n_accepted = 0
-            chunk_number = 0
-            self._phase("batch", "Preparing and submitting batch requests")
-
-            def _submit_chunk():
-                nonlocal chunk_number, n_accepted
-                if not chunk:
-                    return
-                wire_bytes = len(json.dumps({"requests": chunk}).encode("utf-8"))
-                if wire_bytes > self.BATCH_SUBMIT_MAX_BYTES:
-                    raise RuntimeError("Rendered primary chunk exceeds the 100 MiB upload guard; "
-                                       "recover with smaller chunks before applying")
-                self.set_status(f"Submitting a batch of {len(chunk)} request(s)…")
-                chunk_number += 1
-                self._phase_progress("batch", n_built, len(eligible),
-                                     state="submitting", accepted=n_accepted,
-                                     operation=f"submit:{chunk_number}")
-                chunk_id = f"primary-{chunk_number:04d}"
-                identities = [str(req.get("custom_id") or "")
-                              for req in chunk]
-                attempt_id = hashlib.sha256(
-                    (f"{time.time_ns()}:{os.getpid()}:{chunk_id}:"
-                     + "|".join(identities)).encode("utf-8")).hexdigest()[:24]
-                state.data["primary_submission"] = {
-                    "status": "submission_started",
-                    "submission_started": True,
-                    "planned_chunk_id": chunk_id,
-                    "request_identities": identities,
-                    "attempt_id": attempt_id,
-                    "started_ts": datetime.datetime.now().isoformat(
-                        timespec="seconds"),
-                }
-                state.data["phase"] = "primary_submission_started"
-                if not state.save():
-                    raise RuntimeError(
-                        "primary submission marker could not be persisted; "
-                        "no request sent")
-                try:
-                    created = self.api.submit_batch(chunk)
-                    bid = str(created.get("id") or "").strip()
-                    if not bid:
-                        raise APIError(
-                            0, "primary batch submission returned no batch id")
-                except Exception:
-                    marker = state.data["primary_submission"]
-                    marker["status"] = "ambiguous"
-                    marker["ambiguous_ts"] = datetime.datetime.now().isoformat(
-                        timespec="seconds")
-                    state.data["phase"] = "primary_submission_ambiguous"
-                    state.save()
-                    raise
-                state.add_batch(bid, len(chunk),
-                                created.get("processing_status", ""),
-                                request_ids=identities)
-                state.data["primary_submission"].update({
-                    "status": "accepted", "batch_id": bid,
-                    "accepted_ts": datetime.datetime.now().isoformat(
-                        timespec="seconds")})
-                state.data["phase"] = "primary_pending"
-                state.data["primary_chunks"].append(dict(state.data["primary_submission"]))
-                if not state.save():
-                    raise RuntimeError(
-                        "primary batch id could not be persisted; automatic "
-                        "resubmission is blocked by the durable started marker")
-                self.log(f"  > submitted batch {bid} with {len(chunk)} request(s)")
-                self.stats["batches"] += 1
-                n_accepted += len(chunk)
-                self._phase_progress("batch", n_built, len(eligible),
-                                     state="submitted", accepted=n_accepted,
-                                     operation=f"accepted:{chunk_number}")
-                chunk.clear()
-
-            for i, (w, f, fhash, pages) in enumerate(eligible, 1):
-                self._check_stop()
-                self.set_status(f"Rendering {i}/{len(eligible)}: "
-                                f"{self._redact(f.name)}")
-                self._phase_progress("batch", n_built, len(eligible),
-                                     state="rendering", accepted=n_accepted,
-                                     operation=f"render:{i}")
-                if not f.exists():
-                    cid = next((cid for cid, item in inventory.items()
-                                if item.get("path") == str(f)), None)
-                    if cid is not None:
-                        self._record_primary_source_exception(
-                            state, cid, inventory[cid], "source_missing",
-                            "source disappeared during preparation")
-                    continue
-                imgs, text, page_idxs, total_pages, segment_view = \
-                    self._batch_classification_view(f)
-                self.set_preview(imgs[0] if imgs else None, f.name)
-                if not imgs and not text:
-                    self.log(f"    - {self._redact(f.name)}: cannot render - "
-                             f"left unchanged")
-                    self.failed_log.record(self.care_home, w.name, f,
-                                           "skipped: unrenderable", "")
-                    cid = next(cid for cid, item in inventory.items()
-                               if item.get("path") == str(f))
-                    self._record_primary_source_exception(
-                        state, cid, inventory[cid], "unreadable_source",
-                        "no renderable page images or extracted text")
-                    continue
-                system, blocks, mt = self.api.classify_payload(
-                    vocab, imgs, text, page_idxs=page_idxs,
-                    total_pages=total_pages, segment=segment_view)
-                # custom_id: stable, unique, derived from the content hash
-                # (sha-256 hex truncated + a per-hash counter for exact copies).
-                cid = next(cid for cid, meta in inventory.items()
-                           if meta["path"] == str(f))
-                req = self.api.build_batch_request(cid, system, blocks, mt)
-                # rough serialized size (b64 data dominates)
-                req_bytes = sum(len(b.get("source", {}).get("data", ""))
-                                for b in blocks if b.get("type") == "image")
-                req_bytes += sum(len(b.get("text", "")) for b in blocks
-                                 if b.get("type") == "text") + len(system) + 2048
-                if chunk and (chunk_bytes + req_bytes > self.BATCH_SUBMIT_MAX_BYTES
-                              or len(chunk) >= self.BATCH_SUBMIT_MAX_REQUESTS):
-                    _submit_chunk()
-                    chunk_bytes = 0
-                state.add_request(cid, f, w, fhash, pages)
-                chunk.append(req)
-                chunk_bytes += req_bytes
-                n_built += 1
-                self._phase_progress("batch", n_built, len(eligible),
-                                     state="rendering", accepted=n_accepted,
-                                     operation=f"built:{i}")
-            _submit_chunk()
-
-            # Eligibility was decided before this bounded rendering pass.  If
-            # every source disappeared or proved unrenderable here, no provider
-            # request exists to wait for or apply. Keep the initial inventory
-            # and the provider-free exception ledger so a restart cannot
-            # rediscover or resubmit the same source.
-            if not n_built:
-                state.data["primary_submission_complete"] = True
-                state.data["primary_submission"] = {
-                    "status": "nothing_renderable",
-                    "eligible": len(eligible),
-                }
-                state.data["phase"] = "primary_nothing_renderable"
-                if not state.save():
-                    self.log("*** NOT SUBMITTED: no request was rendered, but "
-                             "the empty batch state could not be cleared. "
-                             "No provider request was sent. ***")
-                    self.on_done(self.stats, "batch_state_write_failed")
-                    return
-                self._phase_progress("batch", 0, len(eligible),
-                                     state="attention", accepted=0,
-                                     operation="no-renderable")
-                self.log("\n=== NO BATCH REQUESTS SUBMITTED: every eligible "
-                         "document was missing or could not be rendered; no "
-                         "provider classification result was submitted or applied ===")
-                summary = self.source_attention_summary(state)
-                self.on_done(self.stats,
-                             "batch_source_attention:" + json.dumps(summary)
-                             if summary["unreadable_documents"]
-                             else f"batch_no_renderable:{len(eligible)}")
-                return
-
-            state.data["phase"] = "primary_pending"
-            state.data["primary_submission_complete"] = True
-            state.save()
-            self.stats["batch_requests"] = n_built
-            self._phase_progress("batch", n_built, len(eligible),
-                                 state="submitted", accepted=n_accepted)
-            self.set_progress(total, total)
-            n_batches = len(state.batch_ids())
-            self.log(f"\n=== BATCH SUBMITTED: {n_built} document(s) in "
-                     f"{n_batches} batch(es) ===")
-            self.log(f"  primary batch classification : ~£{est['primary_gbp']:.2f}")
-            self.log(f"  required live finishing      : ~£{est['finishing_gbp']:.2f}")
-            self.log(f"  optional follow-up reserve   : ~£{est['followup_reserve_gbp']:.2f}")
-            self.log(f"  optional accuracy audit      : ~£{est['audit_gbp']:.2f}")
-            self.log(f"  cumulative enabled estimate  : ~£{est['gbp']:.2f}")
-            self.log("You can close this app now. Results are usually ready "
-                     "within an hour (up to 24h). Re-open the folder and press "
-                     "'Check batch status' to fetch and apply them.")
-            self.on_done(self.stats,
-                         f"batch_submitted:{n_built}|{n_batches}|"
-                         f"{est['primary_gbp']:.2f}|{est['gbp']:.2f}")
+            # Whole-scope local preparation is durable before the operator's
+            # first paid submission decision. This also exposes locked files at
+            # the end of a large scope before any earlier chunk is purchased.
+            recovery = source_recovery.Recovery(state, APP_VERSION, APP_BUILD)
+            self._phase("source_preflight", "Inspecting every source locally — no provider submission")
+            recovery.preflight(self._batch_classification_view, self._check_stop,
+                lambda done, count: self._phase_progress("source_preflight", done, count))
+            self.on_done(self.stats, "batch_source_attention:" + json.dumps(
+                self.source_attention_summary(state), sort_keys=True))
         except CreditExhausted as e:
             self.log(f"\n*** STOPPED: API credit exhausted during submission. "
                      f"{e.detail} ***")
@@ -11806,13 +11684,30 @@ class Engine:
         a clean restart can continue with the next chunk while an ambiguous POST
         still fails closed instead of risking duplicate billing.
         """
+        def persist():
+            # Production states have a durable path; save() can legitimately
+            # return None. The reopened JSON, never its return value, authorizes
+            # the next provider request or an accepted-submission update.
+            expected = json.loads(json.dumps(state.data))
+            result = state.save()
+            durable_path = getattr(state, "path", None)
+            if durable_path is None:
+                # In-memory adapters are used only by offline progress tests.
+                if result is False:
+                    raise RuntimeError("follow-up state could not be persisted")
+                return True
+            try:
+                with open(durable_path, "r", encoding="utf-8") as stream:
+                    actual = json.load(stream)
+            except Exception as exc:
+                raise RuntimeError("follow-up state could not be verified") from exc
+            if actual != expected:
+                raise RuntimeError("follow-up state save verification failed")
+            return True
+
         followup = state.data.get("followup") or {}
         phase = followup.get("phase")
         submission = followup.get("submission") or {}
-        if phase == "pending":
-            return True
-        if phase == "ended":
-            return False
         if (phase in ("submission_started", "ambiguous")
                 or submission.get("status") in
                 ("submission_started", "ambiguous")):
@@ -11821,6 +11716,30 @@ class Engine:
                      "Automatic retry is blocked to prevent duplicate billing. ***")
             self.on_done(self.stats, "batch_followup_ambiguous")
             return True
+        if phase == "pending":
+            return True
+
+        # A later locally recovered primary scope can need its own one-time
+        # follow-up. Keep the original request/batch maps intact: result cache
+        # loading and cost accounting must continue to see the entire history.
+        new_primary_ids = []
+        if phase == "ended":
+            attempted = set(followup.get("attempted_primary_ids", []))
+            attempted.update(meta.get("primary_custom_id") for meta in
+                             followup.get("requests", {}).values())
+            for primary_cid in dict.fromkeys(unresolved):
+                if primary_cid in attempted:
+                    continue
+                meta = state.request_for(primary_cid) or {}
+                worker_path = str(meta.get("worker_dir") or "").casefold()
+                completed = any(
+                    worker.get("completed") and worker_path
+                    == str(worker.get("source_path") or "").casefold()
+                    for worker in (state.data.get("workers") or {}).values())
+                if not completed and meta:
+                    new_primary_ids.append(primary_cid)
+            if not new_primary_ids:
+                return False
 
         followup_api = self._api_for_model(
             followup.get("model_id") or state.data.get("followup_model_id")
@@ -11836,7 +11755,7 @@ class Engine:
             state.data["est_finishing_gbp"] = round(
                 phases["finishing_gbp"], 4)
             state.data["est_audit_gbp"] = round(phases["audit_gbp"], 4)
-            state.save()
+            persist()
         if not followup:
             requests = {}
             for index, primary_cid in enumerate(unresolved):
@@ -11869,7 +11788,55 @@ class Engine:
             state.data["version"] = max(4, int(state.data.get("version", 1)))
             state.data["phase"] = "followup_prepared"
             state.data["followup"] = followup
-            state.save()
+            persist()
+
+        elif new_primary_ids:
+            requests = followup.setdefault("requests", {})
+            new_ids = []
+            for primary_cid in new_primary_ids:
+                meta = state.request_for(primary_cid) or {}
+                # A digest of the primary identity avoids collisions with old
+                # truncated-hash/index IDs, even across many recovery sessions.
+                custom_id = "fu-r-" + hashlib.sha256(
+                    str(primary_cid).encode("utf-8")).hexdigest()[:59]
+                if custom_id in requests:
+                    raise RuntimeError("follow-up request identity collision")
+                requests[custom_id] = {
+                    "primary_custom_id": primary_cid,
+                    "path": meta.get("path", ""),
+                    "worker": meta.get("worker", ""),
+                    "worker_dir": meta.get("worker_dir", ""),
+                    "fhash": str(meta.get("fhash") or ""),
+                    "pages": int(meta.get("pages", 0) or 0),
+                }
+                new_ids.append(custom_id)
+            previous_estimate = max(
+                float(followup.get("est_gbp", 0) or 0),
+                float((state.data.get("costs") or {}).get(
+                    "followup_actual_gbp", 0) or 0))
+            rough = estimate_run_cost_gbp(
+                len(new_ids), followup_api.model_id, self.resolution,
+                adaptive=False, vocab_block=vocab, batch=True,
+                include_second_pass=False, cached_prefix=False)
+            followup.setdefault("recovery_sessions", []).append({
+                "prepared_ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                "request_ids": list(new_ids),
+                "prior_batch_ids": [batch.get("id") for batch in
+                                    followup.get("batches", [])],
+                "prior_est_gbp": previous_estimate,
+            })
+            followup.update({
+                "phase": "prepared", "pending_plan_request_ids": new_ids,
+                "prior_est_gbp": previous_estimate,
+                "est_gbp": previous_estimate + float(rough["primary_gbp"]),
+                "large": (len(new_ids) >= self.FOLLOWUP_LARGE_MIN_REQUESTS
+                          and len(new_ids) / max(1, len(state.data.get("requests", {})))
+                          >= self.FOLLOWUP_LARGE_RATIO),
+            })
+            followup.pop("large_warning_acknowledged", None)
+            state.data["phase"] = "followup_prepared"
+            state.data["followup"] = followup
+            persist()
 
         if followup.get("large") and not followup.get(
                 "large_warning_acknowledged"):
@@ -11887,9 +11854,11 @@ class Engine:
 
         finishing = float(state.data.get("est_finishing_gbp", 0) or 0)
         audit = float(state.data.get("est_audit_gbp", 0) or 0)
+        incurred_live = float((state.data.get("costs") or {}).get(
+            "live_actual_gbp", 0) or 0)
         expected_total = (primary_actual_gbp
                           + float(followup.get("est_gbp", 0) or 0)
-                          + finishing + audit)
+                          + incurred_live + finishing + audit)
         if self.max_budget_gbp > 0 and expected_total > self.max_budget_gbp:
             self.log("*** FOLLOW-UP NOT SUBMITTED: cumulative expected cost "
                      f"£{expected_total:.2f} exceeds the £{self.max_budget_gbp:.2f} "
@@ -11910,13 +11879,21 @@ class Engine:
         # any POST. Payloads are discarded between documents, keeping memory
         # bounded; the planned request IDs and hashes are the durable contract.
         chunk_plan = followup.get("chunk_plan") or []
-        if not chunk_plan:
+        incremental_plan = "pending_plan_request_ids" in followup
+        if not chunk_plan or incremental_plan:
             self._phase("followup_plan", "Sizing stronger-model follow-up requests")
             self.log("Preparing the follow-up chunk plan locally; rendering candidates to measure size and cost. No follow-up request is sent by this pass.")
             sized_requests = []
-            actual_requests = {}
+            prior_plan = list(chunk_plan) if incremental_plan else []
+            plan_ids = set(followup.get("pending_plan_request_ids", []))
+            actual_requests = ({cid: meta for cid, meta in
+                                followup.get("requests", {}).items()
+                                if cid not in plan_ids} if incremental_plan else {})
             input_tokens = 0
-            candidates = list(followup.get("requests", {}).items())
+            candidates = [(cid, meta) for cid, meta in
+                          followup.get("requests", {}).items()
+                          if not incremental_plan or cid in plan_ids]
+            prior_request_count = len(actual_requests)
             for index, (custom_id, meta) in enumerate(candidates, 1):
                 self._followup_progress("followup_plan", index - 1, len(candidates),
                                         operation=f"size:{index}", prepared=len(actual_requests))
@@ -11933,14 +11910,14 @@ class Engine:
             self._followup_progress("followup_plan", len(candidates), len(candidates),
                                     state="complete", prepared=len(actual_requests))
 
-            chunk_plan, oversized = self._partition_followup_request_ids(
+            new_chunk_plan, oversized = self._partition_followup_request_ids(
                 sized_requests)
             if oversized:
                 custom_id, size = oversized[0]
                 followup["oversized_request"] = {
                     "custom_id": custom_id, "bytes": size}
                 state.data["followup"] = followup
-                state.save()
+                persist()
                 self.log("*** FOLLOW-UP NOT SUBMITTED: one document creates a "
                          f"{size / 1048576:.1f} MB request, above the 100 MB "
                          "per-batch guard. No request was sent; lower the "
@@ -11949,6 +11926,19 @@ class Engine:
                     self.stats,
                     f"batch_followup_too_large:{size / 1048576:.1f}")
                 return True
+            attempted = set(followup.get("attempted_primary_ids", []))
+            attempted.update(meta.get("primary_custom_id") for _, meta in candidates
+                             if meta.get("primary_custom_id"))
+            followup["attempted_primary_ids"] = sorted(attempted)
+            followup.pop("pending_plan_request_ids", None)
+            if not new_chunk_plan and incremental_plan:
+                followup.update({"phase": "ended", "requests": actual_requests,
+                                 "est_gbp": followup.pop("prior_est_gbp", 0)})
+                state.data["phase"] = "followup_ended"
+                state.data["followup"] = followup
+                persist()
+                return False
+            chunk_plan = prior_plan + new_chunk_plan
             if not chunk_plan:
                 followup["phase"] = ("pending" if submitted_ids else "ended")
                 followup["requests"] = {
@@ -11957,27 +11947,31 @@ class Engine:
                 state.data["phase"] = ("followup_pending" if submitted_ids
                                        else "followup_ended")
                 state.data["followup"] = followup
-                state.save()
+                persist()
                 return bool(submitted_ids)
 
-            exact_est = tokens_cost_gbp(
+            exact_est = float(followup.pop("prior_est_gbp", 0) or 0) + tokens_cost_gbp(
                 followup_api.model_id, input_tokens,
-                len(actual_requests) * EST_OUTPUT_TOKENS_PER_DOC, batch=True)
-            expected_total = primary_actual_gbp + exact_est + finishing + audit
+                (len(actual_requests) - prior_request_count)
+                * EST_OUTPUT_TOKENS_PER_DOC, batch=True)
+            expected_total = (primary_actual_gbp + exact_est + incurred_live
+                              + finishing + audit)
             followup.update({
                 "phase": "submission_prepared",
                 "requests": actual_requests,
                 "chunk_plan": chunk_plan,
                 "planned_chunks": len(chunk_plan),
                 "planned_request_count": len(actual_requests),
-                "planned_input_tokens": input_tokens,
+                "planned_input_tokens": input_tokens + (
+                    int(followup.get("planned_input_tokens", 0) or 0)
+                    if incremental_plan else 0),
                 "est_gbp": round(exact_est, 4),
             })
             state.data["version"] = max(
                 4, int(state.data.get("version", 1)))
             state.data["phase"] = "followup_submission_prepared"
             state.data["followup"] = followup
-            if not state.save():
+            if not persist():
                 raise RuntimeError(
                     "follow-up chunk plan could not be persisted; no request sent")
             if self.max_budget_gbp > 0 and expected_total > self.max_budget_gbp:
@@ -11991,7 +11985,8 @@ class Engine:
                 return True
         else:
             exact_est = float(followup.get("est_gbp", 0) or 0)
-            expected_total = primary_actual_gbp + exact_est + finishing + audit
+            expected_total = (primary_actual_gbp + exact_est + incurred_live
+                              + finishing + audit)
 
         total_planned = sum(len(chunk) for chunk in chunk_plan)
         self.log(f"Preparing {total_planned} unresolved document(s) for the "
@@ -12001,13 +11996,16 @@ class Engine:
                  f"~£{expected_total:.2f}.")
 
         self._phase("followup_upload", "Preparing and submitting stronger-model follow-up")
-        remaining_total = sum(str(cid) not in submitted_ids for chunk in chunk_plan for cid in chunk)
+        remaining_total = sum(str(cid) not in submitted_ids
+                              and str(cid) in followup.get("requests", {})
+                              for chunk in chunk_plan for cid in chunk)
         prepared_now = attempted_now = 0
         self._followup_progress("followup_upload", 0, remaining_total,
                                 operation="upload:start", accepted=len(submitted_ids))
         for chunk_index, planned_ids in enumerate(chunk_plan, 1):
             remaining_ids = [str(cid) for cid in planned_ids
-                             if str(cid) not in submitted_ids]
+                             if str(cid) not in submitted_ids
+                             and str(cid) in followup.get("requests", {})]
             if not remaining_ids:
                 continue
             built = []
@@ -12040,7 +12038,7 @@ class Engine:
                     "chunk": chunk_index, "bytes": payload_bytes,
                     "request_ids": actual_ids}
                 state.data["followup"] = followup
-                state.save()
+                persist()
                 self.log("*** FOLLOW-UP CHUNK NOT SUBMITTED: rendered payload "
                          f"{chunk_index}/{len(chunk_plan)} is "
                          f"{payload_bytes / 1048576:.1f} MB, above the 100 MB "
@@ -12065,7 +12063,7 @@ class Engine:
             }
             state.data["phase"] = "followup_submitting"
             state.data["followup"] = followup
-            if not state.save():
+            if not persist():
                 raise RuntimeError(
                     "follow-up submission marker could not be persisted; "
                     "no request sent")
@@ -12085,7 +12083,7 @@ class Engine:
                     datetime.datetime.now().isoformat(timespec="seconds")
                 state.data["phase"] = "followup_submission_ambiguous"
                 state.data["followup"] = followup
-                state.save()
+                persist()
                 raise
 
             state.add_batch(
@@ -12100,7 +12098,7 @@ class Engine:
                     timespec="seconds")})
             followup["phase"] = "submitting"
             state.data["phase"] = "followup_submitting"
-            if not state.save():
+            if not persist():
                 raise RuntimeError(
                     "follow-up batch id could not be persisted; automatic retry "
                     "is blocked by the durable started marker")
@@ -12116,7 +12114,7 @@ class Engine:
             followup["phase"] = "ended"
             state.data["phase"] = "followup_ended"
             state.data["followup"] = followup
-            state.save()
+            persist()
             self._followup_progress("followup_upload", prepared_now, remaining_total,
                                     state="complete", accepted=0)
             return False
@@ -12126,7 +12124,7 @@ class Engine:
         followup["submitted_request_ids"] = sorted(submitted_ids)
         state.data["phase"] = "followup_pending"
         state.data["followup"] = followup
-        if not state.save():
+        if not persist():
             raise RuntimeError(
                 "follow-up completion marker could not be persisted; accepted "
                 "batch ids remain protected by per-chunk markers")
@@ -12276,6 +12274,45 @@ class Engine:
             self.log(f"    + double-check: {self._redact(f.name)} -> "
                      f"{self._redact(new_path.name)}")
 
+    def _source_completion_policy(self, state):
+        """Bind partial receipts and exclude deliberately omitted workers from review."""
+        if not state.data.get("source_recovery"):
+            return
+        controller = source_recovery.Recovery(state, APP_VERSION, APP_BUILD)
+        source_recovery.verify_excluded_archives(state)
+        for cid, record in controller.data["records"].items():
+            worker = self._batch_worker_state(state, Path(record["worker_dir"]))
+            if record["state"] == "submitted" and worker and worker.get("completed"):
+                record["state"] = "accepted_applied"
+                controller.event(cid, "accepted_applied", request_id=record.get("request_id", ""))
+        exclusions = source_recovery.exclusion_summary(state)
+        state.data["source_exclusions"] = exclusions
+        if exclusions["count"]:
+            state.data["terminal_outcome"] = "completed_with_exclusions"
+            self.stats["source_exclusions"] = exclusions
+            self.stats["terminal_outcome"] = "completed_with_exclusions"
+            excluded_paths = {str(Path(r["worker_dir"]).resolve()).casefold()
+                for r in controller.data["records"].values() if r["state"] == "excluded_quarantined"}
+            allowed = []
+            for source in self._batch_submitted_worker_scope(state):
+                worker = self._batch_worker_state(state, source)
+                if (worker and worker.get("completed")
+                        and str(source.resolve()).casefold() not in excluded_paths):
+                    allowed.append(Path(worker.get("final_path") or source))
+            self._audit_worker_dirs = allowed
+            # The automatic-review controller is bound to the original whole
+            # cohort. Never silently narrow that signed scope to a partial run.
+            state.data["automatic_review"] = {"status": "blocked_partial_scope",
+                "reason": exclusions["statement"], "eligible_worker_paths": [str(p) for p in allowed]}
+            self._review_controller = None
+            self._review_run_id = ""
+            self.log("COMPLETED WITH EXCLUSIONS: " + exclusions["statement"]
+                + ". Affected workers are excluded from the accuracy audit; automatic review is not started.")
+            report = self.dir / ("_source_exclusions_" + controller.data["run_id"] + ".json")
+            controller.export(report)
+            state.data["source_exclusions_report"] = str(report)
+        controller.checkpoint()
+
     @_care_home_writer_operation
     def run_batch_apply(self, retry_unresolved: str = None):
         """Poll/apply the primary and, when required, discounted follow-up.
@@ -12319,13 +12356,15 @@ class Engine:
                          "prevent duplicate billing. ***")
                 self.on_done(self.stats, "batch_primary_ambiguous")
                 return
-            if state.data.get("primary_submission_complete") is False:
+            if (state.data.get("primary_submission_complete") is False
+                    and not (state.data.get("source_recovery") or {}).get("preflight_complete")):
                 self.log("*** PRIMARY SUBMISSION IS INCOMPLETE. Recover the remaining "
                          "inventory before applying results or moving workers. ***")
                 self.on_done(self.stats, "batch_primary_incomplete")
                 return
             if (not state.batch_ids()
-                    and state.data.get("primary_render_exclusions")):
+                    and state.data.get("primary_render_exclusions")
+                    and not state.data.get("source_recovery")):
                 state.data["phase"] = "processing_incomplete"
                 state.save()
                 summary = self.source_attention_summary(state)
@@ -12419,6 +12458,7 @@ class Engine:
                         return
                 self.log("Batch processing is already complete; resuming only "
                          "the separate post-run audit phase.")
+                self._source_completion_policy(state)
                 self._record_review_processing()
                 self._run_post_run_audit()
                 audit_status = (state.data.get("audit") or {}).get("status")
@@ -12463,6 +12503,11 @@ class Engine:
             self.set_status("Downloading batch results…")
             primary_batches = (batches if active_phase == "primary"
                                else self.poll_batches(state, "primary"))
+            if any(b.get("processing_status") != "ended" for b in primary_batches):
+                counts = self._batch_counts(primary_batches)
+                counts["phase"] = "primary"
+                self.on_done(self.stats, "batch_pending:" + json.dumps(counts))
+                return
             results = self._download_batch_results(
                 self.api, primary_batches,
                 self._expected_batch_ids(state, primary_batches, "primary"),
@@ -12490,9 +12535,10 @@ class Engine:
             state.data.setdefault("costs", {})["primary_actual_gbp"] = round(
                 primary_cost, 6)
 
-            # No first-pass result is applied yet when follow-up is required;
-            # this keeps restart/resume simple and prevents worker movement.
-            if unresolved:
+            # Resume an existing guarded chunk plan before expecting its full
+            # result union: the request map can still contain unsubmitted tail
+            # IDs. This does not authorize a new recovery-session scope.
+            if unresolved and followup_incomplete:
                 if self._submit_followup_batch(
                         state, unresolved, vocab, primary_cost):
                     return
@@ -12562,6 +12608,16 @@ class Engine:
             self.stats["followup_out_tokens"] = followup_out
             self.on_cost(self._current_cost_gbp(),
                          self._committed_batch_tokens)
+
+            # A recovered primary scope can arrive before the earlier
+            # follow-up has been applied. Account for every ended accepted
+            # follow-up above before deciding on another paid scope; an old
+            # estimate is not the already-available actual provider usage.
+            # No first-pass result is applied before this decision.
+            if unresolved and not followup_incomplete:
+                if self._submit_followup_batch(
+                        state, unresolved, vocab, primary_cost):
+                    return
 
             # reverse index: content hash -> [custom_ids] (for moved files)
             by_hash = {}
@@ -12650,17 +12706,36 @@ class Engine:
                         #     previous (interrupted) apply pass -> use the
                         #     remembered name and claim any matching results so
                         #     they are never re-applied or counted as missing.
+                        already_applied = next((row for row in worker_state.get("applied_records", [])
+                            if row.get("hash") == fhash and row.get("path")
+                            and str(Path(row["path"]).resolve()).casefold() == str(f.resolve()).casefold()), None)
                         cached = (self.manifest.seen(fhash, self.api.model_id,
                                                      self.resolution)
-                                  if fhash and not self.reprocess else None)
+                                  if fhash and (not self.reprocess or already_applied) else None)
+                        if already_applied and not cached:
+                            cached = {"name": already_applied.get("name"),
+                                      "group": already_applied.get("group")}
                         if cached:
                             for c in by_hash.get(fhash, []):
                                 if c in results:
                                     matched_cids.add(c)
                         # (b) a batch result for this content?
                         cid = None
+                        # Explicit same-hash aliases replay the representative
+                        # result, even with reprocess enabled. They are not new
+                        # provider requests and never enter usage accounting.
+                        recovery_alias = False
+                        for source_record in (state.data.get("source_recovery") or {}).get("records", {}).values():
+                            if (source_record.get("state") in ("submitted", "accepted_applied")
+                                    and source_record.get("hash") == fhash
+                                    and (state.request_for(source_record.get("request_id")) or {}).get("fhash") == fhash
+                                    and str(Path(source_record["path"]).resolve()).casefold() == str(f.resolve()).casefold()
+                                    and source_record.get("request_id") in results):
+                                cid = source_record["request_id"]
+                                recovery_alias = source_record.get("source_id") != cid
+                                break
                         if not cached:
-                            for c in by_hash.get(fhash, []):
+                            for c in ([] if cid is not None else by_hash.get(fhash, [])):
                                 if c in results and c not in matched_cids:
                                     cid = c
                                     break
@@ -12715,7 +12790,7 @@ class Engine:
                         if followup_completed or primary_usable:
                             msg = res.get("message", {}) or {}
                             usage = msg.get("usage", {}) or {}
-                            if _api_usage:
+                            if _api_usage and not recovery_alias:
                                 _api_usage.record_usage(
                                     self.api.model_id, usage, batch=True)
                                 if followup_completed:
@@ -12984,6 +13059,7 @@ class Engine:
                 Path(self._batch_worker_state(state, source).get("final_path")
                      or source)
                 for source in submitted_scope]
+            self._source_completion_policy(state)
             review_run_id = getattr(self, "_review_run_id", "")
             if getattr(self, "_review_controller", None) is not None \
                     and review_run_id:
@@ -13375,6 +13451,19 @@ class Engine:
             return self._finishing_failure(worker_dir, op_id)
 
         def unavailable(kind, op_id, p, reason, stored=False):
+            # A legacy saved success can fail today's local response validator.
+            # Preserve that answer as lineage, but durably classify it as a
+            # failure before offering an explicit, bounded paid retry.
+            if reason.startswith("invalid"):
+                state = self._finishing_state()
+                if state is not None:
+                    worker_key = str(Path(worker_dir).resolve()).casefold()
+                    operation = (state.data.get("workers", {}).get(worker_key, {})
+                                 .get("finishing_operations", {}).get(op_id, {}))
+                    if operation.get("status") == "complete":
+                        operation.update(status="failed", error="ValueError: invalid saved finishing answer",
+                            response_validation={"previous_status": "complete", "validated_ts": datetime.datetime.now().isoformat(timespec="seconds")})
+                        verify_batch_save(state, "invalid finishing answer could not be recorded")
             self.stats["errors"] += 1
             self.log(f"      ! {self._redact(p.name)}: {what_of(kind)} "
                      f"unavailable ({reason})")
@@ -13393,7 +13482,7 @@ class Engine:
             except (StopRequested, LimitReached, CreditExhausted):
                 raise
             except Exception as e:
-                return unavailable(kind, op_id, p, f"{type(e).__name__}: {e}")
+                return unavailable(kind, op_id, p, f"{type(e).__name__}: finishing evidence unavailable")
             if answer is None:
                 return unavailable(
                     kind, op_id, p,
@@ -15963,6 +16052,8 @@ class App(tk.Tk):
 
     def _begin_automatic_review(self, stats, status):
         """Called only after the engine thread and its writer lock have ended."""
+        if stats.get("terminal_outcome") == "completed_with_exclusions":
+            return False
         run_id = getattr(self, "_review_run_id", "")
         if not run_id:
             return False
@@ -16103,6 +16194,11 @@ class App(tk.Tk):
 
     def _notify_done(self, stats, status):
         kind, _, payload = str(status or "").partition(":")
+        if stats.get("terminal_outcome") == "completed_with_exclusions":
+            exclusions = stats.get("source_exclusions") or {}
+            self._notify("completed_with_exclusions", documents=exclusions.get("count", 0),
+                         workers=len(exclusions.get("workers") or []))
+            return
         if kind == "batch_source_attention":
             try:
                 info = json.loads(payload)
@@ -16269,7 +16365,13 @@ class App(tk.Tk):
         if self.cfg.get("move_mode") and self.move_dest:
             label += f"\nMove mode: processed workers → {self.move_dest}"
         if pending:
-            if pending.get("processing_complete"):
+            if pending.get("source_recovery") and not pending.get("processing_complete"):
+                recovery = source_recovery.Recovery(BatchState(self.care_home_dir), APP_VERSION, APP_BUILD)
+                counts = recovery.summary()
+                label += (f"\nSOURCE RECOVERY: {counts['completed_workers']} workers actually complete; "
+                          f"{counts['unresolved']} unresolved documents, {counts['ready']} ready, "
+                          f"{counts['excluded']} explicitly excluded. Resume Locked documents / source recovery.")
+            elif pending.get("processing_complete"):
                 audit_status = (pending.get("audit") or {}).get("status", "pending")
                 label += (f"\nPROCESSING COMPLETE — accuracy audit {audit_status}. "
                           "Use Check batch status to continue.")
@@ -16342,6 +16444,8 @@ class App(tk.Tk):
         # deliberately not cancelled by this control; use its viewer or cancel
         # the queue before it launches.
         self.stop_btn.configure(state="normal" if processing_busy else "disabled")
+        if hasattr(self, "source_recovery_btn"):
+            self.source_recovery_btn.configure(state="normal" if pending and not busy else "disabled")
 
     def _pick_folder(self):
         if self._batch_busy_guard():
@@ -16633,7 +16737,29 @@ class App(tk.Tk):
             return True
         return False
 
-    def _batch_check_status(self, retry_token: str = None):
+    def _open_source_recovery(self):
+        if not self.care_home_dir or self._batch_busy_guard():
+            return
+        pending = has_pending_batch(self.care_home_dir)
+        if not pending:
+            messagebox.showinfo("Source recovery", "No saved batch scope. Start an Overnight Batch to run local preflight.", parent=self)
+            return
+        if not pending.get("primary_inventory"):
+            messagebox.showinfo("Legacy batch recovery", "This saved run has no complete source inventory. Use Check batch status to reconcile its existing requests; it cannot be approved as an empty recovery scope.", parent=self)
+            return
+        from stage2_source_recovery_ui import RecoveryWindow
+        model_id = pending.get("model_id") or MODELS[self.cfg["model"]]["id"]
+        engine = self._make_engine(get_api_key() or "", model_id)
+        self.engine = engine
+        followup = pending.get("followup_model_id") or model_id
+        def estimate(count):
+            return estimate_pipeline_costs_gbp(count, model_id, followup,
+                float(pending.get("resolution", engine.resolution)),
+                pending.get("primary_vocabulary") or engine.kb.vocabulary_block(),
+                batch=True, include_audit=bool(pending.get("settings", {}).get("post_run_audit")))["gbp"]
+        RecoveryWindow(self, engine, BatchState, APP_VERSION, APP_BUILD, estimate)
+
+    def _batch_check_status(self, retry_token: str = None, source_bypass=False):
         """Poll the pending batch; if it has ended, download and apply the
         results (Phase B) on a background thread. `retry_token` is only ever
         supplied after the user confirmed the exact unresolved finishing
@@ -16647,6 +16773,11 @@ class App(tk.Tk):
             self._refresh_run_controls(pending={})
             return
         pend = has_pending_batch(self.care_home_dir)
+        if (not source_bypass and retry_token is None
+                and pend.get("primary_inventory")
+                and (pend.get("source_recovery") or pend.get("primary_render_exclusions"))):
+            self._open_source_recovery()
+            return
         if (pend.get("phase") in ("primary_exceptions_only", "primary_nothing_renderable")
                 and not pend.get("requests") and not pend.get("batches")):
             # Local-only presentation: do not require an API key, create an
@@ -16655,7 +16786,7 @@ class App(tk.Tk):
             self._done_batch({}, "batch_source_attention:" + json.dumps(summary))
             return
         api_key = get_api_key()
-        if not api_key:
+        if not api_key and (not pend.get("source_recovery") or pend.get("requests")):
             messagebox.showwarning("API key needed",
                                    "Open Settings and add your Anthropic API "
                                    "key first.")
@@ -16663,7 +16794,7 @@ class App(tk.Tk):
         model_id = MODELS[self.cfg["model"]]["id"]
         # the batch was submitted with a specific model; honour it
         model_id = pend.get("model_id") or model_id
-        if self._primary_recovery_needed(pend):
+        if self._primary_recovery_needed(pend) and not (source_bypass and pend.get("source_recovery")):
             self.engine = self._make_engine(api_key, model_id)
             self._check_primary_recovery()
             return
@@ -17408,6 +17539,13 @@ class App(tk.Tk):
     def _done_batch(self, stats, status):
         """End-of-run handling for the Overnight Batch statuses."""
         kind, _, payload = status.partition(":")
+        if stats.get("terminal_outcome") == "completed_with_exclusions" and kind in ("batch_applied", "batch_audit_complete"):
+            statement = stats["source_exclusions"]["statement"]
+            self.set_status("Completed with exclusions — " + statement)
+            messagebox.showwarning("Completed with exclusions", statement +
+                ".\n\nThese documents were not processed or reviewed. Affected workers were excluded from the accuracy audit. "
+                "Automatic review was not started for this partial run. Recovery archives and the terminal receipt are retained.", parent=self)
+            return
         if kind == "batch_busy":
             self.set_status("Another Stage 2 operation is using this folder.")
             messagebox.showwarning(
@@ -17511,7 +17649,9 @@ class App(tk.Tk):
             except (ValueError, TypeError, AttributeError):
                 message = "Source documents need attention. Open Details & full log; completed work is retained."
             self.set_status("Source documents need attention — completed workers and saved results retained.")
-            messagebox.showwarning("Source documents need attention", message)
+            messagebox.showwarning("Source preflight / recovery", message, parent=self)
+            if getattr(self, "care_home_dir", None) and has_pending_batch(self.care_home_dir):
+                self.after(100, self._open_source_recovery)
         elif kind == "batch_apply_attention":
             try:
                 info = json.loads(payload) if payload else {}
