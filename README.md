@@ -1,5 +1,30 @@
 # Stage 2 — Processing
 
+## v1.6.0 - Whole-scope source preflight and delayed recovery
+
+Build `2026.09.15-source-recovery1`. Batch mode now inspects and prepares the
+entire selected source scope locally before the first paid request. **Wait for
+all sources** is the default; a fully disclosed ready subset requires explicit
+confirmation. Locked, corrupt, missing, changed, unsupported, blank and over-limit
+sources remain in a durable queue, not a successful processing count.
+
+**Locked documents / source recovery** supports masked, memory-only passwords,
+validated replacements, delayed supplemental submissions, recoverable quarantine,
+reinstatement, complete export and positive-match reconciliation. Encrypted
+originals and hash-bound lineage are retained. Accepted or uncertain requests
+are never blindly repurchased; accepted same-content evidence is reused.
+
+Exclusions produce **Completed with exclusions**, with exact counts and a retained
+receipt. Affected workers are outside the accuracy audit; automatic review does
+not start for the partial scope. No permanent-delete control is provided.
+Share-code checks use schema-constrained JSON and strict local validation.
+Failed finishing checks require a separate costed confirmation and permit at
+most two retries; ambiguous attempts never retry. Version-5 history is preserved.
+
+See [the recovery design and verification](docs/RELEASE_VERIFICATION_1.6.0.md)
+and [the user guide](docs/USER_GUIDE.md). Development used synthetic sources only;
+an app update does not process or modify any live worker documents.
+
 ## v1.5.9 - Strict finishing evidence - build 2026.09.15-evidence1
 
 Signature and date responses must have the declared field types before they
@@ -520,7 +545,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.5.9 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.6.0 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

@@ -1,4 +1,4 @@
-Stage 2 - Processing v1.5.9 - Obsidian / Jade (build 2026.09.15-evidence1)
+Stage 2 - Processing v1.6.0 - Obsidian / Jade (build 2026.09.15-source-recovery1)
 ===========================
 
 Stage 2 classifies, ranks and organises worker documents for Stage 3, with

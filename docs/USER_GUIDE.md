@@ -1,6 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.5.9 Obsidian / Jade
+## User guide | v1.6.0 Obsidian / Jade
 
 Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Stage 3 uploads the prepared folders. Completing Stage 2 does not itself upload anything.
 
@@ -8,10 +8,9 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 
 ### Your usual route
 
-1. Choose **[Files]**, confirm **[Processed]**, check Settings and the run estimate.
-2. Let processing, follow-up batches and the optional **Accuracy Audit** finish.
-3. Open **Reports**, then **AI Document Review** to check evidence and record decisions.
-4. Use **Improve Stage 2** for a separate review of justified software improvements.
+Choose **[Files]**, check Settings and the estimate. Review Batch preflight and
+confirm the ready scope before submission. Finish processing and audit; then use
+**Reports / AI Document Review**. **Improve Stage 2** is a separate code review.
 
 ### Find the right page
 
@@ -31,6 +30,7 @@ Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Sta
 | Discord, Telegram and Slack updates | 13 |
 | Troubleshooting and completion checklist | 14 |
 | Reliable recovery and source exceptions | 15 |
+| Locked documents and delayed source recovery | 16 |
 
 Edition: 15 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
 
@@ -47,6 +47,7 @@ when relevant.
 | Choose care-home folder | Select the folder containing worker subfolders, normally the care home's [Files] folder. |
 | Start processing | Scan and confirm a new processing run. Read the estimate before submitting. |
 | Check batch status | Check saved provider jobs and apply ready results. A saved batch may have more than one phase. |
+| Locked documents / source recovery | Resume local inspection, passwords, replacements and exact supplemental scopes. |
 | Stop | Request a safe stop. It is not a pause button or a promise of instant interruption. |
 | Preview / Hide preview | Show or hide the current document without crowding the main work area. |
 | Details & full log | Open the full activity log, detailed counters, and Folder & utilities. |
@@ -125,7 +126,7 @@ Read an unknown document before defining it. A controlled compliance type belong
 
 Batch mode submits work to the provider for asynchronous processing. The confirmation screen separates primary classification, follow-up allowance, required finishing work and the optional audit. Use that estimate rather than assuming every part of a batch run has the same price.
 
-1. Wait for submission to finish and the app to report a saved pending batch.
+1. Review whole-scope local preflight. **Wait for all sources** is the default; **Process ready documents now** needs explicit confirmation. Wait for the chosen submission to be acknowledged.
 2. When ready to continue, select the same care-home folder and press **Check batch status**.
 3. Stage 2 checks the saved provider jobs. If results are ready, it applies them and continues the run.
 4. Some results need a follow-up batch. Follow-up work can be split into several bounded requests; a large follow-up is not automatically an error.
@@ -170,6 +171,7 @@ For a Batch run, the button becomes **Recover final checks** when checks are
 deferred. It inspects saved evidence before downloading results. If a failed or malformed finishing check is eligible
 for another attempt, the app asks separately before sending new paid finishing
 requests and shows an estimate. Declining preserves unfinished work for later.
+Only durably failed checks can retry, at most twice; uncertain checks never retry.
 An uncertain provider outcome is not retried this way: reconcile whether it was
 accepted first. Do not restart primary classification to solve a finishing
 attention state.
@@ -550,11 +552,10 @@ automatically rewritten to pretend an unexplained mismatch is safe.
 the worker is compliant or processed. Supply the missing originals, or explicitly
 resolve the intentionally empty folder outside the completed-document count.
 
-**Unreadable source document** means Stage 2 could not obtain usable evidence.
-Its original identity is retained; other readable requests can continue. The worker
-stays incomplete. **View source issues** reopens a source-only outcome without an
-API key or new request. Obtain a complete original; do not overwrite an active or
-pending source. Replacements need a deliberate new/reconciled processing scope.
+Source issues now distinguish **password-protected**, **corrupt/truncated**, **zero-page**,
+**no usable content**, **unsupported**, **missing**, **changed** and **file-size limit**.
+The complete recovery queue opens without an API key. Resolve sources only through
+the hash-bound controls on page 16; do not overwrite a pending source manually.
 
 ### Network errors: what the app can and cannot fix
 
@@ -567,3 +568,53 @@ Failed final checks use the separate costed recovery confirmation on page 5.
 No model, image resolution or naming/ranking policy was reduced by these changes.
 Computer sleep still pauses local processing; keep the computer awake and online
 for unattended local work. Provider-side batch work may continue while it sleeps.
+
+<!-- pagebreak -->
+
+## 14. Locked documents and delayed recovery
+
+Batch mode inspects every discovered source locally before any new provider
+request. PDFs are checked for encryption before accessing pages. Every accessible
+page is inspected; a locked file's structural condition remains unknown until
+decryption. Prepared evidence and exact file hashes survive reopening.
+
+### Resolve now or return later
+
+Open **Locked documents / source recovery**. The full list is grouped by cause and
+worker, with ready, locked, submitted and excluded counts and recorded cost.
+**Wait for all sources / close** retains the run; **Pause operation** stops at a
+safe boundary. Accepted work is retained. Never resubmit the entire batch.
+
+- **Try selected files / Try all remaining locked files:** enter a masked password.
+  Each file is authenticated independently. Passwords are not saved or sent to AI.
+  Successful password-free copies are validated across all pages; originals stay
+  unchanged in the restricted recovery archive. Signed PDFs require separate review.
+- **Import unprotected replacement:** validate and bind a replacement to the exact
+  saved decision. Preserve the prior source where available; a missing original
+  cannot be archived. Changed files require refreshed confirmation.
+- **Submit unlocked documents:** submit only newly validated evidence, with an
+  additional estimate and confirmation. Earlier accepted requests are not purchased
+  again. Different password sessions can add separate non-overlapping scopes.
+  With a saved spend limit, first apply earlier accepted results so their actual
+  costs are recorded before approving another supplement.
+- **Apply accepted / recover final checks:** advance independent workers while
+  other sources wait. Failed final checks have their own bounded costed retry.
+- **Reconcile uncertain submission:** adopt only an exact positive provider match.
+  A missing acknowledgement is never permission to submit that scope again.
+
+### Deliberate exclusions are not full completion
+
+**Remove from run (quarantine)** requires confirmation of the exact documents,
+workers and partial-scope consequence. Verified originals remain recoverable;
+**Reinstate selected** restores them while the worker remains incomplete.
+There is no permanent-delete control. Do not delete recovery checkpoints.
+
+The terminal outcome is **Completed with exclusions**, with exact counts in the
+receipt and exported report. Excluded documents are not processed or reviewed.
+Affected workers are omitted from the accuracy audit, and automatic review does
+not start for the partial run. **Export complete issue list** saves every issue
+and the resolution ledger; **Open containing folder** shows its saved location.
+
+File limits that truncate a worker scope stop before submission: increase the limit
+or select fewer whole workers. Existing version-5 batch history is retained;
+newer unknown state schemas are refused. No live source set is modified by an app update.

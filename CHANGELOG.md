@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.6.0 - 2026-09-15 - Whole-scope preflight and delayed source recovery
+
+- Inspect and prepare every source locally before any paid batch submission.
+  Keep explicit encryption, corruption, missing/drift, empty, unsupported and
+  file-size outcomes; default to waiting, with confirmed ready subsets only.
+- Add persistent masked-password recovery, validated staging, original archives,
+  hash-chained resolution history, exact replacements and reversible quarantine.
+  Verify checkpoints by rereading disk and resume interrupted local transitions.
+- Persist each supplemental scope before POST, retain uncertain markers, reconcile
+  only positive exact provider matches, reuse accepted content and append later
+  follow-up scopes without losing requests, costs or completed workers.
+- Record completed_with_exclusions distinctly in receipts, UI, notifications and
+  audit summaries. Omit affected workers from audits and block automatic review
+  for a partial scope. Do not offer permanent deletion.
+- Request strict JSON-schema share-code responses, enforce field/date types and
+  retain safe diagnostics. Only failed checks can retry, by costed confirmation,
+  at most twice; unknown paid outcomes are never automatically retried.
+- Preserve schema 5 and original history, reject newer unknown schemas, update
+  the credential-free public installer and guide. Synthetic tests are not a live
+  document-interpretation accuracy benchmark.
+
 ## v1.5.9 - 2026-09-15 - Strict finishing evidence
 
 - Validate signature, CoS issue-date and Share Code check responses before
