@@ -5617,6 +5617,7 @@ class BatchState:
         """Take a terminal receipt, then mark and remove mutable state."""
         recovery = self.data.get("source_recovery")
         if recovery:
+            source_recovery.verify_excluded_archives(self)
             if not self.data.get("processing_complete"):
                 raise DurableStateError("Processing is incomplete; terminal receipt is blocked")
             for source in self.data.get("submitted_worker_scope", []):

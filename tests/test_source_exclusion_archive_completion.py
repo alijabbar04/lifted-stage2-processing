@@ -53,3 +53,24 @@ def test_terminal_archive_guard_rejects_out_of_scope_paths_without_reading_them(
     with pytest.raises(recovery.RecoveryError, match="outside"):
         recovery.verify_excluded_archives(c.state)
     read_hash.assert_not_called()
+
+
+def test_final_receipt_rechecks_archive_after_completion_policy(tmp_path):
+    root = tmp_path / "Synthetic care home"
+    pdf(root / "Excluded worker" / "locked.pdf", "later")
+    api, events = Provider(), []
+    engine_for(root, api, events).run_batch_submit()
+    c = controller(root)
+    ids = list(c.data["records"])
+    c.quarantine(ids, c.token(ids))
+    c.state.data["processing_complete"] = True
+    for source in c.state.data["submitted_worker_scope"]:
+        key = str(Path(source["source_path"]).resolve()).casefold()
+        c.state.data.setdefault("workers", {})[key] = {"completed": True}
+    c.checkpoint()
+    engine_for(root, api, events)._source_completion_policy(c.state)
+    Path(c.data["records"][ids[0]]["quarantine_path"]).unlink()
+    with pytest.raises(recovery.RecoveryError, match="archive"):
+        c.state.finalize_applied()
+    assert app.BatchState(root).exists()
+    assert not list(root.glob("*.terminal-*.bak"))
