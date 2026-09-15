@@ -1395,8 +1395,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.5.6"
-APP_BUILD = "2026.09.14-recovery1"
+APP_VERSION = "1.5.7"
+APP_BUILD = "2026.09.15-sonnet5"
 
 def default_app_dir() -> Path:
     sysname = platform.system()

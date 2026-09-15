@@ -41,7 +41,7 @@
 #endif
 
 #define MyAppName "Stage2 Processing"
-#define MyAppVersion "1.5.6"
+#define MyAppVersion "1.5.7"
 #define MyAppPublisher "Lifted / Ali Jabbar"
 #define MyAppExeName "Stage2 Processing.exe"
 

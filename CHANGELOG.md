@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.5.7 - 2026-09-15 - Sonnet 5 escalation
+
+- Second-opinion escalation now uses Claude Sonnet 5 instead of Claude Sonnet
+  4.6. Sonnet 5 is both newer and cheaper - $2/$10 per MTok against $3/$15 -
+  so the follow-up batch for documents the primary model cannot settle costs
+  about a third less for a stronger model. Classification behaviour for
+  documents the primary model does settle is unchanged.
+- Correct the API Usage price row for Sonnet 5, which carried Sonnet 4.6's
+  rate and over-reported Sonnet 5 spend by 50%.
+
 ## v1.5.6 - 2026-09-14 - Durable batch recovery
 
 - Journal exact deduplication transitions before deletion; preserve original
