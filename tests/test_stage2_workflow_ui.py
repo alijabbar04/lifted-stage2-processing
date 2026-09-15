@@ -193,9 +193,9 @@ class TestHiddenTkDialogs(_HiddenTkBase):
         # code-change authority is never implied by that permission.
         self.assertTrue(values["allow_document_changes"])
         self.assertFalse(values["allow_code_changes"])
-        self.assertEqual(values["model_key"], "sol")
+        self.assertEqual(values["model_key"], "opus")
         self.assertEqual(values["effort"], "high")
-        self.assertEqual(values["account"].provider, "codex")
+        self.assertEqual(values["account"].provider, "claude")  # default model is Opus 5
         dialog.allow_var.set(False)
         self.assertFalse(dialog._collect()["allow_document_changes"])
         self.ns["style_titlebar_black"].assert_called()
@@ -210,15 +210,17 @@ class TestHiddenTkDialogs(_HiddenTkBase):
     def test_model_switch_filters_provider_and_blocks_stale_request(self):
         dialog = self.ai_dialog()
         dialog.prepared = self.prepared(dialog)
-        self.select_model(dialog, "opus")
+        # The default review model is now Claude (Opus 5), so crossing to a
+        # Codex model is what exercises the provider filter.
+        self.select_model(dialog, "sol")
         self.assertEqual(len(dialog.filtered_accounts), 1)
-        self.assertEqual(dialog.filtered_accounts[0].provider, "claude")
+        self.assertEqual(dialog.filtered_accounts[0].provider, "codex")
         self.assertIsNone(dialog.prepared)
         self.assertEqual(str(dialog.launch_button["state"]), "disabled")
-        # The old Codex account is incompatible: a new choice is visibly required.
+        # The old Claude account is incompatible: a new choice is visibly required.
         self.assertIsNone(dialog.selector.account())
-        self.assertIn("Choose a Claude Code (Anthropic) account", dialog.account_var.get())
-        self.assertIn("Claude Code (Anthropic)", dialog.selector.provider_label.cget("text"))
+        self.assertIn("Choose a Codex (OpenAI) account", dialog.account_var.get())
+        self.assertIn("Codex (OpenAI)", dialog.selector.provider_label.cget("text"))
         dialog.complete_var.set(True)
         with self.assertRaisesRegex(workflows.WorkflowError, "Choose a registered account"):
             dialog._collect()
@@ -465,7 +467,7 @@ class TestSharedSelectorAndAutoReview(_HiddenTkBase):
     def test_model_menu_is_ranked_and_effort_menu_recommends_first(self):
         dialog = self.ai_dialog()
         values = list(dialog.selector.model_box.cget("values"))
-        self.assertTrue(values[0].startswith("Sol · Codex (OpenAI)") and "recommended" in values[0])
+        self.assertTrue(values[0].startswith("Opus 5 · Claude Code (Anthropic)") and "recommended" in values[0])
         self.assertEqual([dialog.selector._model_labels[v] for v in values], list(workflows.model_keys_for_role("audit-review")))
         efforts = list(dialog.selector.effort_box.cget("values"))
         self.assertEqual(efforts[0], "High · recommended")
@@ -481,7 +483,12 @@ class TestSharedSelectorAndAutoReview(_HiddenTkBase):
     def test_switching_model_preserves_compatible_account_and_effort(self):
         dialog = self.ai_dialog()
         self.select_effort(dialog, "xhigh")
+        # The default is now Claude, so this first hop crosses providers and
+        # clears the account by design; pick the Codex one before testing that
+        # a SAME-provider switch preserves it.
         self.select_model(dialog, "terra")
+        dialog.account_var.set(dialog.selector._account_label(dialog.filtered_accounts[0]))
+        dialog.selector._account_changed()
         self.assertEqual(dialog.selector.account().provider, "codex")
         self.assertEqual(dialog.selector.effort(), "xhigh")
         self.select_model(dialog, "astra")
@@ -518,7 +525,7 @@ class TestSharedSelectorAndAutoReview(_HiddenTkBase):
             dialog._prepare()
             self.pump(lambda: not dialog._operation_busy)
         self.assertEqual(seen["effort"], "medium")
-        self.assertEqual(seen["model_key"], "sol")
+        self.assertEqual(seen["model_key"], "opus")
         saved = self.app.cfg["ai_workflows"]
         self.assertEqual(saved["audit-review_effort"], "medium")
         self.assertNotIn("code-learning_effort", saved)
@@ -552,7 +559,7 @@ class TestSharedSelectorAndAutoReview(_HiddenTkBase):
             dialog = self.auto_dialog()
             self.assertTrue(dialog.enabled_var.get())
             self.assertTrue(dialog.allow_var.get())
-            self.assertEqual(dialog.selector.model_key(), "sol")
+            self.assertEqual(dialog.selector.model_key(), "opus")
             self.assertEqual(dialog.selector.effort(), "high")
             self.assertEqual(dialog.expected_email.get(), "")
             self.assertIn("OFF", dialog.dependency_label.cget("text"))
@@ -565,16 +572,17 @@ class TestSharedSelectorAndAutoReview(_HiddenTkBase):
             verify.assert_not_called()
             prepare.assert_not_called()
             saved = self.app.cfg["ai_workflows"]["auto_review"]
-            self.assertEqual(saved["model_key"], "sol")
+            self.assertEqual(saved["model_key"], "opus")
             self.assertEqual(saved["effort"], "high")
-            self.assertEqual(saved["account_id"], "codex-test")
+            # Opus 5 is a Claude model, so the compatible account is the Claude one.
+            self.assertEqual(saved["account_id"], "claude-test")
             self.assertTrue(saved["allow_document_changes"])
             self.assertEqual(saved["source_root"], str(source))
             self.assertTrue(self.app.cfg["post_run_audit"])
             self.ns["save_config"].assert_called_once_with(self.app.cfg)
             self.app._refresh_ai_review_summary.assert_called_once()
             self.assertIn("accuracy audit was turned on", dialog.status.get())
-            self.assertIn("Sol / High", workflows.auto_review_summary(self.app.cfg))
+            self.assertIn("Opus 5 / High", workflows.auto_review_summary(self.app.cfg))
         finally:
             del self.app._refresh_ai_review_summary
 

@@ -361,10 +361,10 @@ def test_catalog_uses_explicit_ids_with_inferred_provider_and_per_role_ranking()
     assert set(wf.MODEL_CATALOG) == {"sol", "terra", "luna", "astra", "opus", "fable"}
     assert wf.MODEL_CATALOG["sol"]["id"] == "gpt-5.6-sol" and wf.MODEL_CATALOG["astra"]["id"] == "gpt-6-astra"
     assert wf.MODEL_CATALOG["opus"]["id"] == "claude-opus-5" and wf.MODEL_CATALOG["fable"]["id"] == "claude-fable-5-1"
-    assert wf.model_keys_for_role("audit-review")[0] == "sol"
+    assert wf.model_keys_for_role("audit-review")[0] == "opus"
     assert wf.model_keys_for_role("code-learning")[0] == "fable"
     assert set(wf.model_keys_for_role("audit-review")) == set(wf.MODEL_CATALOG)  # no single-role lock
-    assert wf.DEFAULT_MODEL == {"audit-review": "sol", "code-learning": "fable"}
+    assert wf.DEFAULT_MODEL == {"audit-review": "opus", "code-learning": "fable"}
     assert wf.DEFAULT_EXPECTED_EMAIL == ""
     # Compatibility view still exposes label/provider/id/effort/role.
     for key, choice in wf.MODEL_CHOICES.items():
@@ -499,7 +499,7 @@ def test_claude_preflight_accepts_full_model_ids_and_documented_efforts(tmp_path
 
 def test_auto_review_defaults_merge_without_inventing_paths(tmp_path):
     defaults = wf.auto_review_defaults({})
-    assert defaults == {"enabled": True, "model_key": "sol", "effort": "high", "account_id": "", "expected_email": "",
+    assert defaults == {"enabled": True, "model_key": "opus", "effort": "high", "account_id": "", "expected_email": "",
                         "allow_document_changes": True, "review_all_flags": True, "source_root": "", "workspace_root": "", "ledger_path": "", "misnaming_path": ""}
     assert wf.auto_review_defaults(None) == defaults and wf.auto_review_defaults({"ai_workflows": "bad"}) == defaults
     checkout = tmp_path / "checkout"
@@ -518,7 +518,7 @@ def test_auto_review_defaults_merge_without_inventing_paths(tmp_path):
 
 
 def test_auto_review_summary_is_honest_about_state():
-    assert wf.auto_review_summary({}) == "After processing: Accuracy audit → Sol / High document review · account identity verified at launch · Apply corrections on."
+    assert wf.auto_review_summary({}) == "After processing: Accuracy audit → Opus 5 / High document review · account identity verified at launch · Apply corrections on."
     off = wf.auto_review_summary({"ai_workflows": {"auto_review": {"enabled": False}}})
     assert "Automatic AI document review is off" in off
     proposals = wf.auto_review_summary({"ai_workflows": {"auto_review": {"allow_document_changes": False, "model_key": "opus", "effort": "max", "expected_email": ""}}})

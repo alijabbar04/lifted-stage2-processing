@@ -322,7 +322,7 @@ SAFE_MODELS = {
     "Sonnet (balanced)":  {"id": "claude-sonnet-5",   "in": 2.00, "out": 10.00},
 }
 ADVANCED_MODELS = {
-    "Opus   (most able, EXPENSIVE)": {"id": "claude-opus-4-8", "in": 5.00, "out": 25.00},
+    "Opus   (most able, EXPENSIVE)": {"id": "claude-opus-5", "in": 5.00, "out": 25.00},
 }
 # MODELS is the full registry (used for pricing lookups). The Settings dialog
 # decides which subset to actually *offer* based on the advanced-models flag.
@@ -1395,8 +1395,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.5.7"
-APP_BUILD = "2026.09.15-sonnet5"
+APP_VERSION = "1.5.8"
+APP_BUILD = "2026.09.15-current-models"
 
 def default_app_dir() -> Path:
     sysname = platform.system()

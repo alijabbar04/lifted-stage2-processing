@@ -65,18 +65,23 @@ STAGE2_TOOL_APPS = ("PDF Splitter", "PDF Rotator", "AI Document Splitter",
 # Pricing (USD per million tokens). Cache writes bill at 1.25x the input
 # rate, cache reads at 0.10x. The Message Batches API bills at half price.
 # ---------------------------------------------------------------------------
+# Matched by SUBSTRING, first hit wins - so every specific id must appear
+# before the bare family name that would also match it. Superseded models are
+# kept so historical records stay priced at what they actually cost.
 PRICES = [
     ("haiku-4-5", 1.00, 5.00),
     ("haiku", 1.00, 5.00),
-    ("sonnet-4-6", 3.00, 15.00),
     ("sonnet-5", 2.00, 10.00),
-    # Bare "sonnet" is the catch-all for a variant not listed above. It keeps
-    # the older, dearer rate on purpose: over-reporting an unknown model is
-    # safe, under-reporting it hides real spend.
+    ("sonnet-4-6", 3.00, 15.00),
+    # Bare family names are catch-alls for a variant not listed above. They
+    # keep the dearer superseded rate on purpose: over-reporting an
+    # unrecognised model is safe, under-reporting hides real spend.
     ("sonnet", 3.00, 15.00),
-    ("opus-4-8", 15.00, 75.00),
-    ("opus", 15.00, 75.00),
-    ("fable", 15.00, 75.00),
+    ("opus-5", 5.00, 25.00),
+    ("opus-4-8", 5.00, 25.00),
+    ("opus", 5.00, 25.00),
+    ("fable-5-1", 10.00, 50.00),
+    ("fable", 10.00, 50.00),
 ]
 DEFAULT_PRICE = (3.00, 15.00)
 

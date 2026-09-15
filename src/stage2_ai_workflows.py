@@ -35,7 +35,10 @@ EFFORT_LABELS = {"minimal": "Minimal", "low": "Low", "medium": "Medium", "high":
                  "xhigh": "Extra High", "max": "Max", "ultra": "Ultra"}
 ROLES = ("audit-review", "code-learning")
 ROLE_TITLES = {"audit-review": "AI Document Review", "code-learning": "Improve Stage 2"}
-DEFAULT_MODEL = {"audit-review": "sol", "code-learning": "fable"}
+# The two Claude models lead both roles: Opus 5 for document review,
+# Fable 5.1 for the correction-led code investigation. The Codex models
+# below stay selectable; they are simply no longer the default.
+DEFAULT_MODEL = {"audit-review": "opus", "code-learning": "fable"}
 # Identity preferences belong to the user's local configuration, not a release.
 DEFAULT_EXPECTED_EMAIL = ""
 
@@ -45,10 +48,10 @@ DEFAULT_EXPECTED_EMAIL = ""
 # recommended effort first, then other reasonable efforts.
 _CATALOG = (
     ("sol", "Sol", "codex", "gpt-5.6-sol",
-     {"audit-review": (1, ("high", "xhigh", "medium", "max")), "code-learning": (2, ("high", "xhigh", "medium", "max"))},
+     {"audit-review": (2, ("high", "xhigh", "medium", "max")), "code-learning": (4, ("high", "xhigh", "medium", "max"))},
      "Default for consequential, unattended document review; routine Codex choice for bounded code fixes."),
     ("opus", "Opus 5", "claude", "claude-opus-5",
-     {"audit-review": (2, ("high", "xhigh", "medium", "max")), "code-learning": (4, ("high", "xhigh", "medium", "max"))},
+     {"audit-review": (1, ("high", "xhigh", "medium", "max")), "code-learning": (2, ("high", "xhigh", "medium", "max"))},
      "Credible Claude alternative for document review; not a proven upgrade or downgrade on these files."),
     ("terra", "Terra", "codex", "gpt-5.6-terra",
      {"audit-review": (3, ("high", "xhigh", "medium", "max")), "code-learning": (5, ("high", "xhigh", "medium", "max"))},

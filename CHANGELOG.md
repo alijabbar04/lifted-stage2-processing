@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.5.8 - 2026-09-15 - Current Claude models throughout
+
+- Classification "Opus" option is now Claude Opus 5 (`claude-opus-5`) rather
+  than Opus 4.8. Same price, newer model.
+- The post-run **AI Document Review** now defaults to **Opus 5**, and
+  **Improve Stage 2** continues to default to **Fable 5.1** - the two Claude
+  models lead both roles. The Codex options remain selectable.
+- Corrects the API Usage price table, which materially over-reported spend:
+  Opus was billed at $15/$75 against an actual $5/$25, and Fable at $15/$75
+  against an actual $10/$50. Adds explicit rows for Opus 5 and Fable 5.1.
+  Superseded models keep their own historical rates so past records stay
+  priced at what they actually cost.
+
 ## v1.5.7 - 2026-09-15 - Sonnet 5 escalation
 
 - Second-opinion escalation now uses Claude Sonnet 5 instead of Claude Sonnet
