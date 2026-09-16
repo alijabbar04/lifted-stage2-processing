@@ -141,6 +141,7 @@ _SOURCE_DIR = Path(__file__).resolve().parent
 if str(_SOURCE_DIR) not in sys.path:
     sys.path.insert(0, str(_SOURCE_DIR))
 import pipeline_shared as pipeline
+import upload_naming_policy as upload_policy
 from stage2_compact_ui import CompactDashboard
 from stage2_notifications import NotificationService, normalize_settings
 import stage2_ai_workflows as ai_workflows
@@ -1396,8 +1397,8 @@ APP_NAME = "DocReviewAIStation"
 # Shown in the window title so a support question ("which build is this?") can
 # be answered from a screenshot. Bump it with any classification change - see
 # CHANGELOG.md.
-APP_VERSION = "1.6.0"
-APP_BUILD = "2026.09.15-source-recovery1"
+APP_VERSION = "1.7.0"
+APP_BUILD = "2026.09.16-upload-policy1"
 
 def default_app_dir() -> Path:
     sysname = platform.system()
@@ -1722,6 +1723,13 @@ class KnowledgeBase:
         self.important = {}
         self.other = {}
         self._load_or_seed()
+        invalid = upload_policy.validate_controlled_names(
+            list(self.crucial) + list(self.important) + list(self.other))
+        if invalid:
+            raise ValueError(
+                "Controlled vocabulary contains names that cannot be represented "
+                f"under {upload_policy.NAMING_POLICY_VERSION}: {', '.join(invalid)}"
+            )
 
     # ---- disk ----
     def _load_or_seed(self):
@@ -3528,7 +3536,9 @@ class ClaudeAPI:
             '"features": "<2-3 concise identifying features you actually observe '
             'in this document: headings, logos, key phrases, layout, numbers - '
             'always fill this in, matched or not>", '
-            '"other_label": "<a SHORT descriptive phrase (about 3-6 words) '
+            '"other_label": "<a SHORT descriptive phrase (about 3-6 complete words; '
+            'after whitespace is removed it MUST use at most 44 characters, '
+            'because the reserved Other- prefix uses the other 6) '
             'naming what this document actually is, for filing as Other - be '
             'specific about its purpose, not just its format. '
             'e.g. \'reference request email\', \'bank address screenshot\', '
@@ -3653,7 +3663,8 @@ class ClaudeAPI:
             '"rotation": 0|90|180|270 - clockwise degrees the page must be '
             'turned to read upright, '
             '"features": "<identifying features observed on page 1>", '
-            '"other_label": "<a SHORT descriptive phrase (about 3-6 words) '
+            '"other_label": "<a SHORT descriptive phrase (about 3-6 complete words; '
+            'after whitespace is removed it MUST use at most 44 characters) '
             'naming what this document is, if it is an Other-group doc - be '
             'specific about purpose, e.g. \'reference request email\', '
             '\'bank address screenshot\'>", '
@@ -4247,9 +4258,8 @@ class ClaudeAPI:
 ILLEGAL = r'[<>:"/\\|?*]'
 
 def safe_stem(name: str) -> str:
-    name = re.sub(ILLEGAL, " ", name).strip()
-    name = re.sub(r"\s+", " ", name)
-    return name[:150] if name else "document"
+    """Return a word-complete stem under the real portal label limit."""
+    return upload_policy.portal_safe_stem(name)
 
 
 def other_name(label: str) -> str:
@@ -4266,20 +4276,27 @@ def other_name(label: str) -> str:
     lab = re.sub(r"^\s*other\s*[-:]\s*", "", lab, flags=re.I).strip(" -")
     if not lab:
         return "Other - Unknown"
-    # keep it a concise descriptive phrase: at most the first 6 words / 60 chars
-    words = lab.split()
-    lab = " ".join(words[:6])[:60].strip()
-    return f"Other - {lab}" if lab else "Other - Unknown"
+    # Keep the full semantic description in the processing/handoff manifest;
+    # the emitted label is a distinct, portal-safe field.  The policy removes
+    # connector words/uses familiar abbreviations before ever dropping a whole
+    # word, and adds a stable digest only for a genuinely lossy fallback.
+    return upload_policy.portal_safe_stem(
+        f"Other - {lab}" if lab else "Other - Unknown")
 
 
 def unique_path(folder: Path, stem: str, ext: str) -> Path:
     """Return a non-colliding path: 'Name.pdf', 'Name (2).pdf', ..."""
-    cand = folder / f"{stem}{ext}"
+    raw_stem = upload_policy.sanitize_label(stem)
+    safe = upload_policy.portal_safe_stem(raw_stem)
+    cand = folder / f"{safe}{ext}"
     if not cand.exists():
         return cand
     i = 2
     while True:
-        cand = folder / f"{stem} ({i}){ext}"
+        collision = f"({i})"
+        safe = upload_policy.portal_safe_stem(
+            raw_stem, reserved_suffix=collision)
+        cand = folder / f"{safe} {collision}{ext}"
         if not cand.exists():
             return cand
         i += 1
@@ -5146,6 +5163,7 @@ def organize_worker(worker_dir: Path, log=lambda m: None, on_move=None):
 # Stored inside the care-home folder itself so it travels with the documents.
 # ====================================================================
 MANIFEST_NAME = ".docreview_manifest.json"
+HANDOFF_MANIFEST_NAME = ".lifted_stage2_handoff.json"
 
 def _write_hidden_json(path: Path, data: dict):
     """Write JSON to a file that is kept HIDDEN on Windows. Windows refuses to
@@ -5189,6 +5207,25 @@ class ProcessedManifest:
             # hidden-aware write: a plain write_text on an already-hidden file
             # fails with PermissionError on Windows and the cache would be lost
             _write_hidden_json(self.path, self.data)
+            handoff = {
+                "schema_version": 1,
+                "naming_policy_version": upload_policy.NAMING_POLICY_VERSION,
+                "generated_at": datetime.datetime.now().astimezone().isoformat(
+                    timespec="seconds"),
+                "documents": [
+                    {
+                        "source_result_sha256": digest,
+                        "full_document_description": entry.get("full_description")
+                            or entry.get("name") or "",
+                        "short_upload_label": entry.get("short_upload_label")
+                            or upload_policy.portal_safe_stem(entry.get("name") or "Other"),
+                        "final_filename": entry.get("final_filename") or "",
+                        "classification_type": entry.get("group") or "",
+                    }
+                    for digest, entry in sorted(self.data.get("entries", {}).items())
+                ],
+            }
+            _write_hidden_json(self.path.with_name(HANDOFF_MANIFEST_NAME), handoff)
         except Exception:
             traceback.print_exc()
 
@@ -5205,10 +5242,18 @@ class ProcessedManifest:
         return None
 
     def record(self, fhash: str, model_id: str, resolution: float,
-               final_name: str, group: str):
+               final_name: str, group: str, final_filename: str = "",
+               full_description: str = ""):
+        short_label = upload_policy.portal_safe_stem(final_name)
+        if final_filename:
+            short_label = Path(final_filename).stem
         self.data["entries"][fhash] = {
             "sig": self._sig(model_id, resolution),
             "name": final_name, "group": group,
+            "full_description": full_description or final_name,
+            "short_upload_label": short_label,
+            "final_filename": final_filename,
+            "naming_policy_version": upload_policy.NAMING_POLICY_VERSION,
             "ts": datetime.datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -7206,8 +7251,14 @@ def batch_result_needs_followup(kb, result: dict) -> bool:
     conf = _conf_int(result)
     if matched and name and name != "Other":
         return conf < AUTO_REVIEW_MATCH_CONF
-    return not (conf >= AUTO_REVIEW_LABEL_CONF
-                and bool(meaningful_other_label(result)))
+    label = meaningful_other_label(result)
+    if label and upload_policy.normalized_length(f"Other - {label}") \
+            > upload_policy.MAX_PLATFORM_ATTACHMENT_CHARS:
+        # The discounted follow-up prompt carries the same exact 44-character
+        # descriptor budget.  If it is still too long, other_name() performs a
+        # deterministic word-aware fallback instead of slicing mid-word.
+        return True
+    return not (conf >= AUTO_REVIEW_LABEL_CONF and bool(label))
 
 
 def resolve_auto_review(kb, result):
@@ -9829,10 +9880,13 @@ class Engine:
         # descriptor, so recurring Other types get one consistent filename;
         # otherwise the AI's concise label is used. Unresolved values retain the
         # explicit 'Other - Unknown' prefix.
+        full_document_description = str(name or other_label or guess or "Unknown").strip()
         if group == "Other":
             if matched and name and name != "Other":
+                full_document_description = str(name).strip()
                 name = other_name(name)
             else:
+                full_document_description = str(other_label or guess or "Unknown").strip()
                 name = other_name(other_label)
 
         # perform the rename ------------------------------------
@@ -9854,7 +9908,8 @@ class Engine:
         # Recorded here, at apply time, so nothing is marked done prematurely.
         if fhash:
             self.manifest.record(fhash, self.api.model_id, self.resolution,
-                                 name, group)
+                                 name, group, new_path.name,
+                                 full_description=full_document_description)
         self.log(f"    + {self._redact(original)}  ->  {self._redact(new_path.name)}")
         records.append({"path": new_path, "name": name,
                         "group": group, "original": original,
@@ -12271,7 +12326,7 @@ class Engine:
                                    new_path.name, group, "batch-double-check")
             if fhash:
                 self.manifest.record(fhash, self.api.model_id,
-                                     self.resolution, name, group)
+                                     self.resolution, name, group, new_path.name)
             self.log(f"    + double-check: {self._redact(f.name)} -> "
                      f"{self._redact(new_path.name)}")
 
@@ -13209,7 +13264,7 @@ class Engine:
                                    new_path.name, group, "batch-auto-review")
             if item.get("fhash"):
                 self.manifest.record(item["fhash"], self.api.model_id,
-                                     self.resolution, name, group)
+                                     self.resolution, name, group, new_path.name)
             # update the second-pass record so ranking/organising sees the
             # document under its real type
             for r in records:
@@ -13265,7 +13320,7 @@ class Engine:
                                    new_path.name, group, "batch-review")
             if item.get("fhash"):
                 self.manifest.record(item["fhash"], self.api.model_id,
-                                     self.resolution, name, group)
+                                     self.resolution, name, group, new_path.name)
             # update the second-pass record for this file
             for r in records:
                 if str(r.get("path")) == str(p):
@@ -15193,6 +15248,10 @@ class UnknownDialog(tk.Toplevel):
         self.name_var = tk.StringVar(value=guess if guess else "")
         tk.Entry(right, textvariable=self.name_var, width=40, bg=PANEL2, fg=FG,
                  insertbackground=FG, relief="flat", font=MONO).pack(anchor="w")
+        self.counter_lbl = tk.Label(
+            right, text="", bg=BG, fg=FG_DIM, font=("Segoe UI", 8),
+            justify="left")
+        self.counter_lbl.pack(anchor="w", pady=(2, 0))
 
         tk.Label(right, text="Identifying features (saved to the record - edit if needed):",
                  bg=BG, fg=FG_DIM, font=UI).pack(anchor="w", pady=(10, 2))
@@ -15214,15 +15273,20 @@ class UnknownDialog(tk.Toplevel):
 
         bframe = tk.Frame(right, bg=BG)
         bframe.pack(anchor="w", pady=(6, 0))
-        rel = tk.Button(bframe, text="Relevant", command=lambda: self._choose("Relevant"))
-        style_button(rel, GREEN, GREEN_HI)
-        rel.pack(side="left", padx=(0, 8))
-        oth = tk.Button(bframe, text="Other", command=lambda: self._choose("Other"))
-        style_button(oth, AMBER, AMBER_HI)
-        oth.pack(side="left", padx=(0, 8))
+        self.rel_btn = tk.Button(
+            bframe, text="Relevant", command=lambda: self._choose("Relevant"))
+        style_button(self.rel_btn, GREEN, GREEN_HI)
+        self.rel_btn.pack(side="left", padx=(0, 8))
+        self.other_btn = tk.Button(
+            bframe, text="Other", command=lambda: self._choose("Other"))
+        style_button(self.other_btn, AMBER, AMBER_HI)
+        self.other_btn.pack(side="left", padx=(0, 8))
         stop = tk.Button(bframe, text="Stop run", command=self._stop)
         style_button(stop, RED, RED_HI)
         stop.pack(side="left")
+
+        self.name_var.trace_add("write", self._update_name_budget)
+        self._update_name_budget()
 
         self.update_idletasks()
         self._center(master)
@@ -15237,7 +15301,31 @@ class UnknownDialog(tk.Toplevel):
     # controlled-vocabulary entries; in the past whole descriptions were
     # pasted into this field by mistake, polluting the record with
     # paragraph-length "names" (which also bloated every API prompt).
-    MAX_NAME_LEN = 80
+    MAX_NAME_LEN = upload_policy.MAX_PLATFORM_ATTACHMENT_CHARS
+    RESERVED_SUFFIX = "(2)"
+
+    @classmethod
+    def final_label_for_choice(cls, decision, name):
+        cleaned = upload_policy.sanitize_label(name or "Other")
+        return cleaned if decision == "Relevant" else f"Other - {cleaned}"
+
+    @classmethod
+    def choice_budget(cls, decision, name):
+        label = cls.final_label_for_choice(decision, name)
+        used = upload_policy.normalized_length(label + " " + cls.RESERVED_SUFFIX)
+        return used, upload_policy.MAX_PLATFORM_ATTACHMENT_CHARS - used
+
+    def _update_name_budget(self, *_args):
+        name = " ".join(self.name_var.get().split())
+        rel_used, rel_left = self.choice_budget("Relevant", name)
+        oth_used, oth_left = self.choice_budget("Other", name)
+        self.counter_lbl.configure(
+            text=(f"Relevant: {rel_used} / 50 ({max(rel_left, 0)} remain)  ·  "
+                  f"Other: {oth_used} / 50 ({max(oth_left, 0)} remain)\n"
+                  "Includes reserved collision suffix (2)."),
+            fg=RED_HI if rel_left < 0 and oth_left < 0 else FG_DIM)
+        self.rel_btn.configure(state="normal" if name and rel_left >= 0 else "disabled")
+        self.other_btn.configure(state="normal" if oth_left >= 0 else "disabled")
 
     def _choose(self, decision):
         name = " ".join(self.name_var.get().split())
@@ -15246,15 +15334,15 @@ class UnknownDialog(tk.Toplevel):
                                  "Please enter a filename for this document.",
                                  parent=self)
             return
-        if len(name) > self.MAX_NAME_LEN:
+        used, remaining = self.choice_budget(decision, name)
+        if remaining < 0:
             messagebox.showerror(
                 "Define document",
-                f"That name is {len(name)} characters long - it looks like a "
-                f"description, not a name.\n\n"
-                f"This field becomes the FILENAME (and the vocabulary entry), "
-                f"so keep it under {self.MAX_NAME_LEN} characters, e.g. "
-                f"'Loan Agreement'. Put the detail in the identifying-"
-                f"features box below instead.",
+                f"The final whitespace-normalized upload label would use "
+                f"{used} / {self.MAX_NAME_LEN} characters after reserving "
+                f"'{self.RESERVED_SUFFIX}' for a collision. Shorten the name by "
+                f"at least {-remaining} character(s). Put the full detail in "
+                f"the identifying-features box below.",
                 parent=self)
             return
         if not name:

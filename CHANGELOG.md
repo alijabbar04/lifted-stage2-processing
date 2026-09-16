@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.7.0 - 2026-09-16 - Portal-safe upload labels
+
+- Introduce versioned upload naming policy `lifted-upload-label-v1`, matching
+  Lifted's extensionless, whitespace-normalized 50-character attachment label.
+- Apply the policy after every date, rank, sequence and collision suffix; keep
+  whole words and deterministic identities rather than raw character slicing.
+- Constrain and retry over-budget AI Other descriptions, add live manual-dialog
+  counters, and reject manual names that exceed the final reserved budget.
+- Audit the controlled vocabulary at startup and cover main, cached, review,
+  correction, ranking and Re-check Unknowns rename paths with regression tests.
+- Emit a content-hash keyed Stage 2 handoff manifest containing full semantic
+  descriptions alongside the short portal-safe labels used on disk.
+
 ## v1.6.0 - 2026-09-15 - Whole-scope preflight and delayed source recovery
 
 - Inspect and prepare every source locally before any paid batch submission.

@@ -25,6 +25,7 @@ from pathlib import Path
 
 from stage2_locking import (DOCUMENT_WRITER_LOCK, PathWriterLock,
                             WriterLockBusy)
+import upload_naming_policy
 
 
 class ReviewError(RuntimeError):
@@ -616,13 +617,16 @@ def build_plan(queue, decisions):
         scored.sort(key=lambda row: row[0])  # Stable tie order: frozen inventory order.
         for rank, (_key, path, date) in enumerate(scored):
             label = kind + (f" - ({date:%d-%m-%Y})" if kind in DATED and date else "")
-            targets[path] = label + (f" ({rank:02d})" if rank else "") + Path(path).suffix
+            rank_suffix = f"({rank:02d})" if rank else ""
+            targets[path] = upload_naming_policy.final_filename(
+                label, Path(path).suffix, reserved_suffix=rank_suffix)
             changed.add(path)
     # Reserve non-changing names first. Non-ranked Other collisions receive a
     # free suffix, not a fabricated quality ranking.
     for path in list(changed):
         if desired[path].lower().startswith("other"):
-            targets[path] = desired[path] + Path(path).suffix
+            targets[path] = upload_naming_policy.final_filename(
+                desired[path], Path(path).suffix)
     workers = {inventory[path]["worker"] for path in changed}
     planned_paths = {path: path for path in inventory}
     overwrite = {normalized(name) for name in policy["overwrite_types"]}
@@ -656,9 +660,13 @@ def build_plan(queue, decisions):
                 if not desired[path].lower().startswith("other"):
                     raise ReviewError("A ranked target collides with an unreviewed document; include all category peers")
                 number = 1
-                while (folder / f"{Path(name).stem} ({number:02d}){Path(name).suffix}").as_posix().casefold() in occupied:
+                while (folder / upload_naming_policy.final_filename(
+                        desired[path], Path(name).suffix,
+                        reserved_suffix=f"({number:02d})")).as_posix().casefold() in occupied:
                     number += 1
-                target = folder / f"{Path(name).stem} ({number:02d}){Path(name).suffix}"
+                target = folder / upload_naming_policy.final_filename(
+                    desired[path], Path(name).suffix,
+                    reserved_suffix=f"({number:02d})")
             planned_paths[path] = target.as_posix()
             occupied.add(target.as_posix().casefold())
         if any(count > policy["batch_size"] for count in batch_counts.values()):
