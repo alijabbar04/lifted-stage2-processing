@@ -1,6 +1,6 @@
 # Stage 2 - Processing
 
-## User guide | v1.6.0 Obsidian / Jade
+## User guide | v1.7.0 Obsidian / Jade
 
 Stage 1 gathers the documents. Stage 2 classifies, names and organises them. Stage 3 uploads the prepared folders. Completing Stage 2 does not itself upload anything.
 
@@ -32,7 +32,7 @@ confirm the ready scope before submission. Finish processing and audit; then use
 | Reliable recovery and source exceptions | 15 |
 | Locked documents and delayed source recovery | 16 |
 
-Edition: 15 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
+Edition: 16 September 2026. Examples are generic. This guide contains no account credentials or worker documents.
 
 <!-- pagebreak -->
 
@@ -353,6 +353,14 @@ The older manual command may use a confidence-greater-than-80 queue. Follow the 
 ## 8. Naming collisions and a trustworthy review
 
 Official naming and routing rules come from the Stage 2 implementation and the supplied naming-rule snapshot. The reviewer should not invent a near-match, shorten a type arbitrarily or change rules to fit one example.
+
+Stage 2 now measures final upload labels exactly as Lifted does: after removing
+the extension and whitespace, the label must be at most 50 characters. It
+reserves date, rank and collision suffix space first and shortens only at
+whole-word boundaries. The hidden handoff manifest keeps the full description
+separate from the shorter upload label. In the unknown-document dialog, the
+live **Relevant** and **Other** counters include the prefix and reserved
+collision suffix; add extra detail to **Identifying features** when needed.
 
 ### Ranked families: check every peer
 

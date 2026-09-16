@@ -1,5 +1,20 @@
 # Stage 2 — Processing
 
+## v1.7.0 - Portal-safe names and Stage 3 handoff
+
+Build `2026.09.16-upload-policy1`. Every document naming path now applies the
+versioned `lifted-upload-label-v1` contract to the final emitted filename. The
+contract measures the same extensionless, whitespace-normalized 50-character
+label as Lifted, reserves date/rank/collision suffixes before shortening, keeps
+whole words, and adds a stable digest only when a lossy fallback is needed.
+
+AI-generated Other labels receive an exact 44-character descriptor budget and
+one batch follow-up when they exceed it. Manual definition shows live Relevant
+and Other counters and cannot confirm an over-budget name. The full semantic
+description remains in `.docreview_manifest.json`; a compact
+`.lifted_stage2_handoff.json` gives Stage 3 the policy version, full description,
+short label, final filename, content hash and classification type.
+
 ## v1.6.0 - Whole-scope source preflight and delayed recovery
 
 Build `2026.09.15-source-recovery1`. Batch mode now inspects and prepares the
@@ -545,7 +560,7 @@ recovery and avoiding duplicate billing.
 | [`install.ps1`](install.ps1) | end-user bootstrap: pulls the exe + guide from the Release and makes shortcuts |
 | [`setup.ps1`](setup.ps1) | developer setup: deps, LibreOffice check, optional API-key storage |
 
-`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.6.0 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
+`src/Stage2_Processing.pyw` and the adjacent workflow/UI modules are the source for the current v1.7.0 refinement; the earlier compact baseline is retained above for context. `build\build.ps1`
 reproduces the application executable and `build\build_public_installer.ps1`
 builds the credential-free public installer.
 

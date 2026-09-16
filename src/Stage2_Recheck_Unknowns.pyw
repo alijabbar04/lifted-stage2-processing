@@ -289,7 +289,10 @@ def recheck_unknowns(worker_dir: Path, kb, api, manifest, cfg, log,
                 log(f"      ! could not rename {f.name}: {e}")
                 continue
         if fhash:
-            manifest.record(fhash, api.model_id, zoom, new_name, group)
+            full_description = (s2.meaningful_other_label(result)
+                                if group == "Other" else new_name)
+            manifest.record(fhash, api.model_id, zoom, new_name, group,
+                            dest.name, full_description=full_description)
     return stats
 
 
